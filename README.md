@@ -58,6 +58,18 @@ scoop bucket add postile https://github.com/muimsd/postile
 scoop install postile
 ```
 
+### Chocolatey (Windows)
+
+```powershell
+choco install postile
+```
+
+### winget (Windows)
+
+```powershell
+winget install muimsd.postile
+```
+
 ### Debian / Ubuntu (.deb)
 
 Download the `.deb` from [GitHub Releases](https://github.com/muimsd/postile/releases):

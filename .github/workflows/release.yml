@@ -260,3 +260,55 @@ jobs:
           git add Formula/postile.rb bucket/postile.json
           git commit -m "Update package manifests for v${{ steps.version.outputs.version }}"
           git push
+
+  publish-chocolatey:
+    name: Publish to Chocolatey
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+      - name: Download Windows asset and compute checksum
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $url = "https://github.com/muimsd/postile/releases/download/v${version}/postile-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile postile.zip
+          $hash = (Get-FileHash postile.zip -Algorithm SHA256).Hash
+          echo "sha=$hash" >> $env:GITHUB_OUTPUT
+        id: checksum
+      - name: Prepare Chocolatey package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $sha = "${{ steps.checksum.outputs.sha }}"
+          Copy-Item -Recurse packaging/chocolatey choco-pkg
+          (Get-Content choco-pkg/postile.nuspec) -replace '0.1.0', $version | Set-Content choco-pkg/postile.nuspec
+          (Get-Content choco-pkg/tools/chocolateyinstall.ps1) -replace '__CHECKSUM__', $sha | Set-Content choco-pkg/tools/chocolateyinstall.ps1
+      - name: Build and push Chocolatey package
+        shell: pwsh
+        run: |
+          cd choco-pkg
+          choco pack
+          choco push postile.${{ steps.version.outputs.version }}.nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+
+  publish-winget:
+    name: Submit to winget
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+      - name: Submit to winget-pkgs
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: muimsd.postile
+          version: ${{ steps.version.outputs.version }}
+          installers-regex: postile-x86_64-pc-windows-msvc\.zip$
+          token: ${{ secrets.WINGET_TOKEN }}
