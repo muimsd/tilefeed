@@ -101,4 +101,145 @@ mod tests {
             assert_eq!(t.z, 10);
         }
     }
+
+    #[test]
+    fn test_tiles_for_bounds_zoom_0() {
+        // At zoom 0, the entire world is one tile
+        let bounds = Bounds {
+            min_lon: -10.0,
+            min_lat: -10.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+        let tiles = tiles_for_bounds(&bounds, 0, 0);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].z, 0);
+        assert_eq!(tiles[0].x, 0);
+        assert_eq!(tiles[0].y, 0);
+    }
+
+    #[test]
+    fn test_tiles_for_bounds_multiple_zooms() {
+        let bounds = Bounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 1.0,
+            max_lat: 1.0,
+        };
+        let tiles = tiles_for_bounds(&bounds, 0, 2);
+        // Should contain tiles at zoom 0, 1, and 2
+        assert!(tiles.iter().any(|t| t.z == 0));
+        assert!(tiles.iter().any(|t| t.z == 1));
+        assert!(tiles.iter().any(|t| t.z == 2));
+    }
+
+    #[test]
+    fn test_world_to_tile_coords_center() {
+        // At zoom 0, tile (0,0) covers the whole world.
+        // The center of the world (lon=0, lat=0) should map to approximately (extent/2, extent/2)
+        let tile = TileCoord { z: 0, x: 0, y: 0 };
+        let extent = 4096u32;
+        let (x, y) = world_to_tile_coords(0.0, 0.0, &tile, extent);
+        // lon=0 is the center horizontally -> x ~ extent/2
+        assert!((x - (extent as i32 / 2)).abs() < 2);
+        // lat=0 is roughly the center vertically (Mercator) -> y ~ extent/2
+        assert!((y - (extent as i32 / 2)).abs() < 100); // Mercator distortion means this is approximate
+    }
+
+    #[test]
+    fn test_world_to_tile_coords_top_left() {
+        // The top-left corner of the world tile should map to (0, 0)
+        let tile = TileCoord { z: 0, x: 0, y: 0 };
+        let bounds = tile.bounds();
+        let extent = 4096u32;
+        let (x, y) = world_to_tile_coords(bounds.min_lon, bounds.max_lat, &tile, extent);
+        assert_eq!(x, 0);
+        assert_eq!(y, 0);
+    }
+
+    #[test]
+    fn test_world_to_tile_coords_bottom_right() {
+        // The bottom-right corner should map to approximately (extent, extent)
+        let tile = TileCoord { z: 0, x: 0, y: 0 };
+        let bounds = tile.bounds();
+        let extent = 4096u32;
+        let (x, y) = world_to_tile_coords(bounds.max_lon, bounds.min_lat, &tile, extent);
+        assert!((x - extent as i32).abs() <= 1);
+        assert!((y - extent as i32).abs() <= 1);
+    }
+
+    #[test]
+    fn test_tile_bounds_zoom_1() {
+        // At zoom 1 there are 4 tiles; tile (0,0) covers the top-left quadrant
+        let tile = TileCoord { z: 1, x: 0, y: 0 };
+        let bounds = tile.bounds();
+        assert!((bounds.min_lon - (-180.0)).abs() < 1e-6);
+        assert!((bounds.max_lon - 0.0).abs() < 1e-6);
+        // max_lat should be ~85.05 (Mercator limit)
+        assert!(bounds.max_lat > 80.0);
+    }
+
+    #[test]
+    fn test_lon_to_tile_x_boundaries() {
+        // At zoom 1, lon=-180 -> x=0, lon=0 -> x=1, lon=179.9 -> x=1
+        assert_eq!(lon_to_tile_x(-180.0, 1), 0);
+        assert_eq!(lon_to_tile_x(0.0, 1), 1);
+        assert_eq!(lon_to_tile_x(179.9, 1), 1);
+    }
+
+    #[test]
+    fn test_lat_to_tile_y_equator() {
+        // At zoom 1, equator (lat=0) is the boundary between tile y=0 and y=1
+        let y = lat_to_tile_y(0.0, 1);
+        assert_eq!(y, 1);
+    }
+
+    #[test]
+    fn test_tiles_for_bounds_whole_world() {
+        let bounds = Bounds {
+            min_lon: -180.0,
+            min_lat: -85.0,
+            max_lon: 180.0,
+            max_lat: 85.0,
+        };
+        // At zoom 1, the whole world should return 4 tiles
+        let tiles = tiles_for_bounds(&bounds, 1, 1);
+        assert_eq!(tiles.len(), 4);
+    }
+
+    #[test]
+    fn test_tiles_for_bounds_antimeridian() {
+        // Bounds near the antimeridian (but not crossing it, since min_lon < max_lon)
+        let bounds = Bounds {
+            min_lon: 179.0,
+            min_lat: 0.0,
+            max_lon: 179.9,
+            max_lat: 1.0,
+        };
+        let tiles = tiles_for_bounds(&bounds, 2, 2);
+        assert!(!tiles.is_empty());
+        // All tiles should be valid at zoom 2 (x in 0..3, y in 0..3)
+        for t in &tiles {
+            assert!(t.x < 4);
+            assert!(t.y < 4);
+        }
+    }
+
+    #[test]
+    fn test_tiles_for_bounds_near_poles() {
+        // Near the north pole
+        let bounds = Bounds {
+            min_lon: -10.0,
+            min_lat: 80.0,
+            max_lon: 10.0,
+            max_lat: 84.0,
+        };
+        let tiles = tiles_for_bounds(&bounds, 3, 3);
+        assert!(!tiles.is_empty());
+        for t in &tiles {
+            assert_eq!(t.z, 3);
+            // Near the north pole, y should be small (top of the map)
+            assert!(t.y < 4); // 2^3 / 2 = 4 is the equator
+        }
+    }
 }

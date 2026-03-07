@@ -26,10 +26,8 @@ pub async fn generate_source(source: &SourceConfig, reader: &PostgisReader) -> R
     let mut cmd = tokio::process::Command::new("tippecanoe");
     cmd.arg("-o").arg(&source.mbtiles_path);
     cmd.arg("--force"); // Overwrite existing
-    cmd.arg("--minimum-zoom")
-        .arg(source.min_zoom.to_string());
-    cmd.arg("--maximum-zoom")
-        .arg(source.max_zoom.to_string());
+    cmd.arg("--minimum-zoom").arg(source.min_zoom.to_string());
+    cmd.arg("--maximum-zoom").arg(source.max_zoom.to_string());
     cmd.arg("--no-tile-size-limit");
 
     for (layer, path) in &geojson_files {

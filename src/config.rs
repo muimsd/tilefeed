@@ -133,3 +133,207 @@ pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
     let cfg: AppConfig = settings.try_deserialize()?;
     Ok(cfg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_layer(name: &str) -> LayerConfig {
+        LayerConfig {
+            name: name.to_string(),
+            schema: None,
+            table: format!("{}_table", name),
+            geometry_column: None,
+            id_column: None,
+            srid: None,
+            properties: None,
+        }
+    }
+
+    fn sample_source(name: &str, layer_names: &[&str]) -> SourceConfig {
+        SourceConfig {
+            name: name.to_string(),
+            mbtiles_path: format!("/tmp/{}.mbtiles", name),
+            min_zoom: 0,
+            max_zoom: 14,
+            layers: layer_names.iter().map(|l| sample_layer(l)).collect(),
+        }
+    }
+
+    fn sample_config(sources: Vec<SourceConfig>) -> AppConfig {
+        AppConfig {
+            database: DatabaseConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                user: "postgres".to_string(),
+                password: "secret".to_string(),
+                dbname: "testdb".to_string(),
+                pool_size: None,
+            },
+            sources,
+            updates: UpdateConfig::default(),
+            publish: PublishConfig::default(),
+        }
+    }
+
+    // --- find_source_for_layer tests ---
+
+    #[test]
+    fn test_find_source_for_layer_found() {
+        let config = sample_config(vec![
+            sample_source("source_a", &["buildings", "roads"]),
+            sample_source("source_b", &["water", "land"]),
+        ]);
+
+        let result = config.find_source_for_layer("water");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "source_b");
+    }
+
+    #[test]
+    fn test_find_source_for_layer_first_source() {
+        let config = sample_config(vec![
+            sample_source("source_a", &["buildings", "roads"]),
+            sample_source("source_b", &["water"]),
+        ]);
+
+        let result = config.find_source_for_layer("buildings");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "source_a");
+    }
+
+    #[test]
+    fn test_find_source_for_layer_not_found() {
+        let config = sample_config(vec![sample_source("source_a", &["buildings"])]);
+
+        let result = config.find_source_for_layer("nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_source_for_layer_empty_sources() {
+        let config = sample_config(vec![]);
+
+        let result = config.find_source_for_layer("anything");
+        assert!(result.is_none());
+    }
+
+    // --- SourceConfig::find_layer tests ---
+
+    #[test]
+    fn test_find_layer_found() {
+        let source = sample_source("src", &["buildings", "roads", "water"]);
+
+        let result = source.find_layer("roads");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "roads");
+    }
+
+    #[test]
+    fn test_find_layer_not_found() {
+        let source = sample_source("src", &["buildings"]);
+
+        let result = source.find_layer("missing");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_layer_empty_layers() {
+        let source = sample_source("src", &[]);
+
+        let result = source.find_layer("anything");
+        assert!(result.is_none());
+    }
+
+    // --- PublishConfig defaults ---
+
+    #[test]
+    fn test_publish_config_defaults() {
+        let config = PublishConfig::default();
+
+        assert!(matches!(config.backend, PublishBackend::None));
+        assert_eq!(config.destination, None);
+        assert_eq!(config.command, None);
+        assert_eq!(config.args, None);
+        assert_eq!(config.publish_on_generate, Some(true));
+        assert_eq!(config.publish_on_update, Some(true));
+    }
+
+    #[test]
+    fn test_publish_on_generate_enabled_default() {
+        let config = PublishConfig::default();
+        assert!(config.publish_on_generate_enabled());
+    }
+
+    #[test]
+    fn test_publish_on_generate_enabled_explicit_false() {
+        let config = PublishConfig {
+            publish_on_generate: Some(false),
+            ..PublishConfig::default()
+        };
+        assert!(!config.publish_on_generate_enabled());
+    }
+
+    #[test]
+    fn test_publish_on_update_enabled_default() {
+        let config = PublishConfig::default();
+        assert!(config.publish_on_update_enabled());
+    }
+
+    #[test]
+    fn test_publish_on_update_enabled_none() {
+        let config = PublishConfig {
+            publish_on_update: None,
+            ..PublishConfig::default()
+        };
+        // None defaults to true
+        assert!(config.publish_on_update_enabled());
+    }
+
+    // --- UpdateConfig defaults ---
+
+    #[test]
+    fn test_update_config_defaults() {
+        let config = UpdateConfig::default();
+        assert_eq!(config.debounce_ms, Some(200));
+        assert_eq!(config.worker_concurrency, Some(8));
+    }
+
+    // --- DatabaseConfig::connection_string tests ---
+
+    #[test]
+    fn test_connection_string_format() {
+        let db = DatabaseConfig {
+            host: "db.example.com".to_string(),
+            port: 5433,
+            user: "admin".to_string(),
+            password: "p@ss".to_string(),
+            dbname: "mydb".to_string(),
+            pool_size: Some(10),
+        };
+
+        let conn_str = db.connection_string();
+        assert_eq!(
+            conn_str,
+            "host=db.example.com port=5433 user=admin password=p@ss dbname=mydb"
+        );
+    }
+
+    #[test]
+    fn test_connection_string_default_port() {
+        let db = DatabaseConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "postgres".to_string(),
+            password: "".to_string(),
+            dbname: "tiles".to_string(),
+            pool_size: None,
+        };
+
+        let conn_str = db.connection_string();
+        assert!(conn_str.contains("host=localhost"));
+        assert!(conn_str.contains("port=5432"));
+        assert!(conn_str.contains("user=postgres"));
+        assert!(conn_str.contains("dbname=tiles"));
+    }
+}

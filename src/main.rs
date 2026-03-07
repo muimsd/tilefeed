@@ -123,11 +123,7 @@ async fn watch_updates(
         stores.len()
     );
 
-    let mut listener_task = tokio::spawn(start_listener(
-        config.clone(),
-        stores,
-        publisher.clone(),
-    ));
+    let mut listener_task = tokio::spawn(start_listener(config.clone(), stores, publisher.clone()));
 
     tokio::select! {
         result = &mut listener_task => {

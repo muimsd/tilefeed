@@ -174,10 +174,7 @@ async fn handle_batch_update(
                     .push(event);
             }
             None => {
-                warn!(
-                    "Unknown layer '{}', not in any source",
-                    event.layer_name
-                );
+                warn!("Unknown layer '{}', not in any source", event.layer_name);
             }
         }
     }

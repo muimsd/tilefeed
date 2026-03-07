@@ -1,9 +1,32 @@
 # postile
 
+![CI](https://github.com/muimsd/postile/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+
 A PostGIS vector tile pipeline for **MBTiles generation + incremental updates + storage publish**.
+
+## Architecture
+
+```
+PostGIS --> GeoJSON --> Tippecanoe --> MBTiles --+--> Local copy
+                                                +--> S3 upload
+LISTEN/NOTIFY --> Debounce --> MVT encode ------+--> Custom cmd
+```
+
+Full generation exports PostGIS layers as GeoJSON, pipes them through Tippecanoe to produce MBTiles, then publishes the artifact. Incremental updates listen for PostgreSQL notifications, debounce and deduplicate affected tiles, re-encode them as MVT protobuf directly, write them into the existing MBTiles file, and publish again.
+
+## Why postile?
+
+| Tool | Approach | How postile differs |
+|------|----------|---------------------|
+| **pg_tileserv** | Serves tiles on-the-fly from PostGIS, no caching or pre-generation. | postile pre-generates tiles into MBTiles for predictable latency and CDN-friendly serving. |
+| **Martin** | Full-featured tile server with many backends, but more complex to deploy. | postile is headless -- it produces an MBTiles artifact and gets out of the way. Bring your own serving layer (CDN, nginx, tileserver-gl). |
+| **t-rex** | Similar pre-generation approach but tightly coupled to its own built-in HTTP server. | postile decouples generation from serving, so you can choose the best serving strategy for your infrastructure. |
+| **Tippecanoe cron** | Periodic full re-runs via cron or CI. Misses real-time updates and wastes work regenerating unchanged tiles. | postile adds incremental updates via PostgreSQL LISTEN/NOTIFY, regenerating only the tiles affected by each change. |
 
 ## Features
 
+- Cross-platform: runs on Linux, macOS, and Windows
 - Full MBTiles generation from PostGIS via Tippecanoe
 - Multiple sources: separate MBTiles outputs with independent layers and zoom ranges
 - Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY
@@ -125,6 +148,17 @@ cargo run --release -- run
 ```
 
 Configuration can also be set via environment variables with the `TILES_` prefix.
+
+## Serving tiles
+
+postile does not include an HTTP server. It produces MBTiles files and optionally publishes them to a storage backend. To serve tiles to clients, pair it with one of:
+
+- **CDN (CloudFront, Cloudflare R2, etc.)** -- upload the MBTiles to object storage via the S3 or command backend and serve tiles through a CDN edge layer.
+- **Martin** -- point [Martin](https://github.com/maplibre/martin) at the MBTiles file for a production-grade tile server with automatic hot-reload.
+- **tileserver-gl** -- use [tileserver-gl](https://github.com/maptiler/tileserver-gl) to serve raster and vector tiles from MBTiles with built-in style rendering.
+- **nginx with mbtiles module** -- for minimal setups, use an nginx module or a lightweight proxy that reads tiles directly from the SQLite MBTiles file.
+
+This separation lets you choose the serving strategy that fits your infrastructure without being locked into a specific server runtime.
 
 ## Incremental Flow
 

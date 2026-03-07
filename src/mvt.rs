@@ -294,3 +294,221 @@ fn json_to_mvt_value(v: &JsonValue) -> Value {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- zigzag tests ---
+
+    #[test]
+    fn test_zigzag_zero() {
+        assert_eq!(zigzag(0), 0);
+    }
+
+    #[test]
+    fn test_zigzag_positive() {
+        assert_eq!(zigzag(1), 2);
+        assert_eq!(zigzag(2), 4);
+        assert_eq!(zigzag(100), 200);
+    }
+
+    #[test]
+    fn test_zigzag_negative() {
+        assert_eq!(zigzag(-1), 1);
+        assert_eq!(zigzag(-2), 3);
+        assert_eq!(zigzag(-100), 199);
+    }
+
+    #[test]
+    fn test_zigzag_large_values() {
+        assert_eq!(zigzag(i32::MAX), u32::MAX - 1);
+        assert_eq!(zigzag(i32::MIN), u32::MAX);
+    }
+
+    // --- command tests ---
+
+    #[test]
+    fn test_command_moveto() {
+        // MoveTo (id=1), count=1
+        let cmd = command(1, 1);
+        assert_eq!(cmd & 0x7, 1); // id
+        assert_eq!(cmd >> 3, 1); // count
+    }
+
+    #[test]
+    fn test_command_lineto() {
+        // LineTo (id=2), count=5
+        let cmd = command(2, 5);
+        assert_eq!(cmd & 0x7, 2);
+        assert_eq!(cmd >> 3, 5);
+    }
+
+    #[test]
+    fn test_command_closepath() {
+        // ClosePath (id=7), count=1
+        let cmd = command(7, 1);
+        assert_eq!(cmd & 0x7, 7);
+        assert_eq!(cmd >> 3, 1);
+    }
+
+    // --- detect_geom_type tests ---
+
+    #[test]
+    fn test_detect_geom_type_point() {
+        let geom = json!({"type": "Point", "coordinates": [0.0, 0.0]});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Point as i32);
+    }
+
+    #[test]
+    fn test_detect_geom_type_multipoint() {
+        let geom = json!({"type": "MultiPoint", "coordinates": [[0.0, 0.0]]});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Point as i32);
+    }
+
+    #[test]
+    fn test_detect_geom_type_linestring() {
+        let geom = json!({"type": "LineString", "coordinates": [[0.0, 0.0], [1.0, 1.0]]});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Linestring as i32);
+    }
+
+    #[test]
+    fn test_detect_geom_type_polygon() {
+        let geom = json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Polygon as i32);
+    }
+
+    #[test]
+    fn test_detect_geom_type_unknown() {
+        let geom = json!({"type": "GeometryCollection"});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Unknown as i32);
+    }
+
+    #[test]
+    fn test_detect_geom_type_missing_type() {
+        let geom = json!({"coordinates": [0.0, 0.0]});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Unknown as i32);
+    }
+
+    // --- json_to_mvt_value tests ---
+
+    #[test]
+    fn test_json_to_mvt_value_string() {
+        let val = json_to_mvt_value(&json!("hello"));
+        assert_eq!(val.string_value, Some("hello".to_string()));
+        assert_eq!(val.int_value, None);
+        assert_eq!(val.double_value, None);
+        assert_eq!(val.bool_value, None);
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_integer() {
+        let val = json_to_mvt_value(&json!(42));
+        assert_eq!(val.int_value, Some(42));
+        assert_eq!(val.string_value, None);
+        assert_eq!(val.double_value, None);
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_float() {
+        let val = json_to_mvt_value(&json!(3.14));
+        assert_eq!(val.double_value, Some(3.14));
+        assert_eq!(val.int_value, None);
+        assert_eq!(val.string_value, None);
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_bool_true() {
+        let val = json_to_mvt_value(&json!(true));
+        assert_eq!(val.bool_value, Some(true));
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_bool_false() {
+        let val = json_to_mvt_value(&json!(false));
+        assert_eq!(val.bool_value, Some(false));
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_null() {
+        let val = json_to_mvt_value(&json!(null));
+        // Null falls through to the catch-all, stored as string
+        assert!(val.string_value.is_some());
+    }
+
+    // --- encode_tile tests ---
+
+    #[test]
+    fn test_encode_tile_point_feature() {
+        let tile_coord = TileCoord { z: 0, x: 0, y: 0 };
+        let feature = FeatureData {
+            id: 1,
+            geometry: json!({
+                "type": "Point",
+                "coordinates": [0.0, 0.0]
+            }),
+            properties: json!({"name": "test"}),
+            bounds: crate::postgis::Bounds {
+                min_lon: -180.0,
+                min_lat: -85.0,
+                max_lon: 180.0,
+                max_lat: 85.0,
+            },
+            layer_name: "test_layer".to_string(),
+        };
+
+        let mut features_by_layer = HashMap::new();
+        features_by_layer.insert("test_layer".to_string(), vec![feature]);
+
+        let result = encode_tile(&tile_coord, &features_by_layer).unwrap();
+        // Should produce non-empty gzipped output
+        assert!(!result.is_empty());
+        // Gzip magic number check
+        assert_eq!(result[0], 0x1f);
+        assert_eq!(result[1], 0x8b);
+    }
+
+    #[test]
+    fn test_encode_tile_empty_features() {
+        let tile_coord = TileCoord { z: 0, x: 0, y: 0 };
+        let features_by_layer: HashMap<String, Vec<FeatureData>> = HashMap::new();
+
+        let result = encode_tile(&tile_coord, &features_by_layer).unwrap();
+        // Even with no layers, should still produce valid gzipped output (empty tile)
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_multiple_properties() {
+        let tile_coord = TileCoord {
+            z: 10,
+            x: 512,
+            y: 340,
+        };
+        let feature = FeatureData {
+            id: 42,
+            geometry: json!({
+                "type": "Point",
+                "coordinates": [0.0, 51.5]
+            }),
+            properties: json!({"name": "London", "population": 9000000, "capital": true}),
+            bounds: crate::postgis::Bounds {
+                min_lon: -1.0,
+                min_lat: 51.0,
+                max_lon: 1.0,
+                max_lat: 52.0,
+            },
+            layer_name: "cities".to_string(),
+        };
+
+        let mut features_by_layer = HashMap::new();
+        features_by_layer.insert("cities".to_string(), vec![feature]);
+
+        let result = encode_tile(&tile_coord, &features_by_layer).unwrap();
+        assert!(!result.is_empty());
+        // Verify gzip header
+        assert_eq!(result[0], 0x1f);
+        assert_eq!(result[1], 0x8b);
+    }
+}

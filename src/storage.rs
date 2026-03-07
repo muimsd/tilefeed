@@ -114,8 +114,19 @@ async fn publish_to_s3(source_path: &str, destination: &str, args: &[String]) ->
 }
 
 async fn run_publish_command(command: &str, source_path: &str, reason: &str) -> Result<()> {
+    #[cfg(unix)]
     let output = Command::new("sh")
-        .arg("-lc")
+        .arg("-c")
+        .arg(command)
+        .env("POSTILE_MBTILES_PATH", source_path)
+        .env("POSTILE_PUBLISH_REASON", reason)
+        .output()
+        .await
+        .with_context(|| format!("Failed to run publish command '{}'", command))?;
+
+    #[cfg(windows)]
+    let output = Command::new("cmd")
+        .arg("/C")
         .arg(command)
         .env("POSTILE_MBTILES_PATH", source_path)
         .env("POSTILE_PUBLISH_REASON", reason)
