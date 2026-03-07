@@ -6,7 +6,7 @@ use crate::postgis::PostgisReader;
 
 /// Generate MBTiles from PostGIS using Tippecanoe
 pub async fn generate_full(config: &AppConfig, reader: &PostgisReader) -> Result<()> {
-    let temp_dir = std::env::temp_dir().join("tiles-server-export");
+    let temp_dir = std::env::temp_dir().join("postile-export");
     tokio::fs::create_dir_all(&temp_dir).await?;
 
     let mut geojson_files = Vec::new();

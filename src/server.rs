@@ -120,7 +120,7 @@ async fn tilejson(State(state): State<AppState>) -> impl IntoResponse {
 
     let tilejson = serde_json::json!({
         "tilejson": "3.0.0",
-        "name": "tiles-server",
+        "name": "postile",
         "scheme": "xyz",
         "tiles": [format!("{}/tiles/{{z}}/{{x}}/{{y}}.pbf", base_url)],
         "minzoom": config.tiles.min_zoom,
@@ -146,7 +146,7 @@ async fn tilejson(State(state): State<AppState>) -> impl IntoResponse {
 async fn get_metadata(State(state): State<AppState>) -> impl IntoResponse {
     let config = &state.config;
     let metadata = serde_json::json!({
-        "name": "tiles-server",
+        "name": "postile",
         "format": "pbf",
         "minzoom": config.tiles.min_zoom,
         "maxzoom": config.tiles.max_zoom,

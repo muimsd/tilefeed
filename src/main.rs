@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "tiles-server", about = "PostGIS vector tile server with incremental updates")]
+#[command(name = "postile", about = "PostGIS vector tile server with incremental updates")]
 struct Cli {
     /// Path to configuration file
     #[arg(short, long, default_value = "config.toml")]
