@@ -7,10 +7,6 @@ edition = "2021"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP server
-axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
-
 # PostgreSQL (async, with LISTEN/NOTIFY support)
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-geo-types-0_7"] }
 deadpool-postgres = { version = "0.14", features = ["serde"] }
@@ -42,16 +38,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
-thiserror = "2"
 
 # Async utilities
 futures-util = "0.3"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
-
-# In-memory LRU tile cache
-lru = "0.12"
 
 [build-dependencies]
 prost-build = "0.13"

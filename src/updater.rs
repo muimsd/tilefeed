@@ -7,11 +7,11 @@ use tokio::time::{Duration, Instant};
 use tokio_postgres::{AsyncMessage, NoTls};
 use tracing::{error, info, warn};
 
-use crate::cache::TileCache;
 use crate::config::AppConfig;
 use crate::mbtiles::MbtilesStore;
 use crate::mvt;
 use crate::postgis::{Bounds, PostgisReader};
+use crate::storage::StoragePublisher;
 use crate::tiles::{tiles_for_bounds, TileCoord};
 
 #[derive(Debug)]
@@ -25,7 +25,7 @@ struct UpdateEvent {
 pub async fn start_listener(
     config: Arc<AppConfig>,
     mbtiles: Arc<Mutex<MbtilesStore>>,
-    cache: Arc<TileCache>,
+    publisher: Option<Arc<StoragePublisher>>,
 ) -> Result<()> {
     let (client, mut connection) =
         tokio_postgres::connect(&config.database.connection_string(), NoTls)
@@ -35,8 +35,7 @@ pub async fn start_listener(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio_postgres::Notification>();
 
     tokio::spawn(async move {
-        let mut stream =
-            futures_util::stream::poll_fn(move |cx| connection.poll_message(cx));
+        let mut stream = futures_util::stream::poll_fn(move |cx| connection.poll_message(cx));
 
         while let Some(msg) = stream.next().await {
             match msg {
@@ -65,7 +64,7 @@ pub async fn start_listener(
     info!("Listening for tile_update notifications on PostgreSQL");
 
     let reader = PostgisReader::connect(&config.database).await?;
-    let debounce_ms = config.cache.debounce_ms.unwrap_or(200);
+    let debounce_ms = config.updates.debounce_ms.unwrap_or(200);
 
     // Debounce loop: collect events over a window, then batch-process
     loop {
@@ -102,8 +101,14 @@ pub async fn start_listener(
         }
 
         if !parsed_events.is_empty() {
-            if let Err(e) =
-                handle_batch_update(&config, &reader, &mbtiles, &cache, &parsed_events).await
+            if let Err(e) = handle_batch_update(
+                &config,
+                &reader,
+                &mbtiles,
+                publisher.as_ref(),
+                &parsed_events,
+            )
+            .await
             {
                 error!("Failed to handle update batch: {}", e);
             }
@@ -154,14 +159,19 @@ async fn handle_batch_update(
     config: &AppConfig,
     reader: &PostgisReader,
     mbtiles: &Arc<Mutex<MbtilesStore>>,
-    cache: &Arc<TileCache>,
+    publisher: Option<&Arc<StoragePublisher>>,
     events: &[UpdateEvent],
 ) -> Result<()> {
     // Collect all affected tiles across all events
     let mut all_affected: Vec<TileCoord> = Vec::new();
 
     for event in events {
-        let layer = match config.tiles.layers.iter().find(|l| l.name == event.layer_name) {
+        let layer = match config
+            .tiles
+            .layers
+            .iter()
+            .find(|l| l.name == event.layer_name)
+        {
             Some(l) => l,
             None => {
                 warn!("Unknown layer: {}", event.layer_name);
@@ -195,13 +205,14 @@ async fn handle_batch_update(
         return Ok(());
     }
 
-    info!("Regenerating {} unique tiles from batch", all_affected.len());
-
-    // Invalidate cache immediately so stale tiles aren't served
-    cache.invalidate(&all_affected).await;
+    info!(
+        "Regenerating {} unique tiles from batch",
+        all_affected.len()
+    );
 
     // Regenerate tiles concurrently (bounded concurrency)
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+    let worker_count = config.updates.worker_concurrency.unwrap_or(8).max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_count));
     let mut handles = Vec::new();
 
     for tile_coord in all_affected.clone() {
@@ -230,20 +241,29 @@ async fn handle_batch_update(
     let store = mbtiles.lock().await;
     store.begin_transaction()?;
 
-    for (coord, data) in &encoded {
-        match data {
-            None => store.delete_tile(coord.z, coord.x, coord.y)?,
-            Some(tile_data) => store.put_tile(coord.z, coord.x, coord.y, tile_data)?,
+    let write_result: Result<()> = (|| {
+        for (coord, data) in &encoded {
+            match data {
+                None => store.delete_tile(coord.z, coord.x, coord.y)?,
+                Some(tile_data) => store.put_tile(coord.z, coord.x, coord.y, tile_data)?,
+            }
         }
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = store.rollback_transaction();
+        return Err(e);
     }
 
     store.commit_transaction()?;
     drop(store);
 
-    // Populate cache with fresh tiles
-    for (coord, data) in encoded {
-        if let Some(tile_data) = data {
-            cache.put(coord.z, coord.x, coord.y, tile_data).await;
+    if let Some(publisher) = publisher {
+        if config.publish.publish_on_update_enabled() {
+            publisher
+                .publish_mbtiles(&config.tiles.mbtiles_path, "incremental-update")
+                .await?;
         }
     }
 

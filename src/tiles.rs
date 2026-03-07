@@ -67,12 +67,7 @@ pub fn tiles_for_bounds(bounds: &Bounds, min_zoom: u8, max_zoom: u8) -> Vec<Tile
 }
 
 /// Convert tile-relative coordinates (0..extent) to pixel within tile
-pub fn world_to_tile_coords(
-    lon: f64,
-    lat: f64,
-    tile: &TileCoord,
-    extent: u32,
-) -> (i32, i32) {
+pub fn world_to_tile_coords(lon: f64, lat: f64, tile: &TileCoord, extent: u32) -> (i32, i32) {
     let bounds = tile.bounds();
     let x = ((lon - bounds.min_lon) / (bounds.max_lon - bounds.min_lon) * extent as f64) as i32;
     let y = ((bounds.max_lat - lat) / (bounds.max_lat - bounds.min_lat) * extent as f64) as i32;

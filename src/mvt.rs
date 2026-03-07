@@ -19,7 +19,10 @@ use vector_tile::Tile;
 const EXTENT: u32 = 4096;
 
 /// Encode a set of features into a gzipped MVT tile
-pub fn encode_tile(tile_coord: &TileCoord, features_by_layer: &HashMap<String, Vec<FeatureData>>) -> Result<Vec<u8>> {
+pub fn encode_tile(
+    tile_coord: &TileCoord,
+    features_by_layer: &HashMap<String, Vec<FeatureData>>,
+) -> Result<Vec<u8>> {
     let mut layers = Vec::new();
 
     for (layer_name, features) in features_by_layer {
@@ -210,7 +213,11 @@ fn encode_ring(coords: &JsonValue, tile_coord: &TileCoord, close: bool) -> Resul
     let mut prev_y = y;
 
     // LineTo remaining points (skip last if closing, since ClosePath handles it)
-    let end = if close { points.len() - 1 } else { points.len() };
+    let end = if close {
+        points.len() - 1
+    } else {
+        points.len()
+    };
     let line_to_count = end - 1;
 
     if line_to_count > 0 {

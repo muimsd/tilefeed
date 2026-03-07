@@ -28,8 +28,10 @@ pub async fn generate_full(config: &AppConfig, reader: &PostgisReader) -> Result
     let mut cmd = tokio::process::Command::new("tippecanoe");
     cmd.arg("-o").arg(mbtiles_path);
     cmd.arg("--force"); // Overwrite existing
-    cmd.arg("--minimum-zoom").arg(config.tiles.min_zoom.to_string());
-    cmd.arg("--maximum-zoom").arg(config.tiles.max_zoom.to_string());
+    cmd.arg("--minimum-zoom")
+        .arg(config.tiles.min_zoom.to_string());
+    cmd.arg("--maximum-zoom")
+        .arg(config.tiles.max_zoom.to_string());
     cmd.arg("--no-tile-size-limit");
 
     for (layer, path) in &geojson_files {

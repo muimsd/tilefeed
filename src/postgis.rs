@@ -37,11 +37,7 @@ impl PostgisReader {
     }
 
     /// Export an entire layer as GeoJSON FeatureCollection to a file
-    pub async fn export_layer_geojson(
-        &self,
-        layer: &LayerConfig,
-        output_path: &str,
-    ) -> Result<()> {
+    pub async fn export_layer_geojson(&self, layer: &LayerConfig, output_path: &str) -> Result<()> {
         let client = self.pool.get().await?;
         let schema = layer.schema.as_deref().unwrap_or("public");
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");

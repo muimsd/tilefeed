@@ -6,18 +6,23 @@ password = "postgres"
 dbname = "geodata"
 pool_size = 4
 
-[server]
-host = "0.0.0.0"
-port = 3000
-
 [tiles]
 mbtiles_path = "./tiles.mbtiles"
 min_zoom = 0
 max_zoom = 14
 
-[cache]
-max_tiles = 10000
+[updates]
 debounce_ms = 200
+worker_concurrency = 8
+
+[publish]
+backend = "none" # "none", "local", "s3", "command"
+# destination = "/tmp/tiles.mbtiles"   # for local
+# destination = "s3://bucket/tiles.mbtiles" # for s3
+# args = ["--endpoint-url", "https://s3.us-east-1.amazonaws.com"] # optional for s3
+# command = "rclone copy \"$POSTILE_MBTILES_PATH\" remote:tiles/tiles.mbtiles" # for command backend
+publish_on_generate = true
+publish_on_update = true
 
 [[tiles.layers]]
 name = "buildings"
