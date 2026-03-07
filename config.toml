@@ -6,11 +6,6 @@ password = "postgres"
 dbname = "geodata"
 pool_size = 4
 
-[tiles]
-mbtiles_path = "./tiles.mbtiles"
-min_zoom = 0
-max_zoom = 14
-
 [updates]
 debounce_ms = 200
 worker_concurrency = 8
@@ -24,7 +19,13 @@ backend = "none" # "none", "local", "s3", "command"
 publish_on_generate = true
 publish_on_update = true
 
-[[tiles.layers]]
+[[sources]]
+name = "basemap"
+mbtiles_path = "./basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[[sources.layers]]
 name = "buildings"
 schema = "public"
 table = "buildings"

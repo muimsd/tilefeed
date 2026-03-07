@@ -6,11 +6,6 @@ password = "postgres"
 dbname = "postile_example"
 pool_size = 4
 
-[tiles]
-mbtiles_path = "./examples/local-parks/parks.mbtiles"
-min_zoom = 0
-max_zoom = 14
-
 [updates]
 debounce_ms = 200
 worker_concurrency = 8
@@ -21,7 +16,14 @@ destination = "./examples/local-parks/output/parks.mbtiles"
 publish_on_generate = true
 publish_on_update = false
 
-[[tiles.layers]]
+# All layers in a single MBTiles source
+[[sources]]
+name = "parks"
+mbtiles_path = "./examples/local-parks/parks.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[[sources.layers]]
 name = "parks"
 schema = "public"
 table = "parks"
@@ -30,7 +32,7 @@ id_column = "id"
 srid = 4326
 properties = ["name", "type"]
 
-[[tiles.layers]]
+[[sources.layers]]
 name = "trails"
 schema = "public"
 table = "trails"

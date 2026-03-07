@@ -1,18 +1,18 @@
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
-use crate::config::AppConfig;
+use crate::config::SourceConfig;
 use crate::postgis::PostgisReader;
 
-/// Generate MBTiles from PostGIS using Tippecanoe
-pub async fn generate_full(config: &AppConfig, reader: &PostgisReader) -> Result<()> {
-    let temp_dir = std::env::temp_dir().join("postile-export");
+/// Generate MBTiles for a single source using Tippecanoe
+pub async fn generate_source(source: &SourceConfig, reader: &PostgisReader) -> Result<()> {
+    let temp_dir = std::env::temp_dir().join(format!("postile-export-{}", source.name));
     tokio::fs::create_dir_all(&temp_dir).await?;
 
     let mut geojson_files = Vec::new();
 
     // Export each layer to GeoJSON
-    for layer in &config.tiles.layers {
+    for layer in &source.layers {
         let geojson_path = temp_dir
             .join(format!("{}.geojson", layer.name))
             .to_string_lossy()
@@ -23,15 +23,13 @@ pub async fn generate_full(config: &AppConfig, reader: &PostgisReader) -> Result
     }
 
     // Build Tippecanoe command
-    let mbtiles_path = &config.tiles.mbtiles_path;
-
     let mut cmd = tokio::process::Command::new("tippecanoe");
-    cmd.arg("-o").arg(mbtiles_path);
+    cmd.arg("-o").arg(&source.mbtiles_path);
     cmd.arg("--force"); // Overwrite existing
     cmd.arg("--minimum-zoom")
-        .arg(config.tiles.min_zoom.to_string());
+        .arg(source.min_zoom.to_string());
     cmd.arg("--maximum-zoom")
-        .arg(config.tiles.max_zoom.to_string());
+        .arg(source.max_zoom.to_string());
     cmd.arg("--no-tile-size-limit");
 
     for (layer, path) in &geojson_files {
@@ -39,7 +37,7 @@ pub async fn generate_full(config: &AppConfig, reader: &PostgisReader) -> Result
             .arg(format!("{}:{}", layer.name, path));
     }
 
-    info!("Running Tippecanoe: {:?}", cmd);
+    info!("Running Tippecanoe for source '{}': {:?}", source.name, cmd);
 
     let output = cmd
         .output()
@@ -48,10 +46,13 @@ pub async fn generate_full(config: &AppConfig, reader: &PostgisReader) -> Result
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Tippecanoe failed: {}", stderr);
+        bail!("Tippecanoe failed for source '{}': {}", source.name, stderr);
     }
 
-    info!("MBTiles generated at {}", mbtiles_path);
+    info!(
+        "MBTiles generated for source '{}' at {}",
+        source.name, source.mbtiles_path
+    );
 
     // Clean up temp files
     for (_, path) in &geojson_files {

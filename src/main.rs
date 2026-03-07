@@ -9,6 +9,7 @@ mod updater;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -58,7 +59,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Generate => {
             let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-            generator::generate_full(&app_config, &reader).await?;
+            generate_all_sources(&app_config, &reader).await?;
             publish_after_generate(&app_config, publisher.as_deref()).await?;
             info!("Tile generation complete");
         }
@@ -67,13 +68,23 @@ async fn main() -> Result<()> {
         }
         Commands::Run => {
             let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-            generator::generate_full(&app_config, &reader).await?;
+            generate_all_sources(&app_config, &reader).await?;
             publish_after_generate(&app_config, publisher.as_deref()).await?;
             info!("Tile generation complete, starting incremental watcher...");
             watch_updates(app_config, publisher).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn generate_all_sources(
+    config: &config::AppConfig,
+    reader: &postgis::PostgisReader,
+) -> Result<()> {
+    for source in &config.sources {
+        generator::generate_source(source, reader).await?;
+    }
     Ok(())
 }
 
@@ -86,11 +97,11 @@ async fn publish_after_generate(
     }
 
     if let Some(publisher) = publisher {
-        publisher
-            .publish_mbtiles(&config.tiles.mbtiles_path, "full-generate")
-            .await?;
-    } else {
-        info!("Publish requested after full generation, but no publish backend is configured");
+        for source in &config.sources {
+            publisher
+                .publish_mbtiles(&source.mbtiles_path, "full-generate")
+                .await?;
+        }
     }
 
     Ok(())
@@ -100,14 +111,21 @@ async fn watch_updates(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
 ) -> Result<()> {
-    let mbtiles_store = mbtiles::MbtilesStore::open(&config.tiles.mbtiles_path)?;
-    let mbtiles = Arc::new(Mutex::new(mbtiles_store));
+    // Open one MbtilesStore per source
+    let mut stores: HashMap<String, Arc<Mutex<mbtiles::MbtilesStore>>> = HashMap::new();
+    for source in &config.sources {
+        let store = mbtiles::MbtilesStore::open(&source.mbtiles_path)?;
+        stores.insert(source.name.clone(), Arc::new(Mutex::new(store)));
+    }
 
-    info!("Watching PostgreSQL notifications and applying incremental tile updates");
+    info!(
+        "Watching PostgreSQL notifications for {} source(s)",
+        stores.len()
+    );
 
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
-        mbtiles.clone(),
+        stores,
         publisher.clone(),
     ));
 

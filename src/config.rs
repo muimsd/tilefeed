@@ -3,7 +3,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
-    pub tiles: TilesConfig,
+    pub sources: Vec<SourceConfig>,
     #[serde(default)]
     pub updates: UpdateConfig,
     #[serde(default)]
@@ -21,7 +21,8 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TilesConfig {
+pub struct SourceConfig {
+    pub name: String,
     pub mbtiles_path: String,
     pub min_zoom: u8,
     pub max_zoom: u8,
@@ -104,6 +105,22 @@ impl DatabaseConfig {
             "host={} port={} user={} password={} dbname={}",
             self.host, self.port, self.user, self.password, self.dbname
         )
+    }
+}
+
+impl AppConfig {
+    /// Find which source owns a given layer name
+    pub fn find_source_for_layer(&self, layer_name: &str) -> Option<&SourceConfig> {
+        self.sources
+            .iter()
+            .find(|s| s.layers.iter().any(|l| l.name == layer_name))
+    }
+}
+
+impl SourceConfig {
+    /// Find a layer by name within this source
+    pub fn find_layer(&self, name: &str) -> Option<&LayerConfig> {
+        self.layers.iter().find(|l| l.name == name)
     }
 }
 

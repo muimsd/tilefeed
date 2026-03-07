@@ -24,7 +24,7 @@ struct UpdateEvent {
 /// Start the LISTEN/NOTIFY listener for incremental tile updates
 pub async fn start_listener(
     config: Arc<AppConfig>,
-    mbtiles: Arc<Mutex<MbtilesStore>>,
+    stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     publisher: Option<Arc<StoragePublisher>>,
 ) -> Result<()> {
     let (client, mut connection) =
@@ -104,7 +104,7 @@ pub async fn start_listener(
             if let Err(e) = handle_batch_update(
                 &config,
                 &reader,
-                &mbtiles,
+                &stores,
                 publisher.as_ref(),
                 &parsed_events,
             )
@@ -154,44 +154,86 @@ fn parse_notification(payload: &str) -> Result<UpdateEvent> {
     })
 }
 
-/// Handle a batch of update events: deduplicate affected tiles, regenerate concurrently
+/// Handle a batch of update events: group by source, deduplicate affected tiles, regenerate
 async fn handle_batch_update(
     config: &AppConfig,
     reader: &PostgisReader,
-    mbtiles: &Arc<Mutex<MbtilesStore>>,
+    stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
     publisher: Option<&Arc<StoragePublisher>>,
     events: &[UpdateEvent],
 ) -> Result<()> {
-    // Collect all affected tiles across all events
+    // Group events by source name
+    let mut events_by_source: HashMap<String, Vec<&UpdateEvent>> = HashMap::new();
+
+    for event in events {
+        match config.find_source_for_layer(&event.layer_name) {
+            Some(source) => {
+                events_by_source
+                    .entry(source.name.clone())
+                    .or_default()
+                    .push(event);
+            }
+            None => {
+                warn!(
+                    "Unknown layer '{}', not in any source",
+                    event.layer_name
+                );
+            }
+        }
+    }
+
+    // Process each affected source independently
+    for (source_name, source_events) in &events_by_source {
+        let source = config
+            .sources
+            .iter()
+            .find(|s| &s.name == source_name)
+            .unwrap();
+
+        let store = match stores.get(source_name) {
+            Some(s) => s,
+            None => {
+                error!("No MBTiles store for source '{}'", source_name);
+                continue;
+            }
+        };
+
+        update_source(config, reader, source, store, publisher, source_events).await?;
+    }
+
+    Ok(())
+}
+
+/// Update a single source's MBTiles with affected tiles
+async fn update_source(
+    config: &AppConfig,
+    reader: &PostgisReader,
+    source: &crate::config::SourceConfig,
+    mbtiles: &Arc<Mutex<MbtilesStore>>,
+    publisher: Option<&Arc<StoragePublisher>>,
+    events: &[&UpdateEvent],
+) -> Result<()> {
     let mut all_affected: Vec<TileCoord> = Vec::new();
 
     for event in events {
-        let layer = match config
-            .tiles
-            .layers
-            .iter()
-            .find(|l| l.name == event.layer_name)
-        {
+        let layer = match source.find_layer(&event.layer_name) {
             Some(l) => l,
-            None => {
-                warn!("Unknown layer: {}", event.layer_name);
-                continue;
-            }
+            None => continue,
         };
 
         if let Some(feat) = reader.get_feature(layer, event.feature_id).await? {
             all_affected.extend(tiles_for_bounds(
                 &feat.bounds,
-                config.tiles.min_zoom,
-                config.tiles.max_zoom,
+                source.min_zoom,
+                source.max_zoom,
             ));
         }
 
         if let Some(ref old_bounds) = event.old_bounds {
             all_affected.extend(tiles_for_bounds(
                 old_bounds,
-                config.tiles.min_zoom,
-                config.tiles.max_zoom,
+                source.min_zoom,
+                source.max_zoom,
             ));
         }
     }
@@ -201,13 +243,14 @@ async fn handle_batch_update(
     all_affected.dedup();
 
     if all_affected.is_empty() {
-        info!("No affected tiles in batch");
+        info!("No affected tiles for source '{}'", source.name);
         return Ok(());
     }
 
     info!(
-        "Regenerating {} unique tiles from batch",
-        all_affected.len()
+        "Regenerating {} unique tiles for source '{}'",
+        all_affected.len(),
+        source.name
     );
 
     // Regenerate tiles concurrently (bounded concurrency)
@@ -217,12 +260,12 @@ async fn handle_batch_update(
 
     for tile_coord in all_affected.clone() {
         let sem = semaphore.clone();
-        let cfg = config.clone();
+        let src = source.clone();
         let rdr = reader.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            regenerate_single_tile(&cfg, &rdr, &tile_coord).await
+            regenerate_single_tile(&src, &rdr, &tile_coord).await
         });
         handles.push((tile_coord, handle));
     }
@@ -262,24 +305,28 @@ async fn handle_batch_update(
     if let Some(publisher) = publisher {
         if config.publish.publish_on_update_enabled() {
             publisher
-                .publish_mbtiles(&config.tiles.mbtiles_path, "incremental-update")
+                .publish_mbtiles(&source.mbtiles_path, "incremental-update")
                 .await?;
         }
     }
 
-    info!("Batch update complete ({} tiles)", all_affected.len());
+    info!(
+        "Batch update complete for source '{}' ({} tiles)",
+        source.name,
+        all_affected.len()
+    );
     Ok(())
 }
 
 async fn regenerate_single_tile(
-    config: &AppConfig,
+    source: &crate::config::SourceConfig,
     reader: &PostgisReader,
     tile_coord: &TileCoord,
 ) -> Result<Option<Vec<u8>>> {
     let bounds = tile_coord.bounds();
     let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
 
-    for layer in &config.tiles.layers {
+    for layer in &source.layers {
         let features = reader.get_features_in_bounds(layer, &bounds).await?;
         if !features.is_empty() {
             features_by_layer.insert(layer.name.clone(), features);
