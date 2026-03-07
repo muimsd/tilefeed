@@ -37,12 +37,102 @@ Full generation exports PostGIS layers as GeoJSON, pipes them through Tippecanoe
   - S3 upload via `aws s3 cp`
   - Custom command runner (for any storage workflow)
 
-## Requirements
+## Installation
 
-- Rust 1.70+
-- PostgreSQL with [PostGIS](https://postgis.net/)
+### Prerequisites
+
+- PostgreSQL with [PostGIS](https://postgis.net/) extension
 - [Tippecanoe](https://github.com/felt/tippecanoe) for full generation
 - `aws` CLI only if using `publish.backend = "s3"`
+
+### From source (all platforms)
+
+Requires [Rust 1.70+](https://rustup.rs/) and `protoc` (protobuf compiler).
+
+```bash
+# Install protoc
+# Linux (Debian/Ubuntu):
+sudo apt-get install -y protobuf-compiler
+# macOS:
+brew install protobuf
+# Windows:
+choco install protoc
+
+# Clone and build
+git clone https://github.com/muimsd/postile.git
+cd postile
+cargo build --release
+
+# Binary is at target/release/postile (or postile.exe on Windows)
+```
+
+### From pre-built binaries
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/muimsd/postile/releases):
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `postile-x86_64-unknown-linux-gnu` |
+| macOS Apple Silicon | `postile-aarch64-apple-darwin` |
+| macOS Intel | `postile-x86_64-apple-darwin` |
+| Windows x86_64 | `postile-x86_64-pc-windows-msvc` |
+
+```bash
+# Example: download and install on Linux
+curl -L -o postile https://github.com/muimsd/postile/releases/latest/download/postile-x86_64-unknown-linux-gnu
+chmod +x postile
+sudo mv postile /usr/local/bin/
+```
+
+### Install Tippecanoe
+
+Tippecanoe is required for the `generate` and `run` commands.
+
+```bash
+# macOS
+brew install tippecanoe
+
+# Linux (build from source)
+git clone https://github.com/felt/tippecanoe.git
+cd tippecanoe
+make -j && sudo make install
+
+# Windows
+# Use WSL or build with MSYS2. See https://github.com/felt/tippecanoe#windows
+```
+
+## Usage
+
+### Commands
+
+```bash
+postile generate              # full tile generation from PostGIS via Tippecanoe
+postile watch                 # watch LISTEN/NOTIFY and apply incremental updates
+postile run                   # generate then watch
+postile -c other.toml watch   # use alternate config file
+postile --help                # show all options
+```
+
+If running from source instead of an installed binary, prefix with `cargo run --release --`:
+
+```bash
+cargo run --release -- generate
+cargo run --release -- -c myconfig.toml run
+```
+
+### Environment variables
+
+All config fields can be overridden with environment variables using the `TILES_` prefix and `__` as a section separator:
+
+```bash
+export TILES_DATABASE__HOST=db.example.com
+export TILES_DATABASE__PORT=5432
+export TILES_DATABASE__USER=myuser
+export TILES_DATABASE__PASSWORD=secret
+export TILES_DATABASE__DBNAME=geodata
+```
+
+You can also use a `.env` file in the project directory.
 
 ## Quick Start
 
@@ -134,20 +224,18 @@ Backend-specific publish fields:
   - `POSTILE_MBTILES_PATH`
   - `POSTILE_PUBLISH_REASON`
 
-### 3. Run commands
+### 3. Run
 
 ```bash
 # Full rebuild all sources
-cargo run --release -- generate
+postile generate
 
 # Incremental watcher only (requires existing MBTiles)
-cargo run --release -- watch
+postile watch
 
 # Full rebuild, then keep watching updates
-cargo run --release -- run
+postile run
 ```
-
-Configuration can also be set via environment variables with the `TILES_` prefix.
 
 ## Serving tiles
 
