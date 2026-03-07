@@ -45,6 +45,41 @@ Full generation exports PostGIS layers as GeoJSON, pipes them through Tippecanoe
 - [Tippecanoe](https://github.com/felt/tippecanoe) for full generation
 - `aws` CLI only if using `publish.backend = "s3"`
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install --formula https://raw.githubusercontent.com/muimsd/postile/main/Formula/postile.rb
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add postile https://github.com/muimsd/postile
+scoop install postile
+```
+
+### Debian / Ubuntu (.deb)
+
+Download the `.deb` from [GitHub Releases](https://github.com/muimsd/postile/releases):
+
+```bash
+curl -LO https://github.com/muimsd/postile/releases/latest/download/postile_amd64.deb
+sudo dpkg -i postile_amd64.deb
+```
+
+### Fedora / RHEL (.rpm)
+
+```bash
+curl -LO https://github.com/muimsd/postile/releases/latest/download/postile-x86_64.rpm
+sudo rpm -i postile-x86_64.rpm
+```
+
+### Cargo
+
+```bash
+cargo install postile
+```
+
 ### From source (all platforms)
 
 Requires [Rust 1.70+](https://rustup.rs/) and `protoc` (protobuf compiler).
