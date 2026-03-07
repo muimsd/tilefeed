@@ -126,11 +126,7 @@ fn encode_point(coords: &JsonValue, tile_coord: &TileCoord) -> Result<Vec<u32>> 
     let lat = coords[1].as_f64().unwrap_or(0.0);
     let (x, y) = to_tile_xy(lon, lat, tile_coord);
 
-    let mut cmds = Vec::new();
-    cmds.push(command(1, 1)); // MoveTo, count=1
-    cmds.push(zigzag(x));
-    cmds.push(zigzag(y));
-    Ok(cmds)
+    Ok(vec![command(1, 1), zigzag(x), zigzag(y)])
 }
 
 fn encode_multi_point(coords: &JsonValue, tile_coord: &TileCoord) -> Result<Vec<u32>> {
