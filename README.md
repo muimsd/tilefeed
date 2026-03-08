@@ -120,6 +120,7 @@ Download the latest binary for your platform from [GitHub Releases](https://gith
 | Platform | Binary |
 |----------|--------|
 | Linux x86_64 | `tilefeed-x86_64-unknown-linux-gnu` |
+| Linux ARM64 | `tilefeed-aarch64-unknown-linux-gnu` |
 | macOS Apple Silicon | `tilefeed-aarch64-apple-darwin` |
 | macOS Intel | `tilefeed-x86_64-apple-darwin` |
 | Windows x86_64 | `tilefeed-x86_64-pc-windows-msvc` |
