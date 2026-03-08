@@ -23,4 +23,4 @@ Initial release.
 - CI with tests on all platforms, clippy, formatting checks, and release builds
 - Local-parks example with end-to-end walkthrough
 
-[0.1.0]: https://github.com/muimsd/postile/releases/tag/v0.1.0
+[0.1.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.1.0

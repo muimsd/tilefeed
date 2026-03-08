@@ -1,6 +1,6 @@
-# postile
+# tilefeed
 
-![CI](https://github.com/muimsd/postile/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/muimsd/tilefeed/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
 A PostGIS vector tile pipeline for **MBTiles generation + incremental updates + storage publish**.
@@ -15,14 +15,14 @@ LISTEN/NOTIFY --> Debounce --> MVT encode ------+--> Custom cmd
 
 Full generation exports PostGIS layers as GeoJSON, pipes them through Tippecanoe to produce MBTiles, then publishes the artifact. Incremental updates listen for PostgreSQL notifications, debounce and deduplicate affected tiles, re-encode them as MVT protobuf directly, write them into the existing MBTiles file, and publish again.
 
-## Why postile?
+## Why tilefeed?
 
-| Tool | Approach | How postile differs |
+| Tool | Approach | How tilefeed differs |
 |------|----------|---------------------|
-| **pg_tileserv** | Serves tiles on-the-fly from PostGIS, no caching or pre-generation. | postile pre-generates tiles into MBTiles for predictable latency and CDN-friendly serving. |
-| **Martin** | Full-featured tile server with many backends, but more complex to deploy. | postile is headless -- it produces an MBTiles artifact and gets out of the way. Bring your own serving layer (CDN, nginx, tileserver-gl). |
-| **t-rex** | Similar pre-generation approach but tightly coupled to its own built-in HTTP server. | postile decouples generation from serving, so you can choose the best serving strategy for your infrastructure. |
-| **Tippecanoe cron** | Periodic full re-runs via cron or CI. Misses real-time updates and wastes work regenerating unchanged tiles. | postile adds incremental updates via PostgreSQL LISTEN/NOTIFY, regenerating only the tiles affected by each change. |
+| **pg_tileserv** | Serves tiles on-the-fly from PostGIS, no caching or pre-generation. | tilefeed pre-generates tiles into MBTiles for predictable latency and CDN-friendly serving. |
+| **Martin** | Full-featured tile server with many backends, but more complex to deploy. | tilefeed is headless -- it produces an MBTiles artifact and gets out of the way. Bring your own serving layer (CDN, nginx, tileserver-gl). |
+| **t-rex** | Similar pre-generation approach but tightly coupled to its own built-in HTTP server. | tilefeed decouples generation from serving, so you can choose the best serving strategy for your infrastructure. |
+| **Tippecanoe cron** | Periodic full re-runs via cron or CI. Misses real-time updates and wastes work regenerating unchanged tiles. | tilefeed adds incremental updates via PostgreSQL LISTEN/NOTIFY, regenerating only the tiles affected by each change. |
 
 ## Features
 
@@ -48,48 +48,48 @@ Full generation exports PostGIS layers as GeoJSON, pipes them through Tippecanoe
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew install --formula https://raw.githubusercontent.com/muimsd/postile/main/Formula/postile.rb
+brew install --formula https://raw.githubusercontent.com/muimsd/tilefeed/main/Formula/tilefeed.rb
 ```
 
 ### Scoop (Windows)
 
 ```powershell
-scoop bucket add postile https://github.com/muimsd/postile
-scoop install postile
+scoop bucket add tilefeed https://github.com/muimsd/tilefeed
+scoop install tilefeed
 ```
 
 ### Chocolatey (Windows)
 
 ```powershell
-choco install postile
+choco install tilefeed
 ```
 
 ### winget (Windows)
 
 ```powershell
-winget install muimsd.postile
+winget install muimsd.tilefeed
 ```
 
 ### Debian / Ubuntu (.deb)
 
-Download the `.deb` from [GitHub Releases](https://github.com/muimsd/postile/releases):
+Download the `.deb` from [GitHub Releases](https://github.com/muimsd/tilefeed/releases):
 
 ```bash
-curl -LO https://github.com/muimsd/postile/releases/latest/download/postile_amd64.deb
-sudo dpkg -i postile_amd64.deb
+curl -LO https://github.com/muimsd/tilefeed/releases/latest/download/tilefeed_amd64.deb
+sudo dpkg -i tilefeed_amd64.deb
 ```
 
 ### Fedora / RHEL (.rpm)
 
 ```bash
-curl -LO https://github.com/muimsd/postile/releases/latest/download/postile-x86_64.rpm
-sudo rpm -i postile-x86_64.rpm
+curl -LO https://github.com/muimsd/tilefeed/releases/latest/download/tilefeed-x86_64.rpm
+sudo rpm -i tilefeed-x86_64.rpm
 ```
 
 ### Cargo
 
 ```bash
-cargo install postile
+cargo install tilefeed
 ```
 
 ### From source (all platforms)
@@ -106,29 +106,29 @@ brew install protobuf
 choco install protoc
 
 # Clone and build
-git clone https://github.com/muimsd/postile.git
-cd postile
+git clone https://github.com/muimsd/tilefeed.git
+cd tilefeed
 cargo build --release
 
-# Binary is at target/release/postile (or postile.exe on Windows)
+# Binary is at target/release/tilefeed (or tilefeed.exe on Windows)
 ```
 
 ### From pre-built binaries
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/muimsd/postile/releases):
+Download the latest binary for your platform from [GitHub Releases](https://github.com/muimsd/tilefeed/releases):
 
 | Platform | Binary |
 |----------|--------|
-| Linux x86_64 | `postile-x86_64-unknown-linux-gnu` |
-| macOS Apple Silicon | `postile-aarch64-apple-darwin` |
-| macOS Intel | `postile-x86_64-apple-darwin` |
-| Windows x86_64 | `postile-x86_64-pc-windows-msvc` |
+| Linux x86_64 | `tilefeed-x86_64-unknown-linux-gnu` |
+| macOS Apple Silicon | `tilefeed-aarch64-apple-darwin` |
+| macOS Intel | `tilefeed-x86_64-apple-darwin` |
+| Windows x86_64 | `tilefeed-x86_64-pc-windows-msvc` |
 
 ```bash
 # Example: download and install on Linux
-curl -L -o postile https://github.com/muimsd/postile/releases/latest/download/postile-x86_64-unknown-linux-gnu
-chmod +x postile
-sudo mv postile /usr/local/bin/
+curl -L -o tilefeed https://github.com/muimsd/tilefeed/releases/latest/download/tilefeed-x86_64-unknown-linux-gnu
+chmod +x tilefeed
+sudo mv tilefeed /usr/local/bin/
 ```
 
 ### Install Tippecanoe
@@ -153,11 +153,11 @@ make -j && sudo make install
 ### Commands
 
 ```bash
-postile generate              # full tile generation from PostGIS via Tippecanoe
-postile watch                 # watch LISTEN/NOTIFY and apply incremental updates
-postile run                   # generate then watch
-postile -c other.toml watch   # use alternate config file
-postile --help                # show all options
+tilefeed generate              # full tile generation from PostGIS via Tippecanoe
+tilefeed watch                 # watch LISTEN/NOTIFY and apply incremental updates
+tilefeed run                   # generate then watch
+tilefeed -c other.toml watch   # use alternate config file
+tilefeed --help                # show all options
 ```
 
 If running from source instead of an installed binary, prefix with `cargo run --release --`:
@@ -268,25 +268,25 @@ Backend-specific publish fields:
 - `local`: set `publish.destination` to a file path.
 - `s3`: set `publish.destination = "s3://bucket/path/tiles.mbtiles"`.
 - `command`: set `publish.command`, and use env vars:
-  - `POSTILE_MBTILES_PATH`
-  - `POSTILE_PUBLISH_REASON`
+  - `TILEFEED_MBTILES_PATH`
+  - `TILEFEED_PUBLISH_REASON`
 
 ### 3. Run
 
 ```bash
 # Full rebuild all sources
-postile generate
+tilefeed generate
 
 # Incremental watcher only (requires existing MBTiles)
-postile watch
+tilefeed watch
 
 # Full rebuild, then keep watching updates
-postile run
+tilefeed run
 ```
 
 ## Serving tiles
 
-postile does not include an HTTP server. It produces MBTiles files and optionally publishes them to a storage backend. To serve tiles to clients, pair it with one of:
+tilefeed does not include an HTTP server. It produces MBTiles files and optionally publishes them to a storage backend. To serve tiles to clients, pair it with one of:
 
 - **CDN (CloudFront, Cloudflare R2, etc.)** -- upload the MBTiles to object storage via the S3 or command backend and serve tiles through a CDN edge layer.
 - **Martin** -- point [Martin](https://github.com/maplibre/martin) at the MBTiles file for a production-grade tile server with automatic hot-reload.
@@ -298,7 +298,7 @@ This separation lets you choose the serving strategy that fits your infrastructu
 ## Incremental Flow
 
 1. PostgreSQL trigger emits `pg_notify('tile_update', ...)`
-2. `postile` debounces notifications into a batch
+2. `tilefeed` debounces notifications into a batch
 3. Events are routed to the correct source based on layer name
 4. Affected tiles are derived from new/old feature bounds
 5. Tiles are regenerated and written into the source's MBTiles

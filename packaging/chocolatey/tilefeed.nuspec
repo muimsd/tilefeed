@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
-    <id>postile</id>
+    <id>tilefeed</id>
     <version>0.1.0</version>
-    <title>postile</title>
+    <title>tilefeed</title>
     <authors>muimsd</authors>
     <owners>muimsd</owners>
-    <projectUrl>https://github.com/muimsd/postile</projectUrl>
-    <licenseUrl>https://github.com/muimsd/postile/blob/main/LICENSE</licenseUrl>
+    <projectUrl>https://github.com/muimsd/tilefeed</projectUrl>
+    <licenseUrl>https://github.com/muimsd/tilefeed/blob/main/LICENSE</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY</description>
     <summary>Pre-generates MBTiles from PostGIS and incrementally updates them via PostgreSQL LISTEN/NOTIFY</summary>
     <tags>postgis vector-tiles mbtiles tippecanoe gis</tags>
-    <packageSourceUrl>https://github.com/muimsd/postile</packageSourceUrl>
-    <bugTrackerUrl>https://github.com/muimsd/postile/issues</bugTrackerUrl>
+    <packageSourceUrl>https://github.com/muimsd/tilefeed</packageSourceUrl>
+    <bugTrackerUrl>https://github.com/muimsd/tilefeed/issues</bugTrackerUrl>
   </metadata>
   <files>
     <file src="tools/**" target="tools" />

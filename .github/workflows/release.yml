@@ -20,25 +20,25 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: postile
-            archive: postile-x86_64-unknown-linux-gnu.tar.gz
+            artifact: tilefeed
+            archive: tilefeed-x86_64-unknown-linux-gnu.tar.gz
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact: postile
-            archive: postile-aarch64-unknown-linux-gnu.tar.gz
+            artifact: tilefeed
+            archive: tilefeed-aarch64-unknown-linux-gnu.tar.gz
             cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: postile
-            archive: postile-aarch64-apple-darwin.tar.gz
+            artifact: tilefeed
+            archive: tilefeed-aarch64-apple-darwin.tar.gz
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: postile
-            archive: postile-x86_64-apple-darwin.tar.gz
+            artifact: tilefeed
+            archive: tilefeed-x86_64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: postile.exe
-            archive: postile-x86_64-pc-windows-msvc.zip
+            artifact: tilefeed.exe
+            archive: tilefeed-x86_64-pc-windows-msvc.zip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -112,12 +112,12 @@ jobs:
       - name: Rename .deb
         run: |
           DEB=$(find target/${{ matrix.target }}/debian -name '*.deb' | head -1)
-          cp "$DEB" postile_${{ matrix.arch }}.deb
+          cp "$DEB" tilefeed_${{ matrix.arch }}.deb
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
-          name: postile_${{ matrix.arch }}.deb
-          path: postile_${{ matrix.arch }}.deb
+          name: tilefeed_${{ matrix.arch }}.deb
+          path: tilefeed_${{ matrix.arch }}.deb
 
   package-rpm:
     name: Build .rpm (x86_64)
@@ -138,12 +138,12 @@ jobs:
       - name: Rename .rpm
         run: |
           RPM=$(find target/generate-rpm -name '*.rpm' | head -1)
-          cp "$RPM" postile-x86_64.rpm
+          cp "$RPM" tilefeed-x86_64.rpm
       - name: Upload .rpm
         uses: actions/upload-artifact@v4
         with:
-          name: postile-x86_64.rpm
-          path: postile-x86_64.rpm
+          name: tilefeed-x86_64.rpm
+          path: tilefeed-x86_64.rpm
 
   release:
     name: Create Release
@@ -176,13 +176,13 @@ jobs:
       - name: Download release assets and compute checksums
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          BASE_URL="https://github.com/muimsd/postile/releases/download/v${VERSION}"
+          BASE_URL="https://github.com/muimsd/tilefeed/releases/download/v${VERSION}"
           for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
-            curl -sL "${BASE_URL}/postile-${target}.tar.gz" -o "postile-${target}.tar.gz"
-            sha256sum "postile-${target}.tar.gz" >> checksums.txt
+            curl -sL "${BASE_URL}/tilefeed-${target}.tar.gz" -o "tilefeed-${target}.tar.gz"
+            sha256sum "tilefeed-${target}.tar.gz" >> checksums.txt
           done
-          curl -sL "${BASE_URL}/postile-x86_64-pc-windows-msvc.zip" -o postile-windows.zip
-          sha256sum postile-windows.zip >> checksums.txt
+          curl -sL "${BASE_URL}/tilefeed-x86_64-pc-windows-msvc.zip" -o tilefeed-windows.zip
+          sha256sum tilefeed-windows.zip >> checksums.txt
           cat checksums.txt
       - name: Update Homebrew formula
         run: |
@@ -190,74 +190,74 @@ jobs:
           SHA_ARM=$(grep aarch64-apple-darwin checksums.txt | awk '{print $1}')
           SHA_INTEL=$(grep x86_64-apple-darwin checksums.txt | awk '{print $1}')
           SHA_LINUX=$(grep x86_64-unknown-linux-gnu checksums.txt | awk '{print $1}')
-          cat > Formula/postile.rb <<EOF
-          class Postile < Formula
+          cat > Formula/tilefeed.rb <<EOF
+          class Tilefeed < Formula
             desc "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
-            homepage "https://github.com/muimsd/postile"
+            homepage "https://github.com/muimsd/tilefeed"
             version "${VERSION}"
             license "MIT"
 
             on_macos do
               on_arm do
-                url "https://github.com/muimsd/postile/releases/download/v${VERSION}/postile-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-aarch64-apple-darwin.tar.gz"
                 sha256 "${SHA_ARM}"
               end
               on_intel do
-                url "https://github.com/muimsd/postile/releases/download/v${VERSION}/postile-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-x86_64-apple-darwin.tar.gz"
                 sha256 "${SHA_INTEL}"
               end
             end
 
             on_linux do
-              url "https://github.com/muimsd/postile/releases/download/v${VERSION}/postile-x86_64-unknown-linux-gnu.tar.gz"
+              url "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
               sha256 "${SHA_LINUX}"
             end
 
             def install
-              bin.install "postile"
+              bin.install "tilefeed"
             end
 
             test do
-              assert_match "postile", shell_output("\#{bin}/postile --help")
+              assert_match "tilefeed", shell_output("\#{bin}/tilefeed --help")
             end
           end
           EOF
-          sed -i 's/^          //' Formula/postile.rb
+          sed -i 's/^          //' Formula/tilefeed.rb
       - name: Update Scoop manifest
         run: |
           VERSION=${{ steps.version.outputs.version }}
           SHA_WIN=$(grep windows checksums.txt | awk '{print $1}')
-          cat > bucket/postile.json <<EOF
+          cat > bucket/tilefeed.json <<EOF
           {
               "version": "${VERSION}",
               "description": "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY",
-              "homepage": "https://github.com/muimsd/postile",
+              "homepage": "https://github.com/muimsd/tilefeed",
               "license": "MIT",
               "architecture": {
                   "64bit": {
-                      "url": "https://github.com/muimsd/postile/releases/download/v${VERSION}/postile-x86_64-pc-windows-msvc.zip",
+                      "url": "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-x86_64-pc-windows-msvc.zip",
                       "hash": "${SHA_WIN}"
                   }
               },
-              "bin": "postile.exe",
+              "bin": "tilefeed.exe",
               "checkver": {
-                  "github": "https://github.com/muimsd/postile"
+                  "github": "https://github.com/muimsd/tilefeed"
               },
               "autoupdate": {
                   "architecture": {
                       "64bit": {
-                          "url": "https://github.com/muimsd/postile/releases/download/v\$version/postile-x86_64-pc-windows-msvc.zip"
+                          "url": "https://github.com/muimsd/tilefeed/releases/download/v\$version/tilefeed-x86_64-pc-windows-msvc.zip"
                       }
                   }
               }
           }
           EOF
-          sed -i 's/^          //' bucket/postile.json
+          sed -i 's/^          //' bucket/tilefeed.json
       - name: Commit and push manifest updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/postile.rb bucket/postile.json
+          git add Formula/tilefeed.rb bucket/tilefeed.json
           git commit -m "Update package manifests for v${{ steps.version.outputs.version }}"
           git push
 
@@ -275,9 +275,9 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $url = "https://github.com/muimsd/postile/releases/download/v${version}/postile-x86_64-pc-windows-msvc.zip"
-          Invoke-WebRequest -Uri $url -OutFile postile.zip
-          $hash = (Get-FileHash postile.zip -Algorithm SHA256).Hash
+          $url = "https://github.com/muimsd/tilefeed/releases/download/v${version}/tilefeed-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile tilefeed.zip
+          $hash = (Get-FileHash tilefeed.zip -Algorithm SHA256).Hash
           echo "sha=$hash" >> $env:GITHUB_OUTPUT
         id: checksum
       - name: Prepare Chocolatey package
@@ -286,14 +286,14 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $sha = "${{ steps.checksum.outputs.sha }}"
           Copy-Item -Recurse packaging/chocolatey choco-pkg
-          (Get-Content choco-pkg/postile.nuspec) -replace '0.1.0', $version | Set-Content choco-pkg/postile.nuspec
+          (Get-Content choco-pkg/tilefeed.nuspec) -replace '0.1.0', $version | Set-Content choco-pkg/tilefeed.nuspec
           (Get-Content choco-pkg/tools/chocolateyinstall.ps1) -replace '__CHECKSUM__', $sha | Set-Content choco-pkg/tools/chocolateyinstall.ps1
       - name: Build and push Chocolatey package
         shell: pwsh
         run: |
           cd choco-pkg
           choco pack
-          choco push postile.${{ steps.version.outputs.version }}.nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+          choco push tilefeed.${{ steps.version.outputs.version }}.nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
 
   publish-winget:
     name: Submit to winget
@@ -308,7 +308,7 @@ jobs:
       - name: Submit to winget-pkgs
         uses: vedantmgoyal9/winget-releaser@v2
         with:
-          identifier: muimsd.postile
+          identifier: muimsd.tilefeed
           version: ${{ steps.version.outputs.version }}
-          installers-regex: postile-x86_64-pc-windows-msvc\.zip$
+          installers-regex: tilefeed-x86_64-pc-windows-msvc\.zip$
           token: ${{ secrets.WINGET_TOKEN }}

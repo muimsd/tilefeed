@@ -27,7 +27,7 @@ Requires PostgreSQL with PostGIS extension. Tippecanoe is needed for `generate` 
 
 ## Architecture
 
-**postile** is a PostGIS vector tile pipeline that builds MBTiles and incrementally updates them via PostgreSQL LISTEN/NOTIFY. It does not serve HTTP tiles.
+**tilefeed** is a PostGIS vector tile pipeline that builds MBTiles and incrementally updates them via PostgreSQL LISTEN/NOTIFY. It does not serve HTTP tiles.
 
 ### Multi-source model
 

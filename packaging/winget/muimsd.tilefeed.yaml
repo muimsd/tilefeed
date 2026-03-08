@@ -1,11 +1,11 @@
-PackageIdentifier: muimsd.postile
+PackageIdentifier: muimsd.tilefeed
 PackageVersion: 0.1.0
-PackageName: postile
+PackageName: tilefeed
 Publisher: muimsd
 License: MIT
-LicenseUrl: https://github.com/muimsd/postile/blob/main/LICENSE
+LicenseUrl: https://github.com/muimsd/tilefeed/blob/main/LICENSE
 ShortDescription: PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY
-PackageUrl: https://github.com/muimsd/postile
+PackageUrl: https://github.com/muimsd/tilefeed
 Tags:
   - postgis
   - vector-tiles
@@ -15,12 +15,12 @@ Tags:
 Installers:
   - Architecture: x64
     InstallerType: zip
-    InstallerUrl: https://github.com/muimsd/postile/releases/download/v0.1.0/postile-x86_64-pc-windows-msvc.zip
+    InstallerUrl: https://github.com/muimsd/tilefeed/releases/download/v0.1.0/tilefeed-x86_64-pc-windows-msvc.zip
     InstallerSha256: __CHECKSUM__
     NestedInstallerType: portable
     NestedInstallerFiles:
-      - RelativeFilePath: postile.exe
-        PortableCommandAlias: postile
+      - RelativeFilePath: tilefeed.exe
+        PortableCommandAlias: tilefeed
 PackageLocale: en-US
 ManifestType: singleton
 ManifestVersion: 1.6.0

@@ -118,8 +118,8 @@ async fn run_publish_command(command: &str, source_path: &str, reason: &str) -> 
     let output = Command::new("sh")
         .arg("-c")
         .arg(command)
-        .env("POSTILE_MBTILES_PATH", source_path)
-        .env("POSTILE_PUBLISH_REASON", reason)
+        .env("TILEFEED_MBTILES_PATH", source_path)
+        .env("TILEFEED_PUBLISH_REASON", reason)
         .output()
         .await
         .with_context(|| format!("Failed to run publish command '{}'", command))?;
@@ -128,8 +128,8 @@ async fn run_publish_command(command: &str, source_path: &str, reason: &str) -> 
     let output = Command::new("cmd")
         .arg("/C")
         .arg(command)
-        .env("POSTILE_MBTILES_PATH", source_path)
-        .env("POSTILE_PUBLISH_REASON", reason)
+        .env("TILEFEED_MBTILES_PATH", source_path)
+        .env("TILEFEED_PUBLISH_REASON", reason)
         .output()
         .await
         .with_context(|| format!("Failed to run publish command '{}'", command))?;

@@ -17,7 +17,7 @@ use updater::start_listener;
 
 #[derive(Parser)]
 #[command(
-    name = "postile",
+    name = "tilefeed",
     about = "PostGIS vector tile generator with incremental MBTiles updates"
 )]
 struct Cli {

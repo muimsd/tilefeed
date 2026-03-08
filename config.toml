@@ -15,7 +15,7 @@ backend = "none" # "none", "local", "s3", "command"
 # destination = "/tmp/tiles.mbtiles"   # for local
 # destination = "s3://bucket/tiles.mbtiles" # for s3
 # args = ["--endpoint-url", "https://s3.us-east-1.amazonaws.com"] # optional for s3
-# command = "rclone copy \"$POSTILE_MBTILES_PATH\" remote:tiles/tiles.mbtiles" # for command backend
+# command = "rclone copy \"$TILEFEED_MBTILES_PATH\" remote:tiles/tiles.mbtiles" # for command backend
 publish_on_generate = true
 publish_on_update = true
 

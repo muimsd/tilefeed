@@ -1,10 +1,10 @@
 [package]
-name = "postile"
+name = "tilefeed"
 version = "0.2.0"
 edition = "2021"
 description = "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
 license = "MIT"
-repository = "https://github.com/muimsd/postile"
+repository = "https://github.com/muimsd/tilefeed"
 keywords = ["postgis", "vector-tiles", "mbtiles", "tippecanoe", "gis"]
 categories = ["command-line-utilities", "database"]
 readme = "README.md"
@@ -58,14 +58,14 @@ depends = "$auto"
 section = "utils"
 priority = "optional"
 assets = [
-    ["target/release/postile", "usr/bin/", "755"],
-    ["README.md", "usr/share/doc/postile/README", "644"],
+    ["target/release/tilefeed", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/tilefeed/README", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/postile", dest = "/usr/bin/postile", mode = "0755" },
-    { source = "README.md", dest = "/usr/share/doc/postile/README.md", mode = "0644" },
+    { source = "target/release/tilefeed", dest = "/usr/bin/tilefeed", mode = "0755" },
+    { source = "README.md", dest = "/usr/share/doc/tilefeed/README.md", mode = "0644" },
 ]
 
 [build-dependencies]

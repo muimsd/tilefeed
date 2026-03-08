@@ -12,8 +12,8 @@ End-to-end example using sample park and trail data in San Francisco. Demonstrat
 
 ```bash
 # Create the database and load sample data (5 parks, 4 trails)
-createdb postile_example
-psql -d postile_example < examples/local-parks/setup.sql
+createdb tilefeed_example
+psql -d tilefeed_example < examples/local-parks/setup.sql
 ```
 
 This creates two tables (`parks` polygons, `trails` linestrings) with sample SF geometries, spatial indexes, and LISTEN/NOTIFY triggers.
@@ -57,7 +57,7 @@ cargo run --release -- -c examples/local-parks/config.toml watch
 You should see:
 
 ```
-INFO postile::updater: Listening for tile_update notifications on PostgreSQL
+INFO tilefeed::updater: Listening for tile_update notifications on PostgreSQL
 ```
 
 ### Step 3: Make changes in another terminal
@@ -66,7 +66,7 @@ While the watcher is running, open another terminal and modify data:
 
 ```bash
 # Insert a new park
-psql -d postile_example -c "
+psql -d tilefeed_example -c "
 INSERT INTO parks (name, type, geom) VALUES (
     'Twin Peaks',
     'scenic_overlook',
@@ -75,12 +75,12 @@ INSERT INTO parks (name, type, geom) VALUES (
 "
 
 # Update an existing trail
-psql -d postile_example -c "
+psql -d tilefeed_example -c "
 UPDATE trails SET difficulty = 'moderate', length_km = 2.0 WHERE name = 'Glen Park Loop';
 "
 
 # Delete a park
-psql -d postile_example -c "
+psql -d tilefeed_example -c "
 DELETE FROM parks WHERE name = 'Buena Vista Park';
 "
 ```
@@ -90,15 +90,15 @@ DELETE FROM parks WHERE name = 'Buena Vista Park';
 The watcher terminal should show tiles being regenerated for each change:
 
 ```
-INFO postile::updater: Processing batch of 1 notification(s)
-INFO postile::updater: Regenerating 17 unique tiles from batch
-INFO postile::updater: Batch update complete (17 tiles)
-INFO postile::updater: Processing batch of 1 notification(s)
-INFO postile::updater: Regenerating 15 unique tiles from batch
-INFO postile::updater: Batch update complete (15 tiles)
-INFO postile::updater: Processing batch of 1 notification(s)
-INFO postile::updater: Regenerating 16 unique tiles from batch
-INFO postile::updater: Batch update complete (16 tiles)
+INFO tilefeed::updater: Processing batch of 1 notification(s)
+INFO tilefeed::updater: Regenerating 17 unique tiles from batch
+INFO tilefeed::updater: Batch update complete (17 tiles)
+INFO tilefeed::updater: Processing batch of 1 notification(s)
+INFO tilefeed::updater: Regenerating 15 unique tiles from batch
+INFO tilefeed::updater: Batch update complete (15 tiles)
+INFO tilefeed::updater: Processing batch of 1 notification(s)
+INFO tilefeed::updater: Regenerating 16 unique tiles from batch
+INFO tilefeed::updater: Batch update complete (16 tiles)
 ```
 
 Each INSERT/UPDATE/DELETE fires a PostgreSQL NOTIFY event. The watcher debounces them, computes affected tiles from feature bounds, and regenerates only those tiles in the MBTiles file.
@@ -114,7 +114,7 @@ cargo run --release -- -c examples/local-parks/config.toml run
 ## Cleanup
 
 ```bash
-dropdb postile_example
+dropdb tilefeed_example
 rm -f examples/local-parks/parks.mbtiles
 rm -rf examples/local-parks/output/
 ```

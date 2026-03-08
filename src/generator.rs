@@ -6,7 +6,7 @@ use crate::postgis::PostgisReader;
 
 /// Generate MBTiles for a single source using Tippecanoe
 pub async fn generate_source(source: &SourceConfig, reader: &PostgisReader) -> Result<()> {
-    let temp_dir = std::env::temp_dir().join(format!("postile-export-{}", source.name));
+    let temp_dir = std::env::temp_dir().join(format!("tilefeed-export-{}", source.name));
     tokio::fs::create_dir_all(&temp_dir).await?;
 
     let mut geojson_files = Vec::new();

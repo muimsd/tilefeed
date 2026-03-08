@@ -207,7 +207,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("postile_test_{}_{}_{}.mbtiles", pid, ts, id));
+        let path = std::env::temp_dir().join(format!("tilefeed_test_{}_{}_{}.mbtiles", pid, ts, id));
         path.to_string_lossy().to_string()
     }
 
