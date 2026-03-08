@@ -27,6 +27,59 @@ pub struct SourceConfig {
     pub min_zoom: u8,
     pub max_zoom: u8,
     pub layers: Vec<LayerConfig>,
+    #[serde(default)]
+    pub tippecanoe: TippecanoeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TippecanoeConfig {
+    // Feature dropping strategies (mutually exclusive in practice)
+    /// Drop the densest features to keep tiles under size limit
+    pub drop_densest_as_needed: Option<bool>,
+    /// Drop a fraction of features to keep tiles under size limit
+    pub drop_fraction_as_needed: Option<bool>,
+    /// Drop the smallest features to keep tiles under size limit
+    pub drop_smallest_as_needed: Option<bool>,
+    /// Coalesce the densest features to keep tiles under size limit
+    pub coalesce_densest_as_needed: Option<bool>,
+
+    /// Continue tiling to higher zooms if features are still being dropped
+    pub extend_zooms_if_still_dropping: Option<bool>,
+
+    // Drop rate control
+    /// Rate at which features are dropped at lower zooms (default: 2.5)
+    pub drop_rate: Option<f64>,
+    /// Base zoom level for the drop rate calculation
+    pub base_zoom: Option<u8>,
+
+    // Detail and simplification
+    /// Simplification factor (in tile units, e.g. 10)
+    pub simplification: Option<f64>,
+    /// Detect shared borders between polygons and simplify them identically
+    pub detect_shared_borders: Option<bool>,
+    /// Don't combine very small polygons into pixels
+    pub no_tiny_polygon_reduction: Option<bool>,
+
+    // Tile limits
+    /// Don't limit the number of features per tile (default: 200,000)
+    pub no_feature_limit: Option<bool>,
+    /// Don't limit tile size (currently hardcoded on; set false to use default 500KB limit)
+    pub no_tile_size_limit: Option<bool>,
+    /// Don't compress tile data (PBF) with gzip
+    pub no_tile_compression: Option<bool>,
+
+    // Geometry tuning
+    /// Buffer size in pixels around each tile (default: 5)
+    pub buffer: Option<u32>,
+    /// Detail level at max zoom (default: 12, i.e. 4096 units)
+    pub full_detail: Option<u32>,
+    /// Detail level at lower zooms (default: 12)
+    pub low_detail: Option<u32>,
+    /// Detail level below which to drop features (default: equal to low_detail)
+    pub minimum_detail: Option<u32>,
+
+    /// Additional raw arguments passed directly to Tippecanoe
+    pub extra_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +210,7 @@ mod tests {
             min_zoom: 0,
             max_zoom: 14,
             layers: layer_names.iter().map(|l| sample_layer(l)).collect(),
+            tippecanoe: TippecanoeConfig::default(),
         }
     }
 

@@ -25,6 +25,38 @@ mbtiles_path = "./basemap.mbtiles"
 min_zoom = 0
 max_zoom = 14
 
+# Tippecanoe fine-tuning (all optional, sensible defaults apply)
+[sources.tippecanoe]
+# Feature dropping strategies (pick one or combine as needed)
+# drop_densest_as_needed = true
+# drop_fraction_as_needed = true
+# drop_smallest_as_needed = true
+# coalesce_densest_as_needed = true
+# extend_zooms_if_still_dropping = true
+
+# Drop rate control
+# drop_rate = 2.5        # rate features are dropped at lower zooms
+# base_zoom = 14         # base zoom for drop rate calculation
+
+# Detail and simplification
+# simplification = 10.0  # simplification factor in tile units
+# detect_shared_borders = true
+# no_tiny_polygon_reduction = true
+
+# Tile limits
+no_tile_size_limit = true     # default: true (set false for 500KB limit)
+# no_feature_limit = true     # remove 200,000 feature-per-tile limit
+# no_tile_compression = true  # skip gzip compression of PBF tiles
+
+# Geometry tuning
+# buffer = 5             # pixel buffer around each tile edge
+# full_detail = 12       # detail at max zoom (4096 coordinate units)
+# low_detail = 12        # detail at lower zooms
+# minimum_detail = 7     # detail below which features are dropped
+
+# Escape hatch: pass any extra arguments directly to Tippecanoe
+# extra_args = ["--cluster-distance=10", "--accumulate-attribute=count:sum"]
+
 [[sources.layers]]
 name = "buildings"
 schema = "public"
