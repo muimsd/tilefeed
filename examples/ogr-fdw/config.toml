@@ -1,0 +1,38 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_ogr_example"
+pool_size = 4
+
+[updates]
+debounce_ms = 200
+worker_concurrency = 8
+
+[publish]
+backend = "local"
+destination = "./examples/ogr-fdw/output/buildings.mbtiles"
+publish_on_generate = true
+publish_on_update = false  # foreign tables don't support LISTEN/NOTIFY
+
+# Buildings from Esri FeatureServer via OGR_FDW
+[[sources]]
+name = "buildings"
+mbtiles_path = "./examples/ogr-fdw/buildings.mbtiles"
+min_zoom = 0
+max_zoom = 16
+
+[sources.tippecanoe]
+drop_densest_as_needed = true
+no_tile_size_limit = true
+no_feature_limit = true
+detect_shared_borders = true
+
+[[sources.layers]]
+name = "buildings"
+table = "buildings"          # foreign table created by OGR_FDW
+geometry_column = "geom"
+id_column = "ogc_fid"
+srid = 4326
+properties = ["name", "type", "height"]
