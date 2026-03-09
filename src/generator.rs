@@ -113,13 +113,10 @@ pub async fn generate_source(
 
     info!("Running Tippecanoe for source '{}': {:?}", source.name, cmd);
 
-    let output = cmd
-        .output()
-        .await
-        .context(format!(
-            "Failed to run '{}'. Is it installed and in PATH?",
-            bin
-        ))?;
+    let output = cmd.output().await.context(format!(
+        "Failed to run '{}'. Is it installed and in PATH?",
+        bin
+    ))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
