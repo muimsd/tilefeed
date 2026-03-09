@@ -1,0 +1,31 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_example"
+
+[updates]
+debounce_ms = 200
+worker_concurrency = 4
+
+# Custom path to ogr2ogr (optional, defaults to "ogr2ogr" on PATH)
+# ogr2ogr_bin = "/usr/local/bin/ogr2ogr"
+
+# GDAL backend: uses ogr2ogr to generate MBTiles directly from GeoJSON
+[[sources]]
+name = "districts"
+mbtiles_path = "./examples/gdal-generation/districts.mbtiles"
+min_zoom = 0
+max_zoom = 12
+generation_backend = "gdal"
+
+[[sources.layers]]
+name = "districts"
+schema = "public"
+table = "districts"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "population", "area_sqkm"]
+generate_label_points = true

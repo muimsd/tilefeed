@@ -748,4 +748,100 @@ mod tests {
         assert_eq!(cfg.sources[0].max_zoom, 8);
         assert!(cfg.sources[0].layers[0].generate_label_points);
     }
+
+    #[test]
+    fn test_load_gdal_generation_config() {
+        let cfg = load_config("examples/gdal-generation/config").unwrap();
+        assert_eq!(cfg.sources[0].name, "districts");
+        assert!(matches!(
+            cfg.sources[0].generation_backend,
+            GenerationBackend::Gdal
+        ));
+        assert_eq!(cfg.sources[0].max_zoom, 12);
+        assert!(cfg.sources[0].layers[0].generate_label_points);
+        assert_eq!(
+            cfg.sources[0].layers[0].properties,
+            Some(vec![
+                "name".to_string(),
+                "population".to_string(),
+                "area_sqkm".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_load_multi_source_config() {
+        let cfg = load_config("examples/multi-source/config").unwrap();
+        assert_eq!(cfg.sources.len(), 2);
+        // Source 1: basemap with tippecanoe
+        assert_eq!(cfg.sources[0].name, "basemap");
+        assert!(matches!(
+            cfg.sources[0].generation_backend,
+            GenerationBackend::Tippecanoe
+        ));
+        assert_eq!(cfg.sources[0].layers.len(), 2);
+        assert!(cfg.sources[0].layers[0].generate_label_points);
+        assert!(cfg.sources[0].layers[0].generate_boundary_lines);
+        assert!(cfg.sources[0].layers[0].simplify_tolerance.is_some());
+        assert!(cfg.sources[0].layers[0].property_rules.is_some());
+        assert!(cfg.sources[0].layers[1].property_rules.is_some());
+        // Source 2: POI with native
+        assert_eq!(cfg.sources[1].name, "poi");
+        assert!(matches!(
+            cfg.sources[1].generation_backend,
+            GenerationBackend::Native
+        ));
+        assert_eq!(cfg.sources[1].min_zoom, 10);
+        assert_eq!(cfg.sources[1].max_zoom, 16);
+        // Serve config
+        assert_eq!(cfg.serve.host, Some("0.0.0.0".to_string()));
+        assert_eq!(cfg.serve.cors_origins.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_load_s3_publish_config() {
+        let cfg = load_config("examples/s3-publish/config").unwrap();
+        assert!(matches!(cfg.publish.backend, PublishBackend::S3));
+        assert!(cfg
+            .publish
+            .destination
+            .as_ref()
+            .unwrap()
+            .starts_with("s3://"));
+        assert!(cfg.publish.publish_on_generate_enabled());
+        assert!(cfg.publish.publish_on_update_enabled());
+    }
+
+    #[test]
+    fn test_load_mapbox_publish_config() {
+        let cfg = load_config("examples/mapbox-publish/config").unwrap();
+        assert!(matches!(cfg.publish.backend, PublishBackend::Mapbox));
+        assert_eq!(
+            cfg.publish.mapbox_tileset_id,
+            Some("username.basemap".to_string())
+        );
+        assert!(cfg.publish.mapbox_token.is_some());
+        assert!(cfg.publish.publish_on_generate_enabled());
+        assert!(!cfg.publish.publish_on_update_enabled());
+        assert!(cfg.sources[0].layers[0].generate_label_points);
+    }
+
+    #[test]
+    fn test_load_custom_command_config() {
+        let cfg = load_config("examples/custom-command/config").unwrap();
+        assert!(matches!(cfg.publish.backend, PublishBackend::Command));
+        assert_eq!(cfg.publish.command, Some("rsync".to_string()));
+        assert_eq!(
+            cfg.publish.args,
+            Some(vec!["-avz".to_string(), "--progress".to_string()])
+        );
+        assert!(matches!(
+            cfg.sources[0].generation_backend,
+            GenerationBackend::Native
+        ));
+        assert_eq!(
+            cfg.sources[0].layers[0].filter,
+            Some("type IN ('national', 'state')".to_string())
+        );
+    }
 }

@@ -1,0 +1,33 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_example"
+
+[updates]
+debounce_ms = 500
+worker_concurrency = 4
+
+[publish]
+backend = "mapbox"
+mapbox_tileset_id = "username.basemap"
+mapbox_token = "sk.eyJ1IjoiZXhhbXBsZSJ9.example_secret_token"
+publish_on_generate = true
+publish_on_update = false
+
+[[sources]]
+name = "basemap"
+mbtiles_path = "./examples/mapbox-publish/basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[[sources.layers]]
+name = "buildings"
+schema = "public"
+table = "buildings"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type", "height"]
+generate_label_points = true

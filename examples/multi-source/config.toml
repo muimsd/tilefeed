@@ -1,0 +1,78 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_example"
+pool_size = 8
+
+[updates]
+debounce_ms = 300
+worker_concurrency = 4
+
+[serve]
+host = "0.0.0.0"
+port = 3000
+cors_origins = ["http://localhost:8080", "http://localhost:3000"]
+
+# Source 1: basemap with multiple layers at low-mid zoom
+[[sources]]
+name = "basemap"
+mbtiles_path = "./examples/multi-source/basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[sources.tippecanoe]
+drop_densest_as_needed = true
+no_tile_size_limit = true
+
+[[sources.layers]]
+name = "buildings"
+schema = "public"
+table = "buildings"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type", "height"]
+simplify_tolerance = 0.00001
+generate_label_points = true
+generate_boundary_lines = true
+
+[[sources.layers.property_rules]]
+below_zoom = 10
+exclude = ["height"]
+
+[[sources.layers]]
+name = "roads"
+schema = "public"
+table = "roads"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "class", "surface"]
+simplify_tolerance = 0.00001
+
+[[sources.layers.property_rules]]
+below_zoom = 8
+exclude = ["surface"]
+
+# Source 2: POIs at higher zoom using native backend
+[[sources]]
+name = "poi"
+mbtiles_path = "./examples/multi-source/poi.mbtiles"
+min_zoom = 10
+max_zoom = 16
+generation_backend = "native"
+
+[[sources.layers]]
+name = "pois"
+schema = "public"
+table = "points_of_interest"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "category", "rating"]
+
+[[sources.layers.property_rules]]
+below_zoom = 14
+exclude = ["rating"]

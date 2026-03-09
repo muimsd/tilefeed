@@ -438,6 +438,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn test_check_binary_custom_path() {
         assert!(check_binary("echo", Some("/bin/echo")).is_ok());
     }

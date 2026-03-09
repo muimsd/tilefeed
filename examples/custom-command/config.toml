@@ -1,0 +1,34 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_example"
+
+[updates]
+debounce_ms = 200
+worker_concurrency = 4
+
+[publish]
+backend = "command"
+command = "rsync"
+args = ["-avz", "--progress"]
+publish_on_generate = true
+publish_on_update = true
+
+[[sources]]
+name = "basemap"
+mbtiles_path = "./examples/custom-command/basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+generation_backend = "native"
+
+[[sources.layers]]
+name = "parks"
+schema = "public"
+table = "parks"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type"]
+filter = "type IN ('national', 'state')"
