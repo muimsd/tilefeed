@@ -274,6 +274,7 @@ jobs:
   publish-chocolatey:
     name: Publish to Chocolatey
     needs: release
+    continue-on-error: true
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -308,6 +309,7 @@ jobs:
   publish-winget:
     name: Submit to winget
     needs: release
+    continue-on-error: true
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
