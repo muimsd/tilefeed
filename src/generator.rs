@@ -5,7 +5,11 @@ use crate::config::SourceConfig;
 use crate::postgis::PostgisReader;
 
 /// Generate MBTiles for a single source using Tippecanoe
-pub async fn generate_source(source: &SourceConfig, reader: &PostgisReader) -> Result<()> {
+pub async fn generate_source(
+    source: &SourceConfig,
+    reader: &PostgisReader,
+    tippecanoe_bin: Option<&str>,
+) -> Result<()> {
     let temp_dir = std::env::temp_dir().join(format!("tilefeed-export-{}", source.name));
     tokio::fs::create_dir_all(&temp_dir).await?;
 
@@ -23,7 +27,8 @@ pub async fn generate_source(source: &SourceConfig, reader: &PostgisReader) -> R
     }
 
     // Build Tippecanoe command
-    let mut cmd = tokio::process::Command::new("tippecanoe");
+    let bin = tippecanoe_bin.unwrap_or("tippecanoe");
+    let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("-o").arg(&source.mbtiles_path);
     cmd.arg("--force"); // Overwrite existing
     cmd.arg("--minimum-zoom").arg(source.min_zoom.to_string());
@@ -111,7 +116,10 @@ pub async fn generate_source(source: &SourceConfig, reader: &PostgisReader) -> R
     let output = cmd
         .output()
         .await
-        .context("Failed to run Tippecanoe. Is it installed?")?;
+        .context(format!(
+            "Failed to run '{}'. Is it installed and in PATH?",
+            bin
+        ))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

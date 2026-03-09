@@ -83,7 +83,7 @@ async fn generate_all_sources(
     reader: &postgis::PostgisReader,
 ) -> Result<()> {
     for source in &config.sources {
-        generator::generate_source(source, reader).await?;
+        generator::generate_source(source, reader, config.tippecanoe_bin.as_deref()).await?;
     }
     Ok(())
 }

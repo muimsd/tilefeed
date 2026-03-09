@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub updates: UpdateConfig,
     #[serde(default)]
     pub publish: PublishConfig,
+    /// Path to the Tippecanoe binary (default: "tippecanoe", resolved via PATH)
+    pub tippecanoe_bin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +229,7 @@ mod tests {
             sources,
             updates: UpdateConfig::default(),
             publish: PublishConfig::default(),
+            tippecanoe_bin: None,
         }
     }
 

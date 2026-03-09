@@ -208,6 +208,9 @@ The trigger layer name must match a `[[sources.layers]].name` in config.
 Each `[[sources]]` block defines an independent MBTiles output with its own layers and zoom range. Notifications are automatically routed to the correct source based on layer name.
 
 ```toml
+# Path to Tippecanoe binary (default: "tippecanoe", resolved via PATH)
+# tippecanoe_bin = "/usr/local/bin/tippecanoe"
+
 [database]
 host = "localhost"
 port = 5432
