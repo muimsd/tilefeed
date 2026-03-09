@@ -13,6 +13,8 @@ impl MbtilesStore {
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open MBTiles at {}", path))?;
 
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+
         // Tippecanoe creates a `tiles` view over `map` + `images` tables.
         // Materialize it into a real table so we can INSERT/UPDATE/DELETE.
         let is_view: bool = conn
@@ -54,6 +56,8 @@ impl MbtilesStore {
 
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to create MBTiles at {}", path))?;
+
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
         conn.execute_batch(
             "
@@ -163,14 +167,101 @@ impl MbtilesStore {
     }
 
     /// Read a metadata value by name
-    #[cfg(test)]
-    fn get_metadata(&self, name: &str) -> Result<Option<String>> {
+    pub fn get_metadata(&self, name: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
             .prepare("SELECT value FROM metadata WHERE name = ?1")?;
         let result = stmt.query_row(params![name], |row| row.get::<_, String>(0));
         match result {
             Ok(val) => Ok(Some(val)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get all metadata key-value pairs
+    pub fn get_all_metadata(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT name, value FROM metadata ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Count total tiles
+    pub fn tile_count(&self) -> Result<u64> {
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM tiles", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Count tiles per zoom level
+    pub fn tile_count_by_zoom(&self) -> Result<Vec<(u8, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT zoom_level, COUNT(*) FROM tiles GROUP BY zoom_level ORDER BY zoom_level"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, u8>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get total size of all tile data in bytes
+    pub fn total_tile_size(&self) -> Result<u64> {
+        let size: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(tile_data)), 0) FROM tiles",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(size as u64)
+    }
+
+    /// Get average tile size in bytes
+    pub fn avg_tile_size(&self) -> Result<f64> {
+        let avg: f64 = self.conn.query_row(
+            "SELECT COALESCE(AVG(LENGTH(tile_data)), 0) FROM tiles",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(avg)
+    }
+
+    /// Get all tile coordinates (for diff)
+    pub fn all_tile_coords(&self) -> Result<Vec<(u8, u32, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT zoom_level, tile_column, tile_row FROM tiles ORDER BY zoom_level, tile_column, tile_row"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, u8>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get raw tile data by TMS coordinates (no y-flip)
+    pub fn get_tile_raw_tms(&self, z: u8, x: u32, tms_y: u32) -> Result<Option<Vec<u8>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tile_data FROM tiles WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3",
+        )?;
+        let result = stmt.query_row(params![z as i32, x as i32, tms_y as i32], |row| {
+            row.get::<_, Vec<u8>>(0)
+        });
+        match result {
+            Ok(data) => Ok(Some(data)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -433,6 +524,78 @@ mod tests {
         let retrieved = store.get_tile(5, 10, 10).unwrap();
         assert_eq!(retrieved, Some(b"persist".to_vec()));
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_tile_count() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        assert_eq!(store.tile_count().unwrap(), 0);
+
+        store.put_tile(0, 0, 0, b"a").unwrap();
+        store.put_tile(1, 0, 0, b"b").unwrap();
+        store.put_tile(1, 1, 0, b"c").unwrap();
+
+        assert_eq!(store.tile_count().unwrap(), 3);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_tile_count_by_zoom() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        store.put_tile(0, 0, 0, b"a").unwrap();
+        store.put_tile(2, 0, 0, b"b").unwrap();
+        store.put_tile(2, 1, 0, b"c").unwrap();
+        store.put_tile(2, 1, 1, b"d").unwrap();
+
+        let counts = store.tile_count_by_zoom().unwrap();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0], (0, 1));
+        assert_eq!(counts[1], (2, 3));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_total_tile_size() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        store.put_tile(0, 0, 0, b"hello").unwrap(); // 5 bytes
+        store.put_tile(1, 0, 0, b"world!!").unwrap(); // 7 bytes
+
+        assert_eq!(store.total_tile_size().unwrap(), 12);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_get_all_metadata() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        store.set_metadata("name", "test").unwrap();
+        store.set_metadata("format", "pbf").unwrap();
+
+        let metadata = store.get_all_metadata().unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0], ("format".to_string(), "pbf".to_string()));
+        assert_eq!(metadata[1], ("name".to_string(), "test".to_string()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_all_tile_coords() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        store.put_tile(0, 0, 0, b"a").unwrap(); // TMS y = 0
+        store.put_tile(1, 0, 0, b"b").unwrap(); // TMS y = 1
+
+        let coords = store.all_tile_coords().unwrap();
+        assert_eq!(coords.len(), 2);
         cleanup(&path);
     }
 }

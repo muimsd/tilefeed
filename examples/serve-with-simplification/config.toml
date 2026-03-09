@@ -1,0 +1,49 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_example"
+
+[updates]
+debounce_ms = 300
+worker_concurrency = 4
+
+[serve]
+host = "0.0.0.0"
+port = 3000
+cors_origins = ["http://localhost:8080"]
+
+[[sources]]
+name = "parks"
+mbtiles_path = "./examples/serve-with-simplification/parks.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+# Polygons with geometry simplification and property filtering
+[[sources.layers]]
+name = "parks"
+schema = "public"
+table = "parks"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type", "description", "area_sqm"]
+filter = "type != 'private'"
+simplify_tolerance = 0.00001
+
+# Exclude heavy properties at low zooms
+[[sources.layers.property_rules]]
+below_zoom = 8
+exclude = ["description", "area_sqm"]
+
+# Linestrings with simplification
+[[sources.layers]]
+name = "trails"
+schema = "public"
+table = "trails"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "difficulty", "length_km"]
+simplify_tolerance = 0.00001

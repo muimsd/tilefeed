@@ -21,11 +21,39 @@ struct UpdateEvent {
     old_bounds: Option<Bounds>,
 }
 
-/// Start the LISTEN/NOTIFY listener for incremental tile updates
+/// Start the LISTEN/NOTIFY listener for incremental tile updates with auto-reconnect
 pub async fn start_listener(
     config: Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     publisher: Option<Arc<StoragePublisher>>,
+) -> Result<()> {
+    let mut retry_count: u32 = 0;
+    let max_retry_delay_secs: u64 = 60;
+
+    loop {
+        match run_listener(&config, &stores, publisher.as_ref()).await {
+            Ok(()) => {
+                // Clean exit (channel closed)
+                info!("Listener exited cleanly");
+                return Ok(());
+            }
+            Err(e) => {
+                retry_count += 1;
+                let delay_secs = (2u64.pow(retry_count.min(6))).min(max_retry_delay_secs);
+                error!(
+                    "Listener connection lost: {}. Reconnecting in {}s (attempt {})...",
+                    e, delay_secs, retry_count
+                );
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            }
+        }
+    }
+}
+
+async fn run_listener(
+    config: &AppConfig,
+    stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
+    publisher: Option<&Arc<StoragePublisher>>,
 ) -> Result<()> {
     let (client, mut connection) =
         tokio_postgres::connect(&config.database.connection_string(), NoTls)
@@ -71,7 +99,7 @@ pub async fn start_listener(
         // Wait for the first notification
         let first = match rx.recv().await {
             Some(n) => n,
-            None => break,
+            None => return Ok(()),  // channel closed, will trigger reconnect in outer loop
         };
 
         let mut events = vec![first];
@@ -102,10 +130,10 @@ pub async fn start_listener(
 
         if !parsed_events.is_empty() {
             if let Err(e) = handle_batch_update(
-                &config,
+                config,
                 &reader,
-                &stores,
-                publisher.as_ref(),
+                stores,
+                publisher,
                 &parsed_events,
             )
             .await
@@ -114,8 +142,6 @@ pub async fn start_listener(
             }
         }
     }
-
-    Ok(())
 }
 
 fn parse_notification(payload: &str) -> Result<UpdateEvent> {
@@ -322,17 +348,23 @@ async fn regenerate_single_tile(
 ) -> Result<Option<Vec<u8>>> {
     let bounds = tile_coord.bounds();
     let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
+    let mut layer_configs: HashMap<String, &crate::config::LayerConfig> = HashMap::new();
 
     for layer in &source.layers {
         let features = reader.get_features_in_bounds(layer, &bounds).await?;
         if !features.is_empty() {
             features_by_layer.insert(layer.name.clone(), features);
         }
+        layer_configs.insert(layer.name.clone(), layer);
     }
 
     if features_by_layer.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(mvt::encode_tile(tile_coord, &features_by_layer)?))
+        Ok(Some(mvt::encode_tile_with_config(
+            tile_coord,
+            &features_by_layer,
+            &layer_configs,
+        )?))
     }
 }

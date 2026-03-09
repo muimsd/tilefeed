@@ -52,7 +52,7 @@ impl PostgisReader {
             None => "*".to_string(),
         };
 
-        let query = format!(
+        let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
@@ -61,6 +61,10 @@ impl PostgisReader {
             WHERE "{geom_col}" IS NOT NULL"#,
             table = layer.table,
         );
+
+        if let Some(ref filter) = layer.filter {
+            query.push_str(&format!(" AND ({})", filter));
+        }
 
         let rows = client
             .query(&query, &[])
@@ -124,7 +128,7 @@ impl PostgisReader {
             None => "*".to_string(),
         };
 
-        let query = format!(
+        let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
@@ -137,6 +141,10 @@ impl PostgisReader {
             WHERE "{id_col}" = $1 AND "{geom_col}" IS NOT NULL"#,
             table = layer.table,
         );
+
+        if let Some(ref filter) = layer.filter {
+            query.push_str(&format!(" AND ({})", filter));
+        }
 
         let row = client.query_opt(&query, &[&feature_id]).await?;
 
@@ -183,7 +191,7 @@ impl PostgisReader {
             None => "*".to_string(),
         };
 
-        let query = format!(
+        let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
@@ -196,6 +204,10 @@ impl PostgisReader {
               )"#,
             table = layer.table,
         );
+
+        if let Some(ref filter) = layer.filter {
+            query.push_str(&format!(" AND ({})", filter));
+        }
 
         let rows = client
             .query(
@@ -228,6 +240,118 @@ impl PostgisReader {
         }
 
         Ok(features)
+    }
+
+    /// Connect with retry and exponential backoff
+    pub async fn connect_with_retry(config: &DatabaseConfig, max_retries: u32) -> Result<Self> {
+        let mut attempt = 0;
+        loop {
+            match Self::connect(config).await {
+                Ok(reader) => return Ok(reader),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        return Err(e.context(format!("Failed to connect after {} attempts", max_retries)));
+                    }
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(5)));
+                    tracing::warn!(
+                        "PostGIS connection attempt {} failed: {}. Retrying in {:?}...",
+                        attempt, e, delay
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    /// Check if a layer's table and columns exist in the database
+    pub async fn validate_layer(&self, layer: &LayerConfig) -> Result<Vec<String>> {
+        let client = self.pool.get().await?;
+        let schema = layer.schema.as_deref().unwrap_or("public");
+        let mut issues = Vec::new();
+
+        // Check table exists
+        let table_exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)",
+                &[&schema, &layer.table],
+            )
+            .await?
+            .get(0);
+
+        if !table_exists {
+            issues.push(format!("Table \"{}\".\"{}\" does not exist", schema, layer.table));
+            return Ok(issues);
+        }
+
+        // Check geometry column(s) exist
+        for geom_col in layer.geometry_columns() {
+            let col_exists: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
+                    &[&schema, &layer.table, &geom_col],
+                )
+                .await?
+                .get(0);
+            if !col_exists {
+                issues.push(format!(
+                    "Geometry column \"{}\" does not exist in \"{}\".\"{}\"",
+                    geom_col, schema, layer.table
+                ));
+            }
+        }
+
+        // Check id column exists
+        let id_col = layer.id_column.as_deref().unwrap_or("id");
+        let id_exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
+                &[&schema, &layer.table, &id_col],
+            )
+            .await?
+            .get(0);
+        if !id_exists {
+            issues.push(format!(
+                "ID column \"{}\" does not exist in \"{}\".\"{}\"",
+                id_col, schema, layer.table
+            ));
+        }
+
+        // Check property columns exist
+        if let Some(ref props) = layer.properties {
+            for prop in props {
+                let prop_exists: bool = client
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
+                        &[&schema, &layer.table, &prop],
+                    )
+                    .await?
+                    .get(0);
+                if !prop_exists {
+                    issues.push(format!(
+                        "Property column \"{}\" does not exist in \"{}\".\"{}\"",
+                        prop, schema, layer.table
+                    ));
+                }
+            }
+        }
+
+        // Check if NOTIFY trigger is installed
+        let trigger_exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.triggers WHERE event_object_schema = $1 AND event_object_table = $2 AND trigger_name LIKE '%tile_update%')",
+                &[&schema, &layer.table],
+            )
+            .await?
+            .get(0);
+        if !trigger_exists {
+            issues.push(format!(
+                "No tile_update trigger found on \"{}\".\"{}\"",
+                schema, layer.table
+            ));
+        }
+
+        Ok(issues)
     }
 }
 

@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tiles_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  test-runner:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TILES_DATABASE__HOST: postgres
+      TILES_DATABASE__PORT: "5432"
+      TILES_DATABASE__USER: postgres
+      TILES_DATABASE__PASSWORD: postgres
+      TILES_DATABASE__DBNAME: tiles_test
+    volumes:
+      - ./tests/integration:/tests:ro
+    entrypoint: ["/bin/sh", "/tests/run.sh"]

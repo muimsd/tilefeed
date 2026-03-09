@@ -1,0 +1,26 @@
+[database]
+host = "postgres"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tiles_test"
+
+[[sources]]
+name = "test"
+mbtiles_path = "/tmp/test.mbtiles"
+min_zoom = 0
+max_zoom = 6
+
+[[sources.layers]]
+name = "points"
+table = "test_points"
+geometry_column = "geom"
+id_column = "id"
+properties = ["name"]
+
+[[sources.layers]]
+name = "lines"
+table = "test_lines"
+geometry_column = "geom"
+id_column = "id"
+properties = ["name"]

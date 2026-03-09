@@ -55,6 +55,13 @@ futures-util = "0.3"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# HTTP server (for tile serving)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
+
+# Hashing (for ETags)
+sha2 = "0.10"
+
 [package.metadata.deb]
 maintainer = "muimsd"
 depends = "$auto"

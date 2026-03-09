@@ -1,11 +1,15 @@
 mod config;
+mod diff;
 mod generator;
+mod inspect;
 mod mbtiles;
 mod mvt;
 mod postgis;
+mod server;
 mod storage;
 mod tiles;
 mod updater;
+mod validate;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -39,6 +43,26 @@ enum Commands {
 
     /// Generate tiles, optionally publish, then watch for incremental updates
     Run,
+
+    /// Generate, then serve tiles over HTTP and watch for updates
+    Serve,
+
+    /// Inspect an MBTiles file (metadata, tile counts, sizes)
+    Inspect {
+        /// Path to the MBTiles file to inspect
+        path: String,
+    },
+
+    /// Validate config against the actual database
+    Validate,
+
+    /// Compare two MBTiles files and show differences
+    Diff {
+        /// Path to the first MBTiles file
+        path_a: String,
+        /// Path to the second MBTiles file
+        path_b: String,
+    },
 }
 
 #[tokio::main]
@@ -53,25 +77,56 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
-    let app_config = Arc::new(config::load_config(&cli.config)?);
-    let publisher = storage::StoragePublisher::from_config(&app_config.publish)?.map(Arc::new);
 
     match cli.command {
-        Commands::Generate => {
-            let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-            generate_all_sources(&app_config, &reader).await?;
-            publish_after_generate(&app_config, publisher.as_deref()).await?;
-            info!("Tile generation complete");
+        Commands::Inspect { path } => {
+            inspect::inspect_mbtiles(&path)?;
         }
-        Commands::Watch => {
-            watch_updates(app_config, publisher).await?;
+        Commands::Diff { path_a, path_b } => {
+            diff::diff_mbtiles(&path_a, &path_b)?;
         }
-        Commands::Run => {
-            let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-            generate_all_sources(&app_config, &reader).await?;
-            publish_after_generate(&app_config, publisher.as_deref()).await?;
-            info!("Tile generation complete, starting incremental watcher...");
-            watch_updates(app_config, publisher).await?;
+        _ => {
+            // Commands that need the full config
+            let app_config = Arc::new(config::load_config(&cli.config)?);
+            let publisher =
+                storage::StoragePublisher::from_config(&app_config.publish)?.map(Arc::new);
+
+            match cli.command {
+                Commands::Generate => {
+                    let reader =
+                        postgis::PostgisReader::connect(&app_config.database).await?;
+                    generate_all_sources(&app_config, &reader).await?;
+                    publish_after_generate(&app_config, publisher.as_deref()).await?;
+                    info!("Tile generation complete");
+                }
+                Commands::Watch => {
+                    watch_updates(app_config, publisher).await?;
+                }
+                Commands::Run => {
+                    let reader =
+                        postgis::PostgisReader::connect(&app_config.database).await?;
+                    generate_all_sources(&app_config, &reader).await?;
+                    publish_after_generate(&app_config, publisher.as_deref()).await?;
+                    info!("Tile generation complete, starting incremental watcher...");
+                    watch_updates(app_config, publisher).await?;
+                }
+                Commands::Serve => {
+                    let reader =
+                        postgis::PostgisReader::connect(&app_config.database).await?;
+                    generate_all_sources(&app_config, &reader).await?;
+                    publish_after_generate(&app_config, publisher.as_deref()).await?;
+                    info!("Tile generation complete, starting server and watcher...");
+                    serve_and_watch(app_config, publisher).await?;
+                }
+                Commands::Validate => {
+                    let valid = validate::validate_config(&app_config).await?;
+                    if !valid {
+                        std::process::exit(1);
+                    }
+                }
+                // Already handled above
+                Commands::Inspect { .. } | Commands::Diff { .. } => unreachable!(),
+            }
         }
     }
 
@@ -107,16 +162,22 @@ async fn publish_after_generate(
     Ok(())
 }
 
-async fn watch_updates(
-    config: Arc<config::AppConfig>,
-    publisher: Option<Arc<storage::StoragePublisher>>,
-) -> Result<()> {
-    // Open one MbtilesStore per source
-    let mut stores: HashMap<String, Arc<Mutex<mbtiles::MbtilesStore>>> = HashMap::new();
+fn open_stores(
+    config: &config::AppConfig,
+) -> Result<HashMap<String, Arc<Mutex<mbtiles::MbtilesStore>>>> {
+    let mut stores = HashMap::new();
     for source in &config.sources {
         let store = mbtiles::MbtilesStore::open(&source.mbtiles_path)?;
         stores.insert(source.name.clone(), Arc::new(Mutex::new(store)));
     }
+    Ok(stores)
+}
+
+async fn watch_updates(
+    config: Arc<config::AppConfig>,
+    publisher: Option<Arc<storage::StoragePublisher>>,
+) -> Result<()> {
+    let stores = open_stores(&config)?;
 
     info!(
         "Watching PostgreSQL notifications for {} source(s)",
@@ -133,6 +194,43 @@ async fn watch_updates(
             listener_task.abort();
             let _ = listener_task.await;
             info!("Incremental watcher shut down");
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve_and_watch(
+    config: Arc<config::AppConfig>,
+    publisher: Option<Arc<storage::StoragePublisher>>,
+) -> Result<()> {
+    let stores = open_stores(&config)?;
+
+    info!(
+        "Starting server and watcher for {} source(s)",
+        stores.len()
+    );
+
+    let mut listener_task = tokio::spawn(start_listener(
+        config.clone(),
+        stores.clone(),
+        publisher.clone(),
+    ));
+    let mut server_task = tokio::spawn(server::start_server(config.clone(), stores));
+
+    tokio::select! {
+        result = &mut listener_task => {
+            result??;
+        }
+        result = &mut server_task => {
+            result??;
+        }
+        _ = shutdown_signal() => {
+            listener_task.abort();
+            server_task.abort();
+            let _ = listener_task.await;
+            let _ = server_task.await;
+            info!("Server and watcher shut down");
         }
     }
 

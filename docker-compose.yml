@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tiles
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  tilefeed:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./config.toml:/data/config.toml:ro
+      - tiles-data:/data/output
+    environment:
+      TILES_DATABASE__HOST: postgres
+      TILES_DATABASE__PORT: "5432"
+      TILES_DATABASE__USER: postgres
+      TILES_DATABASE__PASSWORD: postgres
+      TILES_DATABASE__DBNAME: tiles
+    ports:
+      - "3000:3000"
+    command: ["serve", "-c", "/data/config.toml"]
+
+volumes:
+  pgdata:
+  tiles-data:

@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub publish: PublishConfig,
     /// Path to the Tippecanoe binary (default: "tippecanoe", resolved via PATH)
     pub tippecanoe_bin: Option<String>,
+    #[serde(default)]
+    pub serve: ServeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +95,33 @@ pub struct LayerConfig {
     pub id_column: Option<String>,
     pub srid: Option<i32>,
     pub properties: Option<Vec<String>>,
+    pub filter: Option<String>,
+    pub geometry_columns: Option<Vec<String>>,
+    /// Douglas-Peucker simplification tolerance in degrees (applied per zoom)
+    /// Higher values = more simplification. Tolerance is scaled by 2^(max_zoom - current_zoom).
+    pub simplify_tolerance: Option<f64>,
+    /// Properties to exclude at zoom levels below this threshold
+    /// e.g. `{ below_zoom = 10, exclude = ["description", "metadata"] }`
+    pub property_rules: Option<Vec<PropertyRule>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PropertyRule {
+    /// Zoom level below which properties are excluded
+    pub below_zoom: u8,
+    /// Properties to exclude below the threshold
+    pub exclude: Vec<String>,
+}
+
+impl LayerConfig {
+    /// Get all geometry columns (supports both single and multiple)
+    pub fn geometry_columns(&self) -> Vec<String> {
+        if let Some(cols) = &self.geometry_columns {
+            cols.clone()
+        } else {
+            vec![self.geometry_column.as_deref().unwrap_or("geom").to_string()]
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,6 +188,23 @@ impl PublishConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServeConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub cors_origins: Option<Vec<String>>,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(3000),
+            cors_origins: None,
+        }
+    }
+}
+
 impl DatabaseConfig {
     pub fn connection_string(&self) -> String {
         format!(
@@ -207,6 +253,10 @@ mod tests {
             id_column: None,
             srid: None,
             properties: None,
+            filter: None,
+            geometry_columns: None,
+            simplify_tolerance: None,
+            property_rules: None,
         }
     }
 
@@ -235,6 +285,7 @@ mod tests {
             updates: UpdateConfig::default(),
             publish: PublishConfig::default(),
             tippecanoe_bin: None,
+            serve: ServeConfig::default(),
         }
     }
 

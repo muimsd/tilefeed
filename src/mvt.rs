@@ -1,11 +1,13 @@
 use anyhow::Result;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use geo::{LineString, Polygon, Simplify};
 use prost::Message;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
+use crate::config::LayerConfig;
 use crate::postgis::FeatureData;
 use crate::tiles::TileCoord;
 
@@ -23,9 +25,24 @@ pub fn encode_tile(
     tile_coord: &TileCoord,
     features_by_layer: &HashMap<String, Vec<FeatureData>>,
 ) -> Result<Vec<u8>> {
+    encode_tile_with_config(tile_coord, features_by_layer, &HashMap::new())
+}
+
+/// Encode a set of features into a gzipped MVT tile with layer-specific config
+/// for geometry simplification and property filtering
+pub fn encode_tile_with_config(
+    tile_coord: &TileCoord,
+    features_by_layer: &HashMap<String, Vec<FeatureData>>,
+    layer_configs: &HashMap<String, &LayerConfig>,
+) -> Result<Vec<u8>> {
     let mut layers = Vec::new();
 
     for (layer_name, features) in features_by_layer {
+        let layer_cfg = layer_configs.get(layer_name.as_str()).copied();
+
+        // Compute excluded properties for this zoom level
+        let excluded_props = compute_excluded_properties(layer_cfg, tile_coord.z);
+
         let mut keys: Vec<String> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         let mut key_index: HashMap<String, u32> = HashMap::new();
@@ -33,8 +50,15 @@ pub fn encode_tile(
         let mut mvt_features: Vec<Feature> = Vec::new();
 
         for feature in features {
+            // Apply geometry simplification if configured
+            let geometry = if let Some(tolerance) = simplification_tolerance(layer_cfg, tile_coord.z) {
+                let simplified = simplify_geometry(&feature.geometry, tolerance);
+                encode_geometry(&simplified, tile_coord)?
+            } else {
+                encode_geometry(&feature.geometry, tile_coord)?
+            };
+
             let geom_type = detect_geom_type(&feature.geometry);
-            let geometry = encode_geometry(&feature.geometry, tile_coord)?;
 
             if geometry.is_empty() {
                 continue;
@@ -43,6 +67,11 @@ pub fn encode_tile(
             let mut tags = Vec::new();
             if let Some(props) = feature.properties.as_object() {
                 for (k, v) in props {
+                    // Skip excluded properties
+                    if excluded_props.contains(k.as_str()) {
+                        continue;
+                    }
+
                     let key_idx = *key_index.entry(k.clone()).or_insert_with(|| {
                         keys.push(k.clone());
                         (keys.len() - 1) as u32
@@ -91,6 +120,156 @@ pub fn encode_tile(
     let compressed = encoder.finish()?;
 
     Ok(compressed)
+}
+
+/// Compute the simplification tolerance for a given zoom level
+fn simplification_tolerance(layer_cfg: Option<&LayerConfig>, zoom: u8) -> Option<f64> {
+    let cfg = layer_cfg?;
+    let base_tolerance = cfg.simplify_tolerance?;
+    // Scale tolerance: more simplification at lower zooms
+    // At max_zoom, tolerance is the base value; at lower zooms it's larger
+    Some(base_tolerance * (1 << (18u8.saturating_sub(zoom))) as f64)
+}
+
+/// Compute the set of property names to exclude at the given zoom level
+fn compute_excluded_properties<'a>(layer_cfg: Option<&'a LayerConfig>, zoom: u8) -> HashSet<&'a str> {
+    let mut excluded = HashSet::new();
+    if let Some(cfg) = layer_cfg {
+        if let Some(rules) = &cfg.property_rules {
+            for rule in rules {
+                if zoom < rule.below_zoom {
+                    for prop in &rule.exclude {
+                        excluded.insert(prop.as_str());
+                    }
+                }
+            }
+        }
+    }
+    excluded
+}
+
+/// Simplify a GeoJSON geometry using Douglas-Peucker algorithm
+fn simplify_geometry(geometry: &JsonValue, tolerance: f64) -> JsonValue {
+    let geom_type = geometry.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let coords = &geometry["coordinates"];
+
+    match geom_type {
+        "LineString" => {
+            if let Some(ls) = parse_linestring(coords) {
+                let simplified = ls.simplify(&tolerance);
+                let new_coords: Vec<JsonValue> = simplified
+                    .into_inner()
+                    .into_iter()
+                    .map(|c| serde_json::json!([c.x, c.y]))
+                    .collect();
+                serde_json::json!({"type": "LineString", "coordinates": new_coords})
+            } else {
+                geometry.clone()
+            }
+        }
+        "MultiLineString" => {
+            if let Some(lines) = coords.as_array() {
+                let new_lines: Vec<JsonValue> = lines
+                    .iter()
+                    .filter_map(|l| parse_linestring(l))
+                    .map(|ls| {
+                        let simplified = ls.simplify(&tolerance);
+                        simplified
+                            .into_inner()
+                            .into_iter()
+                            .map(|c| serde_json::json!([c.x, c.y]))
+                            .collect::<Vec<_>>()
+                    })
+                    .map(|coords| JsonValue::Array(coords))
+                    .collect();
+                serde_json::json!({"type": "MultiLineString", "coordinates": new_lines})
+            } else {
+                geometry.clone()
+            }
+        }
+        "Polygon" => {
+            if let Some(poly) = parse_polygon(coords) {
+                let simplified = poly.simplify(&tolerance);
+                let new_coords = polygon_to_json(&simplified);
+                serde_json::json!({"type": "Polygon", "coordinates": new_coords})
+            } else {
+                geometry.clone()
+            }
+        }
+        "MultiPolygon" => {
+            if let Some(polygons) = coords.as_array() {
+                let new_polys: Vec<JsonValue> = polygons
+                    .iter()
+                    .filter_map(|p| parse_polygon(p))
+                    .map(|poly| {
+                        let simplified = poly.simplify(&tolerance);
+                        JsonValue::Array(polygon_to_json(&simplified))
+                    })
+                    .collect();
+                serde_json::json!({"type": "MultiPolygon", "coordinates": new_polys})
+            } else {
+                geometry.clone()
+            }
+        }
+        // Points don't need simplification
+        _ => geometry.clone(),
+    }
+}
+
+fn parse_linestring(coords: &JsonValue) -> Option<LineString<f64>> {
+    let points = coords.as_array()?;
+    let coords: Vec<geo_types::Coord<f64>> = points
+        .iter()
+        .filter_map(|p| {
+            Some(geo_types::Coord {
+                x: p[0].as_f64()?,
+                y: p[1].as_f64()?,
+            })
+        })
+        .collect();
+    if coords.len() >= 2 {
+        Some(LineString::new(coords))
+    } else {
+        None
+    }
+}
+
+fn parse_polygon(coords: &JsonValue) -> Option<Polygon<f64>> {
+    let rings = coords.as_array()?;
+    if rings.is_empty() {
+        return None;
+    }
+
+    let exterior = parse_linestring(&rings[0])?;
+    let interiors: Vec<LineString<f64>> = rings[1..]
+        .iter()
+        .filter_map(|r| parse_linestring(r))
+        .collect();
+
+    Some(Polygon::new(exterior, interiors))
+}
+
+fn polygon_to_json(poly: &Polygon<f64>) -> Vec<JsonValue> {
+    let mut rings = Vec::new();
+
+    let exterior: Vec<JsonValue> = poly
+        .exterior()
+        .0
+        .iter()
+        .map(|c| serde_json::json!([c.x, c.y]))
+        .collect();
+    rings.push(JsonValue::Array(exterior));
+
+    for interior in poly.interiors() {
+        let ring: Vec<JsonValue> = interior
+            .0
+            .iter()
+            .map(|c| serde_json::json!([c.x, c.y]))
+            .collect();
+        rings.push(JsonValue::Array(ring));
+    }
+
+    rings
 }
 
 fn detect_geom_type(geometry: &JsonValue) -> GeomType {
@@ -504,6 +683,125 @@ mod tests {
         let result = encode_tile(&tile_coord, &features_by_layer).unwrap();
         assert!(!result.is_empty());
         // Verify gzip header
+        assert_eq!(result[0], 0x1f);
+        assert_eq!(result[1], 0x8b);
+    }
+
+    // --- simplification tests ---
+
+    #[test]
+    fn test_simplify_geometry_point_unchanged() {
+        let geom = json!({"type": "Point", "coordinates": [1.0, 2.0]});
+        let result = simplify_geometry(&geom, 0.1);
+        assert_eq!(result, geom);
+    }
+
+    #[test]
+    fn test_simplify_geometry_linestring() {
+        // A line with a slight deviation that should be simplified away
+        let geom = json!({
+            "type": "LineString",
+            "coordinates": [[0.0, 0.0], [0.5, 0.001], [1.0, 0.0]]
+        });
+        let result = simplify_geometry(&geom, 0.01);
+        let coords = result["coordinates"].as_array().unwrap();
+        // With tolerance 0.01, the middle point (deviation 0.001) should be removed
+        assert_eq!(coords.len(), 2);
+    }
+
+    #[test]
+    fn test_simplify_geometry_polygon() {
+        let geom = json!({
+            "type": "Polygon",
+            "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 0.001], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
+        });
+        let result = simplify_geometry(&geom, 0.01);
+        let exterior = result["coordinates"][0].as_array().unwrap();
+        // The near-collinear point should be simplified away
+        assert!(exterior.len() < 6);
+    }
+
+    // --- property filtering tests ---
+
+    #[test]
+    fn test_compute_excluded_properties_none() {
+        let excluded = compute_excluded_properties(None, 5);
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn test_compute_excluded_properties_below_zoom() {
+        use crate::config::PropertyRule;
+
+        let cfg = LayerConfig {
+            name: "test".to_string(),
+            schema: None,
+            table: "test".to_string(),
+            geometry_column: None,
+            id_column: None,
+            srid: None,
+            properties: None,
+            filter: None,
+            geometry_columns: None,
+            simplify_tolerance: None,
+            property_rules: Some(vec![PropertyRule {
+                below_zoom: 10,
+                exclude: vec!["description".to_string(), "metadata".to_string()],
+            }]),
+        };
+
+        // At zoom 5 (below 10), properties should be excluded
+        let excluded = compute_excluded_properties(Some(&cfg), 5);
+        assert!(excluded.contains("description"));
+        assert!(excluded.contains("metadata"));
+
+        // At zoom 12 (above 10), nothing excluded
+        let excluded = compute_excluded_properties(Some(&cfg), 12);
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_with_property_filtering() {
+        use crate::config::PropertyRule;
+
+        let tile_coord = TileCoord { z: 5, x: 16, y: 16 };
+        let feature = FeatureData {
+            id: 1,
+            geometry: json!({"type": "Point", "coordinates": [0.0, 0.0]}),
+            properties: json!({"name": "test", "description": "long text", "metadata": "extra"}),
+            bounds: crate::postgis::Bounds {
+                min_lon: -1.0, min_lat: -1.0, max_lon: 1.0, max_lat: 1.0,
+            },
+            layer_name: "layer".to_string(),
+        };
+
+        let cfg = LayerConfig {
+            name: "layer".to_string(),
+            schema: None,
+            table: "test".to_string(),
+            geometry_column: None,
+            id_column: None,
+            srid: None,
+            properties: None,
+            filter: None,
+            geometry_columns: None,
+            simplify_tolerance: None,
+            property_rules: Some(vec![PropertyRule {
+                below_zoom: 10,
+                exclude: vec!["description".to_string(), "metadata".to_string()],
+            }]),
+        };
+
+        let mut features_by_layer = HashMap::new();
+        features_by_layer.insert("layer".to_string(), vec![feature]);
+
+        let mut layer_configs: HashMap<String, &LayerConfig> = HashMap::new();
+        layer_configs.insert("layer".to_string(), &cfg);
+
+        // At zoom 5, description and metadata should be excluded
+        let result = encode_tile_with_config(&tile_coord, &features_by_layer, &layer_configs).unwrap();
+        assert!(!result.is_empty());
+        // Verify it's valid gzip
         assert_eq!(result[0], 0x1f);
         assert_eq!(result[1], 0x8b);
     }
