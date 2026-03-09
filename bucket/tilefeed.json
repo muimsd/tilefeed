@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
   "url": "https://github.com/muimsd/tilefeed/releases/download/v0.4.0/tilefeed-x86_64-pc-windows-msvc.zip",
-  "hash": "44d9507e0719b33c2eb39df1e37919bc28217ba36d23777bbbcf6a84ddc078b9"
+  "hash": "3c18cac124f8839061df388b30193292b8e7d20979734c24d5caa962d8f566bd"
         }
     },
     "bin": "tilefeed.exe",
