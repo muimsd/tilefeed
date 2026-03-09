@@ -180,6 +180,99 @@ fn parse_notification(payload: &str) -> Result<UpdateEvent> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_notification tests ---
+
+    #[test]
+    fn test_parse_notification_json_minimal() {
+        let payload = r#"{"layer": "buildings", "id": 42}"#;
+        let event = parse_notification(payload).unwrap();
+        assert_eq!(event.layer_name, "buildings");
+        assert_eq!(event.feature_id, 42);
+        assert!(event.old_bounds.is_none());
+    }
+
+    #[test]
+    fn test_parse_notification_json_with_old_bounds() {
+        let payload = r#"{"layer": "roads", "id": 7, "old_bounds": {"min_lon": -0.5, "min_lat": 51.0, "max_lon": 0.5, "max_lat": 52.0}}"#;
+        let event = parse_notification(payload).unwrap();
+        assert_eq!(event.layer_name, "roads");
+        assert_eq!(event.feature_id, 7);
+        let bounds = event.old_bounds.unwrap();
+        assert!((bounds.min_lon - (-0.5)).abs() < 1e-6);
+        assert!((bounds.min_lat - 51.0).abs() < 1e-6);
+        assert!((bounds.max_lon - 0.5).abs() < 1e-6);
+        assert!((bounds.max_lat - 52.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_notification_simple_format() {
+        let payload = "water:123";
+        let event = parse_notification(payload).unwrap();
+        assert_eq!(event.layer_name, "water");
+        assert_eq!(event.feature_id, 123);
+        assert!(event.old_bounds.is_none());
+    }
+
+    #[test]
+    fn test_parse_notification_simple_negative_id() {
+        let event = parse_notification("layer:-1").unwrap();
+        assert_eq!(event.feature_id, -1);
+    }
+
+    #[test]
+    fn test_parse_notification_invalid_format() {
+        let result = parse_notification("no_colon_here");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_notification_invalid_id() {
+        let result = parse_notification("layer:not_a_number");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_notification_json_missing_layer() {
+        let payload = r#"{"id": 42}"#;
+        let result = parse_notification(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_notification_json_missing_id() {
+        let payload = r#"{"layer": "test"}"#;
+        let result = parse_notification(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_notification_empty_string() {
+        let result = parse_notification("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_notification_json_large_id() {
+        let payload = r#"{"layer": "test", "id": 9999999999}"#;
+        let event = parse_notification(payload).unwrap();
+        assert_eq!(event.feature_id, 9999999999);
+    }
+
+    #[test]
+    fn test_parse_notification_json_old_bounds_partial() {
+        // old_bounds with missing fields should default to 0.0
+        let payload = r#"{"layer": "test", "id": 1, "old_bounds": {"min_lon": 5.0}}"#;
+        let event = parse_notification(payload).unwrap();
+        let bounds = event.old_bounds.unwrap();
+        assert!((bounds.min_lon - 5.0).abs() < 1e-6);
+        assert!((bounds.min_lat - 0.0).abs() < 1e-6);
+    }
+}
+
 /// Handle a batch of update events: group by source, deduplicate affected tiles, regenerate
 async fn handle_batch_update(
     config: &AppConfig,

@@ -598,4 +598,155 @@ mod tests {
         assert_eq!(coords.len(), 2);
         cleanup(&path);
     }
+
+    #[test]
+    fn test_avg_tile_size() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        store.put_tile(0, 0, 0, b"hello").unwrap(); // 5 bytes
+        store.put_tile(1, 0, 0, b"world!!").unwrap(); // 7 bytes
+
+        let avg = store.avg_tile_size().unwrap();
+        assert!((avg - 6.0).abs() < 0.01);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_avg_tile_size_empty() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        let avg = store.avg_tile_size().unwrap();
+        assert!((avg - 0.0).abs() < 0.01);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_get_tile_raw_tms() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        // put_tile uses XYZ y=0 at zoom 2 -> TMS y=3
+        store.put_tile(2, 1, 0, b"data").unwrap();
+
+        // get_tile_raw_tms uses raw TMS y, so tms_y=3 should find it
+        let result = store.get_tile_raw_tms(2, 1, 3).unwrap();
+        assert_eq!(result, Some(b"data".to_vec()));
+
+        // tms_y=0 should not find it
+        let result = store.get_tile_raw_tms(2, 1, 0).unwrap();
+        assert_eq!(result, None);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_get_tile_raw_tms_not_found() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        let result = store.get_tile_raw_tms(5, 10, 20).unwrap();
+        assert_eq!(result, None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_get_metadata_not_found() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        let result = store.get_metadata("nonexistent").unwrap();
+        assert_eq!(result, None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_tile_count_empty() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        assert_eq!(store.tile_count().unwrap(), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_tile_count_by_zoom_empty() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        let counts = store.tile_count_by_zoom().unwrap();
+        assert!(counts.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_total_tile_size_empty() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        assert_eq!(store.total_tile_size().unwrap(), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_all_tile_coords_empty() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        let coords = store.all_tile_coords().unwrap();
+        assert!(coords.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_multiple_tiles_same_zoom() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        store.put_tile(3, 0, 0, b"a").unwrap();
+        store.put_tile(3, 1, 0, b"b").unwrap();
+        store.put_tile(3, 0, 1, b"c").unwrap();
+        store.put_tile(3, 1, 1, b"d").unwrap();
+
+        assert_eq!(store.tile_count().unwrap(), 4);
+
+        let by_zoom = store.tile_count_by_zoom().unwrap();
+        assert_eq!(by_zoom.len(), 1);
+        assert_eq!(by_zoom[0], (3, 4));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_create_overwrites_existing() {
+        let path = temp_mbtiles_path();
+
+        // Create and add data
+        {
+            let store = MbtilesStore::create(&path).unwrap();
+            store.put_tile(0, 0, 0, b"old").unwrap();
+        }
+
+        // Create again should start fresh
+        let store = MbtilesStore::create(&path).unwrap();
+        assert_eq!(store.tile_count().unwrap(), 0);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_batch_write_in_transaction() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+
+        store.begin_transaction().unwrap();
+        for i in 0..100u32 {
+            store.put_tile(5, i, 0, format!("tile_{}", i).as_bytes()).unwrap();
+        }
+        store.commit_transaction().unwrap();
+
+        assert_eq!(store.tile_count().unwrap(), 100);
+        cleanup(&path);
+    }
 }

@@ -513,4 +513,159 @@ mod tests {
         assert!(conn_str.contains("user=postgres"));
         assert!(conn_str.contains("dbname=tiles"));
     }
+
+    // --- ServeConfig defaults ---
+
+    #[test]
+    fn test_serve_config_defaults() {
+        let config = ServeConfig::default();
+        assert_eq!(config.host, Some("127.0.0.1".to_string()));
+        assert_eq!(config.port, Some(3000));
+        assert_eq!(config.cors_origins, None);
+    }
+
+    // --- GenerationBackend defaults ---
+
+    #[test]
+    fn test_generation_backend_default_is_tippecanoe() {
+        let backend = GenerationBackend::default();
+        assert!(matches!(backend, GenerationBackend::Tippecanoe));
+    }
+
+    // --- find_source_for_layer with derived layers ---
+
+    #[test]
+    fn test_find_source_for_label_layer() {
+        let mut source = sample_source("src", &["parks"]);
+        source.layers[0].generate_label_points = true;
+        let config = sample_config(vec![source]);
+
+        let result = config.find_source_for_layer("parks_labels");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "src");
+    }
+
+    #[test]
+    fn test_find_source_for_boundary_layer() {
+        let mut source = sample_source("src", &["parks"]);
+        source.layers[0].generate_boundary_lines = true;
+        let config = sample_config(vec![source]);
+
+        let result = config.find_source_for_layer("parks_boundary");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "src");
+    }
+
+    #[test]
+    fn test_find_source_for_derived_layer_not_enabled() {
+        let source = sample_source("src", &["parks"]);
+        let config = sample_config(vec![source]);
+
+        assert!(config.find_source_for_layer("parks_labels").is_none());
+        assert!(config.find_source_for_layer("parks_boundary").is_none());
+    }
+
+    // --- SourceConfig::find_parent_layer_for_derived ---
+
+    #[test]
+    fn test_find_parent_layer_for_labels() {
+        let mut source = sample_source("src", &["parks", "water"]);
+        source.layers[0].generate_label_points = true;
+
+        let parent = source.find_parent_layer_for_derived("parks_labels");
+        assert!(parent.is_some());
+        assert_eq!(parent.unwrap().name, "parks");
+    }
+
+    #[test]
+    fn test_find_parent_layer_for_boundary() {
+        let mut source = sample_source("src", &["parks"]);
+        source.layers[0].generate_boundary_lines = true;
+
+        let parent = source.find_parent_layer_for_derived("parks_boundary");
+        assert!(parent.is_some());
+        assert_eq!(parent.unwrap().name, "parks");
+    }
+
+    #[test]
+    fn test_find_parent_layer_for_derived_not_found() {
+        let source = sample_source("src", &["parks"]);
+        assert!(source.find_parent_layer_for_derived("parks_labels").is_none());
+        assert!(source.find_parent_layer_for_derived("nonexistent_labels").is_none());
+    }
+
+    // --- SourceConfig::all_layer_names ---
+
+    #[test]
+    fn test_all_layer_names_no_derived() {
+        let source = sample_source("src", &["buildings", "roads"]);
+        let names = source.all_layer_names();
+        assert_eq!(names, vec!["buildings", "roads"]);
+    }
+
+    #[test]
+    fn test_all_layer_names_with_derived() {
+        let mut source = sample_source("src", &["parks", "water"]);
+        source.layers[0].generate_label_points = true;
+        source.layers[0].generate_boundary_lines = true;
+        source.layers[1].generate_label_points = true;
+
+        let names = source.all_layer_names();
+        assert_eq!(
+            names,
+            vec!["parks", "parks_labels", "parks_boundary", "water", "water_labels"]
+        );
+    }
+
+    #[test]
+    fn test_all_layer_names_empty() {
+        let source = sample_source("src", &[]);
+        let names = source.all_layer_names();
+        assert!(names.is_empty());
+    }
+
+    // --- LayerConfig::geometry_columns ---
+
+    #[test]
+    fn test_geometry_columns_default() {
+        let layer = sample_layer("test");
+        let cols = layer.geometry_columns();
+        assert_eq!(cols, vec!["geom".to_string()]);
+    }
+
+    #[test]
+    fn test_geometry_columns_single_override() {
+        let mut layer = sample_layer("test");
+        layer.geometry_column = Some("the_geom".to_string());
+        let cols = layer.geometry_columns();
+        assert_eq!(cols, vec!["the_geom".to_string()]);
+    }
+
+    #[test]
+    fn test_geometry_columns_multiple() {
+        let mut layer = sample_layer("test");
+        layer.geometry_columns = Some(vec!["geom".to_string(), "geom_simplified".to_string()]);
+        let cols = layer.geometry_columns();
+        assert_eq!(cols, vec!["geom".to_string(), "geom_simplified".to_string()]);
+    }
+
+    // --- PublishBackend ---
+
+    #[test]
+    fn test_publish_backend_default_is_none() {
+        let backend = PublishBackend::default();
+        assert!(matches!(backend, PublishBackend::None));
+    }
+
+    // --- SourceConfig::find_layer edge cases ---
+
+    #[test]
+    fn test_find_layer_does_not_match_derived_names() {
+        let mut source = sample_source("src", &["parks"]);
+        source.layers[0].generate_label_points = true;
+
+        // find_layer only matches actual layer names, not derived
+        assert!(source.find_layer("parks_labels").is_none());
+        assert!(source.find_layer("parks").is_some());
+    }
 }

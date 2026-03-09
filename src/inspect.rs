@@ -62,3 +62,90 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn test_format_bytes_small() {
+        assert_eq!(format_bytes(512), "512 B");
+    }
+
+    #[test]
+    fn test_format_bytes_one_kb() {
+        assert_eq!(format_bytes(1024), "1.0 KB");
+    }
+
+    #[test]
+    fn test_format_bytes_kb_range() {
+        assert_eq!(format_bytes(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn test_format_bytes_one_mb() {
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn test_format_bytes_mb_range() {
+        assert_eq!(format_bytes(5 * 1024 * 1024 + 512 * 1024), "5.5 MB");
+    }
+
+    #[test]
+    fn test_format_bytes_one_gb() {
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn test_format_bytes_boundary_kb() {
+        assert_eq!(format_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn test_inspect_mbtiles_with_tiles() {
+        let path = std::env::temp_dir()
+            .join(format!("tilefeed_inspect_test_{}.mbtiles", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+
+        let store = crate::mbtiles::MbtilesStore::create(&path).unwrap();
+        store.write_default_metadata("test", "A test tileset").unwrap();
+        store.put_tile(0, 0, 0, b"tile_data_here").unwrap();
+        store.put_tile(1, 0, 0, b"more_data").unwrap();
+        drop(store);
+
+        // Should not panic or error
+        let result = inspect_mbtiles(&path);
+        assert!(result.is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_inspect_mbtiles_empty() {
+        let path = std::env::temp_dir()
+            .join(format!("tilefeed_inspect_empty_{}.mbtiles", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+
+        let store = crate::mbtiles::MbtilesStore::create(&path).unwrap();
+        drop(store);
+
+        let result = inspect_mbtiles(&path);
+        assert!(result.is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_inspect_mbtiles_nonexistent() {
+        let result = inspect_mbtiles("/tmp/nonexistent_tilefeed_test.mbtiles");
+        assert!(result.is_err());
+    }
+}

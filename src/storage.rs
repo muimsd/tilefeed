@@ -181,6 +181,153 @@ struct MapboxUploadResponse {
     id: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PublishBackend, PublishConfig};
+
+    fn make_config(backend: PublishBackend) -> PublishConfig {
+        PublishConfig {
+            backend,
+            destination: Some("/tmp/output".to_string()),
+            command: Some("echo done".to_string()),
+            args: Some(vec!["--extra".to_string()]),
+            mapbox_tileset_id: Some("user.tileset".to_string()),
+            mapbox_token: Some("pk.test123".to_string()),
+            publish_on_generate: Some(true),
+            publish_on_update: Some(true),
+        }
+    }
+
+    #[test]
+    fn test_from_config_none() {
+        let config = make_config(PublishBackend::None);
+        let result = StoragePublisher::from_config(&config).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_config_local() {
+        let config = make_config(PublishBackend::Local);
+        let result = StoragePublisher::from_config(&config).unwrap();
+        assert!(result.is_some());
+        match result.unwrap() {
+            StoragePublisher::Local { destination } => {
+                assert_eq!(destination, std::path::PathBuf::from("/tmp/output"));
+            }
+            _ => panic!("Expected Local variant"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_s3() {
+        let config = make_config(PublishBackend::S3);
+        let result = StoragePublisher::from_config(&config).unwrap();
+        match result.unwrap() {
+            StoragePublisher::S3 { destination, args } => {
+                assert_eq!(destination, "/tmp/output");
+                assert_eq!(args, vec!["--extra".to_string()]);
+            }
+            _ => panic!("Expected S3 variant"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_mapbox() {
+        let config = make_config(PublishBackend::Mapbox);
+        let result = StoragePublisher::from_config(&config).unwrap();
+        match result.unwrap() {
+            StoragePublisher::Mapbox { tileset_id, token } => {
+                assert_eq!(tileset_id, "user.tileset");
+                assert_eq!(token, "pk.test123");
+            }
+            _ => panic!("Expected Mapbox variant"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_command() {
+        let config = make_config(PublishBackend::Command);
+        let result = StoragePublisher::from_config(&config).unwrap();
+        match result.unwrap() {
+            StoragePublisher::Command { command } => {
+                assert_eq!(command, "echo done");
+            }
+            _ => panic!("Expected Command variant"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_local_missing_destination() {
+        let config = PublishConfig {
+            backend: PublishBackend::Local,
+            destination: None,
+            ..PublishConfig::default()
+        };
+        let result = StoragePublisher::from_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_config_s3_missing_destination() {
+        let config = PublishConfig {
+            backend: PublishBackend::S3,
+            destination: None,
+            ..PublishConfig::default()
+        };
+        assert!(StoragePublisher::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_from_config_mapbox_missing_tileset() {
+        let config = PublishConfig {
+            backend: PublishBackend::Mapbox,
+            mapbox_tileset_id: None,
+            mapbox_token: Some("token".to_string()),
+            ..PublishConfig::default()
+        };
+        assert!(StoragePublisher::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_from_config_mapbox_missing_token() {
+        let config = PublishConfig {
+            backend: PublishBackend::Mapbox,
+            mapbox_tileset_id: Some("user.tileset".to_string()),
+            mapbox_token: None,
+            ..PublishConfig::default()
+        };
+        assert!(StoragePublisher::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_from_config_command_missing_command() {
+        let config = PublishConfig {
+            backend: PublishBackend::Command,
+            command: None,
+            ..PublishConfig::default()
+        };
+        assert!(StoragePublisher::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_from_config_s3_no_extra_args() {
+        let config = PublishConfig {
+            backend: PublishBackend::S3,
+            destination: Some("s3://bucket/path".to_string()),
+            args: None,
+            ..PublishConfig::default()
+        };
+        let result = StoragePublisher::from_config(&config).unwrap();
+        match result.unwrap() {
+            StoragePublisher::S3 { args, .. } => {
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected S3 variant"),
+        }
+    }
+}
+
 async fn publish_to_mapbox(source_path: &str, tileset_id: &str, token: &str) -> Result<()> {
     // The tileset_id format is "username.tileset-name"
     let username = tileset_id

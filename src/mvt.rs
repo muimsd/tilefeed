@@ -809,4 +809,417 @@ mod tests {
         assert_eq!(result[0], 0x1f);
         assert_eq!(result[1], 0x8b);
     }
+
+    // --- geometry encoding tests ---
+
+    fn make_feature(geom: JsonValue) -> FeatureData {
+        FeatureData {
+            id: 1,
+            geometry: geom,
+            properties: json!({}),
+            bounds: crate::postgis::Bounds {
+                min_lon: -180.0, min_lat: -85.0, max_lon: 180.0, max_lat: 85.0,
+            },
+            layer_name: "test".to_string(),
+        }
+    }
+
+    fn encode_feature_tile(geom: JsonValue) -> Vec<u8> {
+        let tile_coord = TileCoord { z: 0, x: 0, y: 0 };
+        let mut features_by_layer = HashMap::new();
+        features_by_layer.insert("test".to_string(), vec![make_feature(geom)]);
+        encode_tile(&tile_coord, &features_by_layer).unwrap()
+    }
+
+    #[test]
+    fn test_encode_tile_linestring() {
+        let geom = json!({
+            "type": "LineString",
+            "coordinates": [[0.0, 0.0], [10.0, 10.0], [20.0, 0.0]]
+        });
+        let result = encode_feature_tile(geom);
+        assert!(!result.is_empty());
+        assert_eq!(result[0], 0x1f);
+    }
+
+    #[test]
+    fn test_encode_tile_polygon() {
+        let geom = json!({
+            "type": "Polygon",
+            "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]]
+        });
+        let result = encode_feature_tile(geom);
+        assert!(!result.is_empty());
+        assert_eq!(result[0], 0x1f);
+    }
+
+    #[test]
+    fn test_encode_tile_multipoint() {
+        let geom = json!({
+            "type": "MultiPoint",
+            "coordinates": [[0.0, 0.0], [10.0, 10.0]]
+        });
+        let result = encode_feature_tile(geom);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_multilinestring() {
+        let geom = json!({
+            "type": "MultiLineString",
+            "coordinates": [
+                [[0.0, 0.0], [10.0, 10.0]],
+                [[20.0, 20.0], [30.0, 30.0]]
+            ]
+        });
+        let result = encode_feature_tile(geom);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_multipolygon() {
+        let geom = json!({
+            "type": "MultiPolygon",
+            "coordinates": [
+                [[[0.0, 0.0], [5.0, 0.0], [5.0, 5.0], [0.0, 0.0]]],
+                [[[10.0, 10.0], [15.0, 10.0], [15.0, 15.0], [10.0, 10.0]]]
+            ]
+        });
+        let result = encode_feature_tile(geom);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_polygon_with_hole() {
+        let geom = json!({
+            "type": "Polygon",
+            "coordinates": [
+                [[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0], [0.0, 0.0]],
+                [[5.0, 5.0], [15.0, 5.0], [15.0, 15.0], [5.0, 15.0], [5.0, 5.0]]
+            ]
+        });
+        let result = encode_feature_tile(geom);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_unknown_geom_type() {
+        let geom = json!({
+            "type": "GeometryCollection",
+            "geometries": []
+        });
+        // Should produce a tile but with no features (unknown geometry type gives empty commands)
+        let tile_coord = TileCoord { z: 0, x: 0, y: 0 };
+        let mut features_by_layer = HashMap::new();
+        features_by_layer.insert("test".to_string(), vec![make_feature(geom)]);
+        let result = encode_tile(&tile_coord, &features_by_layer).unwrap();
+        // Should still be valid gzip even if empty
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_empty_coordinates() {
+        // Linestring with too few points should produce empty geometry
+        let geom = json!({
+            "type": "LineString",
+            "coordinates": [[0.0, 0.0]]
+        });
+        let tile_coord = TileCoord { z: 0, x: 0, y: 0 };
+        let mut features_by_layer = HashMap::new();
+        features_by_layer.insert("test".to_string(), vec![make_feature(geom)]);
+        let result = encode_tile(&tile_coord, &features_by_layer).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_tile_multiple_layers() {
+        let tile_coord = TileCoord { z: 5, x: 16, y: 16 };
+        let feature_a = FeatureData {
+            id: 1,
+            geometry: json!({"type": "Point", "coordinates": [0.0, 0.0]}),
+            properties: json!({"name": "a"}),
+            bounds: crate::postgis::Bounds {
+                min_lon: -1.0, min_lat: -1.0, max_lon: 1.0, max_lat: 1.0,
+            },
+            layer_name: "layer_a".to_string(),
+        };
+        let feature_b = FeatureData {
+            id: 2,
+            geometry: json!({"type": "Point", "coordinates": [1.0, 1.0]}),
+            properties: json!({"type": "b"}),
+            bounds: crate::postgis::Bounds {
+                min_lon: 0.0, min_lat: 0.0, max_lon: 2.0, max_lat: 2.0,
+            },
+            layer_name: "layer_b".to_string(),
+        };
+
+        let mut features_by_layer = HashMap::new();
+        features_by_layer.insert("layer_a".to_string(), vec![feature_a]);
+        features_by_layer.insert("layer_b".to_string(), vec![feature_b]);
+
+        let result = encode_tile(&tile_coord, &features_by_layer).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    // --- value_to_string tests ---
+
+    #[test]
+    fn test_value_to_string_variants() {
+        assert_eq!(value_to_string(&json!("hello")), "s:hello");
+        assert_eq!(value_to_string(&json!(42)), "n:42");
+        assert_eq!(value_to_string(&json!(true)), "b:true");
+        assert_eq!(value_to_string(&json!(null)), "o:null");
+    }
+
+    // --- parse_linestring tests ---
+
+    #[test]
+    fn test_parse_linestring_valid() {
+        let coords = json!([[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]);
+        let ls = parse_linestring(&coords);
+        assert!(ls.is_some());
+        assert_eq!(ls.unwrap().0.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_linestring_too_few_points() {
+        let coords = json!([[0.0, 0.0]]);
+        assert!(parse_linestring(&coords).is_none());
+    }
+
+    #[test]
+    fn test_parse_linestring_not_array() {
+        let coords = json!("not an array");
+        assert!(parse_linestring(&coords).is_none());
+    }
+
+    #[test]
+    fn test_parse_linestring_empty() {
+        let coords = json!([]);
+        assert!(parse_linestring(&coords).is_none());
+    }
+
+    // --- parse_polygon tests ---
+
+    #[test]
+    fn test_parse_polygon_valid() {
+        let coords = json!([[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]);
+        let poly = parse_polygon(&coords);
+        assert!(poly.is_some());
+    }
+
+    #[test]
+    fn test_parse_polygon_with_hole() {
+        let coords = json!([
+            [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 0.0]],
+            [[2.0, 2.0], [8.0, 2.0], [8.0, 8.0], [2.0, 2.0]]
+        ]);
+        let poly = parse_polygon(&coords);
+        assert!(poly.is_some());
+        assert_eq!(poly.unwrap().interiors().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_polygon_empty_rings() {
+        let coords = json!([]);
+        assert!(parse_polygon(&coords).is_none());
+    }
+
+    #[test]
+    fn test_parse_polygon_not_array() {
+        let coords = json!(42);
+        assert!(parse_polygon(&coords).is_none());
+    }
+
+    // --- simplification tolerance ---
+
+    #[test]
+    fn test_simplification_tolerance_none_config() {
+        assert_eq!(simplification_tolerance(None, 10), None);
+    }
+
+    #[test]
+    fn test_simplification_tolerance_no_tolerance_set() {
+        let cfg = LayerConfig {
+            name: "test".to_string(),
+            schema: None,
+            table: "test".to_string(),
+            geometry_column: None,
+            id_column: None,
+            srid: None,
+            properties: None,
+            filter: None,
+            geometry_columns: None,
+            simplify_tolerance: None,
+            property_rules: None,
+            generate_label_points: false,
+            generate_boundary_lines: false,
+        };
+        assert_eq!(simplification_tolerance(Some(&cfg), 10), None);
+    }
+
+    #[test]
+    fn test_simplification_tolerance_scales_by_zoom() {
+        let cfg = LayerConfig {
+            name: "test".to_string(),
+            schema: None,
+            table: "test".to_string(),
+            geometry_column: None,
+            id_column: None,
+            srid: None,
+            properties: None,
+            filter: None,
+            geometry_columns: None,
+            simplify_tolerance: Some(0.001),
+            property_rules: None,
+            generate_label_points: false,
+            generate_boundary_lines: false,
+        };
+
+        let low_zoom = simplification_tolerance(Some(&cfg), 5).unwrap();
+        let high_zoom = simplification_tolerance(Some(&cfg), 15).unwrap();
+        // Lower zoom should have higher tolerance (more simplification)
+        assert!(low_zoom > high_zoom);
+    }
+
+    // --- simplify_geometry edge cases ---
+
+    #[test]
+    fn test_simplify_multilinestring() {
+        let geom = json!({
+            "type": "MultiLineString",
+            "coordinates": [
+                [[0.0, 0.0], [0.5, 0.001], [1.0, 0.0]],
+                [[2.0, 2.0], [2.5, 2.001], [3.0, 2.0]]
+            ]
+        });
+        let result = simplify_geometry(&geom, 0.01);
+        assert_eq!(result["type"], "MultiLineString");
+        let lines = result["coordinates"].as_array().unwrap();
+        // Each line should be simplified
+        for line in lines {
+            assert_eq!(line.as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_simplify_multipolygon() {
+        let geom = json!({
+            "type": "MultiPolygon",
+            "coordinates": [
+                [[[0.0, 0.0], [1.0, 0.0], [1.0, 0.001], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
+            ]
+        });
+        let result = simplify_geometry(&geom, 0.01);
+        assert_eq!(result["type"], "MultiPolygon");
+    }
+
+    // --- compute_excluded_properties with multiple rules ---
+
+    #[test]
+    fn test_compute_excluded_properties_multiple_rules() {
+        use crate::config::PropertyRule;
+
+        let cfg = LayerConfig {
+            name: "test".to_string(),
+            schema: None,
+            table: "test".to_string(),
+            geometry_column: None,
+            id_column: None,
+            srid: None,
+            properties: None,
+            filter: None,
+            geometry_columns: None,
+            simplify_tolerance: None,
+            property_rules: Some(vec![
+                PropertyRule {
+                    below_zoom: 5,
+                    exclude: vec!["metadata".to_string()],
+                },
+                PropertyRule {
+                    below_zoom: 10,
+                    exclude: vec!["description".to_string()],
+                },
+            ]),
+            generate_label_points: false,
+            generate_boundary_lines: false,
+        };
+
+        // At zoom 3 (below both thresholds): both excluded
+        let excluded = compute_excluded_properties(Some(&cfg), 3);
+        assert!(excluded.contains("metadata"));
+        assert!(excluded.contains("description"));
+
+        // At zoom 7 (above 5, below 10): only description excluded
+        let excluded = compute_excluded_properties(Some(&cfg), 7);
+        assert!(!excluded.contains("metadata"));
+        assert!(excluded.contains("description"));
+
+        // At zoom 12 (above both): none excluded
+        let excluded = compute_excluded_properties(Some(&cfg), 12);
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn test_compute_excluded_properties_no_rules() {
+        let cfg = LayerConfig {
+            name: "test".to_string(),
+            schema: None,
+            table: "test".to_string(),
+            geometry_column: None,
+            id_column: None,
+            srid: None,
+            properties: None,
+            filter: None,
+            geometry_columns: None,
+            simplify_tolerance: None,
+            property_rules: None,
+            generate_label_points: false,
+            generate_boundary_lines: false,
+        };
+
+        let excluded = compute_excluded_properties(Some(&cfg), 0);
+        assert!(excluded.is_empty());
+    }
+
+    // --- json_to_mvt_value edge cases ---
+
+    #[test]
+    fn test_json_to_mvt_value_array() {
+        let val = json_to_mvt_value(&json!([1, 2, 3]));
+        // Arrays fall through to string representation
+        assert!(val.string_value.is_some());
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_object() {
+        let val = json_to_mvt_value(&json!({"key": "value"}));
+        assert!(val.string_value.is_some());
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_negative_integer() {
+        let val = json_to_mvt_value(&json!(-42));
+        assert_eq!(val.int_value, Some(-42));
+    }
+
+    #[test]
+    fn test_json_to_mvt_value_zero() {
+        let val = json_to_mvt_value(&json!(0));
+        assert_eq!(val.int_value, Some(0));
+    }
+
+    // --- detect_geom_type additional ---
+
+    #[test]
+    fn test_detect_geom_type_multilinestring() {
+        let geom = json!({"type": "MultiLineString"});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Linestring as i32);
+    }
+
+    #[test]
+    fn test_detect_geom_type_multipolygon() {
+        let geom = json!({"type": "MultiPolygon"});
+        assert_eq!(detect_geom_type(&geom) as i32, GeomType::Polygon as i32);
+    }
 }

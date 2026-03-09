@@ -242,4 +242,162 @@ mod tests {
             assert!(t.y < 4); // 2^3 / 2 = 4 is the equator
         }
     }
+
+    // --- additional TileCoord::bounds tests ---
+
+    #[test]
+    fn test_tile_bounds_zoom_0_covers_world() {
+        let tile = TileCoord { z: 0, x: 0, y: 0 };
+        let bounds = tile.bounds();
+        assert!((bounds.min_lon - (-180.0)).abs() < 1e-6);
+        assert!((bounds.max_lon - 180.0).abs() < 1e-6);
+        assert!(bounds.max_lat > 85.0);
+        assert!(bounds.min_lat < -85.0);
+    }
+
+    #[test]
+    fn test_tile_bounds_zoom_1_quadrants() {
+        // Bottom-right tile at zoom 1
+        let tile = TileCoord { z: 1, x: 1, y: 1 };
+        let bounds = tile.bounds();
+        assert!((bounds.min_lon - 0.0).abs() < 1e-6);
+        assert!((bounds.max_lon - 180.0).abs() < 1e-6);
+        assert!(bounds.max_lat < 1.0); // around equator
+        assert!(bounds.min_lat < -80.0);
+    }
+
+    #[test]
+    fn test_tile_bounds_high_zoom() {
+        // At zoom 20, tiles are very small
+        let tile = TileCoord { z: 20, x: 524288, y: 524288 };
+        let bounds = tile.bounds();
+        let width = bounds.max_lon - bounds.min_lon;
+        let height = bounds.max_lat - bounds.min_lat;
+        // At zoom 20, lon span per tile = 360/2^20 ≈ 0.000343
+        assert!(width < 0.001);
+        assert!(height < 0.001);
+    }
+
+    // --- lon_to_tile_x / lat_to_tile_y ---
+
+    #[test]
+    fn test_lon_to_tile_x_zoom_0() {
+        // At zoom 0, everything maps to x=0
+        assert_eq!(lon_to_tile_x(-180.0, 0), 0);
+        assert_eq!(lon_to_tile_x(0.0, 0), 0);
+        assert_eq!(lon_to_tile_x(179.9, 0), 0);
+    }
+
+    #[test]
+    fn test_lat_to_tile_y_zoom_0() {
+        // At zoom 0, everything maps to y=0
+        assert_eq!(lat_to_tile_y(80.0, 0), 0);
+        assert_eq!(lat_to_tile_y(0.0, 0), 0);
+        assert_eq!(lat_to_tile_y(-80.0, 0), 0);
+    }
+
+    #[test]
+    fn test_lon_to_tile_x_high_zoom() {
+        // At zoom 10, there are 1024 tiles horizontally
+        let x = lon_to_tile_x(0.0, 10);
+        assert_eq!(x, 512); // lon=0 is at the center
+    }
+
+    #[test]
+    fn test_lat_to_tile_y_north_pole() {
+        // Very high latitude should map to y=0
+        let y = lat_to_tile_y(85.0, 5);
+        assert_eq!(y, 0);
+    }
+
+    // --- tiles_for_bounds edge cases ---
+
+    #[test]
+    fn test_tiles_for_bounds_point() {
+        // A very tiny bounds (essentially a point)
+        let bounds = Bounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 0.0001,
+            max_lat: 0.0001,
+        };
+        let tiles = tiles_for_bounds(&bounds, 5, 5);
+        // Should return at least one tile
+        assert!(!tiles.is_empty());
+    }
+
+    #[test]
+    fn test_tiles_for_bounds_single_zoom() {
+        let bounds = Bounds {
+            min_lon: -1.0,
+            min_lat: 51.0,
+            max_lon: 0.0,
+            max_lat: 52.0,
+        };
+        let tiles = tiles_for_bounds(&bounds, 8, 8);
+        for t in &tiles {
+            assert_eq!(t.z, 8);
+            assert!(t.x < 256); // 2^8 = 256
+            assert!(t.y < 256);
+        }
+    }
+
+    #[test]
+    fn test_tiles_for_bounds_increasing_with_zoom() {
+        let bounds = Bounds {
+            min_lon: -1.0,
+            min_lat: 51.0,
+            max_lon: 1.0,
+            max_lat: 52.0,
+        };
+        let tiles_z5 = tiles_for_bounds(&bounds, 5, 5);
+        let tiles_z8 = tiles_for_bounds(&bounds, 8, 8);
+        // Higher zoom should produce more tiles for the same bounds
+        assert!(tiles_z8.len() >= tiles_z5.len());
+    }
+
+    // --- world_to_tile_coords edge cases ---
+
+    #[test]
+    fn test_world_to_tile_coords_higher_zoom() {
+        let tile = TileCoord { z: 10, x: 512, y: 340 };
+        let bounds = tile.bounds();
+        let extent = 4096u32;
+
+        // Center of this tile
+        let center_lon = (bounds.min_lon + bounds.max_lon) / 2.0;
+        let center_lat = (bounds.min_lat + bounds.max_lat) / 2.0;
+        let (x, y) = world_to_tile_coords(center_lon, center_lat, &tile, extent);
+        // Should be approximately in the middle
+        assert!((x - 2048).abs() < 50);
+        assert!((y - 2048).abs() < 50);
+    }
+
+    // --- TileCoord derives ---
+
+    #[test]
+    fn test_tile_coord_equality() {
+        let a = TileCoord { z: 5, x: 10, y: 20 };
+        let b = TileCoord { z: 5, x: 10, y: 20 };
+        let c = TileCoord { z: 5, x: 10, y: 21 };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_tile_coord_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TileCoord { z: 1, x: 0, y: 0 });
+        set.insert(TileCoord { z: 1, x: 0, y: 0 }); // duplicate
+        set.insert(TileCoord { z: 1, x: 1, y: 0 });
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_tile_coord_clone() {
+        let a = TileCoord { z: 3, x: 4, y: 5 };
+        let b = a;
+        assert_eq!(a, b);
+    }
 }

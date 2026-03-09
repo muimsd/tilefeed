@@ -78,5 +78,8 @@ assets = [
     { source = "README.md", dest = "/usr/share/doc/tilefeed/README.md", mode = "0644" },
 ]
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [build-dependencies]
 prost-build = "0.13"

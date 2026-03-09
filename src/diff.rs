@@ -125,3 +125,178 @@ fn hash_tile(data: &[u8]) -> [u8; 32] {
     hasher.update(data);
     hasher.finalize().into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(suffix: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("tilefeed_diff_{}_{}.mbtiles", std::process::id(), suffix))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn cleanup(path: &str) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_hash_tile_deterministic() {
+        let data = b"hello world";
+        let hash1 = hash_tile(data);
+        let hash2 = hash_tile(data);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hash_tile_different_data() {
+        let hash1 = hash_tile(b"data_a");
+        let hash2 = hash_tile(b"data_b");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hash_tile_empty() {
+        let hash = hash_tile(b"");
+        // SHA-256 of empty data is a known constant
+        assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn test_diff_identical_mbtiles() {
+        let path_a = temp_path("identical_a");
+        let path_b = temp_path("identical_b");
+
+        {
+            let store_a = crate::mbtiles::MbtilesStore::create(&path_a).unwrap();
+            store_a.set_metadata("name", "test").unwrap();
+            store_a.put_tile(0, 0, 0, b"same").unwrap();
+        }
+        {
+            let store_b = crate::mbtiles::MbtilesStore::create(&path_b).unwrap();
+            store_b.set_metadata("name", "test").unwrap();
+            store_b.put_tile(0, 0, 0, b"same").unwrap();
+        }
+
+        let result = diff_mbtiles(&path_a, &path_b);
+        assert!(result.is_ok());
+
+        cleanup(&path_a);
+        cleanup(&path_b);
+    }
+
+    #[test]
+    fn test_diff_added_tiles() {
+        let path_a = temp_path("added_a");
+        let path_b = temp_path("added_b");
+
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_a).unwrap();
+            store.put_tile(0, 0, 0, b"tile").unwrap();
+        }
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_b).unwrap();
+            store.put_tile(0, 0, 0, b"tile").unwrap();
+            store.put_tile(1, 0, 0, b"new").unwrap();
+        }
+
+        let result = diff_mbtiles(&path_a, &path_b);
+        assert!(result.is_ok());
+
+        cleanup(&path_a);
+        cleanup(&path_b);
+    }
+
+    #[test]
+    fn test_diff_removed_tiles() {
+        let path_a = temp_path("removed_a");
+        let path_b = temp_path("removed_b");
+
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_a).unwrap();
+            store.put_tile(0, 0, 0, b"tile").unwrap();
+            store.put_tile(1, 0, 0, b"extra").unwrap();
+        }
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_b).unwrap();
+            store.put_tile(0, 0, 0, b"tile").unwrap();
+        }
+
+        let result = diff_mbtiles(&path_a, &path_b);
+        assert!(result.is_ok());
+
+        cleanup(&path_a);
+        cleanup(&path_b);
+    }
+
+    #[test]
+    fn test_diff_changed_tiles() {
+        let path_a = temp_path("changed_a");
+        let path_b = temp_path("changed_b");
+
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_a).unwrap();
+            store.put_tile(0, 0, 0, b"old_data").unwrap();
+        }
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_b).unwrap();
+            store.put_tile(0, 0, 0, b"new_data").unwrap();
+        }
+
+        let result = diff_mbtiles(&path_a, &path_b);
+        assert!(result.is_ok());
+
+        cleanup(&path_a);
+        cleanup(&path_b);
+    }
+
+    #[test]
+    fn test_diff_empty_mbtiles() {
+        let path_a = temp_path("empty_a");
+        let path_b = temp_path("empty_b");
+
+        crate::mbtiles::MbtilesStore::create(&path_a).unwrap();
+        crate::mbtiles::MbtilesStore::create(&path_b).unwrap();
+
+        let result = diff_mbtiles(&path_a, &path_b);
+        assert!(result.is_ok());
+
+        cleanup(&path_a);
+        cleanup(&path_b);
+    }
+
+    #[test]
+    fn test_diff_metadata_differences() {
+        let path_a = temp_path("meta_a");
+        let path_b = temp_path("meta_b");
+
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_a).unwrap();
+            store.set_metadata("name", "v1").unwrap();
+            store.set_metadata("format", "pbf").unwrap();
+        }
+        {
+            let store = crate::mbtiles::MbtilesStore::create(&path_b).unwrap();
+            store.set_metadata("name", "v2").unwrap();
+            store.set_metadata("version", "2").unwrap();
+        }
+
+        let result = diff_mbtiles(&path_a, &path_b);
+        assert!(result.is_ok());
+
+        cleanup(&path_a);
+        cleanup(&path_b);
+    }
+
+    #[test]
+    fn test_diff_nonexistent_file() {
+        let path_a = temp_path("exists_ne");
+        crate::mbtiles::MbtilesStore::create(&path_a).unwrap();
+
+        let result = diff_mbtiles(&path_a, "/tmp/nonexistent_tilefeed.mbtiles");
+        assert!(result.is_err());
+
+        cleanup(&path_a);
+    }
+}

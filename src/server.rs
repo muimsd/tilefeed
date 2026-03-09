@@ -182,3 +182,302 @@ async fn serve_tilejson(
 async fn health_check() -> &'static str {
     "ok"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::Response;
+    use tower::util::ServiceExt;
+
+    fn make_test_config() -> AppConfig {
+        use crate::config::*;
+        AppConfig {
+            database: DatabaseConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                user: "postgres".to_string(),
+                password: "secret".to_string(),
+                dbname: "test".to_string(),
+                pool_size: None,
+            },
+            sources: vec![SourceConfig {
+                name: "test_source".to_string(),
+                mbtiles_path: "/tmp/test.mbtiles".to_string(),
+                min_zoom: 0,
+                max_zoom: 14,
+                generation_backend: GenerationBackend::default(),
+                layers: vec![LayerConfig {
+                    name: "buildings".to_string(),
+                    schema: None,
+                    table: "buildings".to_string(),
+                    geometry_column: None,
+                    id_column: None,
+                    srid: None,
+                    properties: Some(vec!["name".to_string(), "height".to_string()]),
+                    filter: None,
+                    geometry_columns: None,
+                    simplify_tolerance: None,
+                    property_rules: None,
+                    generate_label_points: true,
+                    generate_boundary_lines: false,
+                }],
+                tippecanoe: TippecanoeConfig::default(),
+            }],
+            updates: UpdateConfig::default(),
+            publish: PublishConfig::default(),
+            tippecanoe_bin: None,
+            serve: ServeConfig::default(),
+        }
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERVER_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn make_test_store() -> (String, MbtilesStore) {
+        let id = SERVER_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir()
+            .join(format!("tilefeed_server_test_{}_{}.mbtiles", std::process::id(), id))
+            .to_string_lossy()
+            .to_string();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.put_tile(0, 0, 0, b"tile_data").unwrap();
+        (path, store)
+    }
+
+    fn make_app(config: AppConfig, stores: HashMap<String, Arc<Mutex<MbtilesStore>>>) -> Router {
+        let state = AppState {
+            stores,
+            config: Arc::new(config),
+        };
+        let cors = build_cors_layer(&ServeConfig::default());
+        Router::new()
+            .route("/{source}/{z}/{x}/{y_pbf}", get(serve_tile_test))
+            .route("/{source_json}", get(serve_tilejson_test))
+            .route("/health", get(health_check))
+            .layer(cors)
+            .with_state(state)
+    }
+
+    /// Test-only handler that parses z/x/y.pbf from path segments
+    async fn serve_tile_test(
+        State(state): State<AppState>,
+        Path((source, z, x, y_pbf)): Path<(String, u8, u32, String)>,
+        headers: HeaderMap,
+    ) -> Response {
+        let y: u32 = y_pbf.trim_end_matches(".pbf").parse().unwrap_or(0);
+        serve_tile(State(state), Path((source, z, x, y)), headers).await
+    }
+
+    /// Test-only handler that strips .json suffix
+    async fn serve_tilejson_test(
+        State(state): State<AppState>,
+        Path(source_json): Path<String>,
+    ) -> Response {
+        let source = source_json.trim_end_matches(".json").to_string();
+        serve_tilejson(State(state), Path(source)).await
+    }
+
+    async fn send_request(app: Router, request: Request<Body>) -> Response {
+        app.oneshot(request).await.unwrap()
+    }
+
+    #[test]
+    fn test_to_hex() {
+        assert_eq!(to_hex(&[0x00, 0xff, 0xab]), "00ffab");
+        assert_eq!(to_hex(&[]), "");
+        assert_eq!(to_hex(&[0x01]), "01");
+    }
+
+    #[test]
+    fn test_build_cors_layer_default() {
+        let config = ServeConfig::default();
+        // Should not panic
+        let _cors = build_cors_layer(&config);
+    }
+
+    #[test]
+    fn test_build_cors_layer_with_origins() {
+        let config = ServeConfig {
+            host: None,
+            port: None,
+            cors_origins: Some(vec!["http://localhost:3000".to_string()]),
+        };
+        let _cors = build_cors_layer(&config);
+    }
+
+    #[test]
+    fn test_build_cors_layer_empty_origins() {
+        let config = ServeConfig {
+            host: None,
+            port: None,
+            cors_origins: Some(vec![]),
+        };
+        // Empty origins should fall through to Any
+        let _cors = build_cors_layer(&config);
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder().uri("/health").body(Body::empty()).unwrap(),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_tile_source_not_found() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/nonexistent/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_tile_found() {
+        let config = make_test_config();
+        let (_path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+
+        let app = make_app(config, stores);
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/x-protobuf"
+        );
+        assert!(response.headers().get("etag").is_some());
+        assert!(response.headers().get("cache-control").is_some());
+
+        let _ = std::fs::remove_file(&_path);
+    }
+
+    #[tokio::test]
+    async fn test_tile_not_found_returns_no_content() {
+        let config = make_test_config();
+        let (_path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+
+        let app = make_app(config, stores);
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source/5/10/10.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let _ = std::fs::remove_file(&_path);
+    }
+
+    #[tokio::test]
+    async fn test_tile_etag_304() {
+        let config = make_test_config();
+        let (_path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+
+        // First request to get the ETag
+        let app1 = make_app(config.clone(), stores.clone());
+        let response = send_request(
+            app1,
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        ).await;
+        let etag = response.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+        // Second request with If-None-Match
+        let app2 = make_app(config, stores);
+        let response = send_request(
+            app2,
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        let _ = std::fs::remove_file(&_path);
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_endpoint() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source.json")
+                .body(Body::empty())
+                .unwrap(),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["tilejson"], "3.0.0");
+        assert_eq!(json["name"], "test_source");
+        assert_eq!(json["minzoom"], 0);
+        assert_eq!(json["maxzoom"], 14);
+
+        let layers = json["vector_layers"].as_array().unwrap();
+        // buildings + buildings_labels (generate_label_points=true)
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0]["id"], "buildings");
+        assert_eq!(layers[1]["id"], "buildings_labels");
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_source_not_found() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/nonexistent.json")
+                .body(Body::empty())
+                .unwrap(),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
