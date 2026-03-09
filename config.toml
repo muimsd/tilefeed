@@ -14,10 +14,12 @@ debounce_ms = 200
 worker_concurrency = 8
 
 [publish]
-backend = "none" # "none", "local", "s3", "command"
+backend = "none" # "none", "local", "s3", "mapbox", "command"
 # destination = "/tmp/tiles.mbtiles"   # for local
 # destination = "s3://bucket/tiles.mbtiles" # for s3
 # args = ["--endpoint-url", "https://s3.us-east-1.amazonaws.com"] # optional for s3
+# mapbox_tileset_id = "your-username.tileset-name" # for mapbox (requires aws CLI)
+# mapbox_token = "sk.eyJ1Ijoi..."                  # Mapbox secret token with uploads:write scope
 # command = "rclone copy \"$TILEFEED_MBTILES_PATH\" remote:tiles/tiles.mbtiles" # for command backend
 publish_on_generate = true
 publish_on_update = true

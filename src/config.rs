@@ -117,6 +117,7 @@ pub enum PublishBackend {
     None,
     Local,
     S3,
+    Mapbox,
     Command,
 }
 
@@ -127,6 +128,8 @@ pub struct PublishConfig {
     pub destination: Option<String>,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
+    pub mapbox_tileset_id: Option<String>,
+    pub mapbox_token: Option<String>,
     pub publish_on_generate: Option<bool>,
     pub publish_on_update: Option<bool>,
 }
@@ -138,6 +141,8 @@ impl Default for PublishConfig {
             destination: None,
             command: None,
             args: None,
+            mapbox_tileset_id: None,
+            mapbox_token: None,
             publish_on_generate: Some(true),
             publish_on_update: Some(true),
         }
