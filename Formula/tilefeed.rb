@@ -7,17 +7,17 @@ class Tilefeed < Formula
   on_macos do
     on_arm do
       url "https://github.com/muimsd/tilefeed/releases/download/v0.4.0/tilefeed-aarch64-apple-darwin.tar.gz"
-      sha256 "b927037a31787d2f26fb43920be15ca6717a9c0d516e6f5040fea3d354441f6b"
+      sha256 "5ac1a7ea93ba1f61b7ba6812e94a3867accc2a142d2ad49423b1d49f4fdfb158"
     end
     on_intel do
       url "https://github.com/muimsd/tilefeed/releases/download/v0.4.0/tilefeed-x86_64-apple-darwin.tar.gz"
-      sha256 "ffe74da36d64371d8590a9ccdd8d79a2668ae5066ed0b18add6e14c0fe7a1c76"
+      sha256 "9de10b553fd0c61aa274d2f249d5960b2ce3b0ff096c7ce53b70ce7a7bf7dfee"
     end
   end
 
   on_linux do
     url "https://github.com/muimsd/tilefeed/releases/download/v0.4.0/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
-    sha256 "58d192f299f96fc5d89ee12428e9c1156ae355a5b0c59fd9c1578c78770f5316"
+    sha256 "604eb82e44551c7eaaaa3af006d436b2b62d12689cc8128fcad824f2c749b3f5"
   end
 
   def install
