@@ -1,6 +1,6 @@
 [package]
 name = "tilefeed"
-version = "0.7.0"
+version = "0.6.1"
 edition = "2021"
 description = "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
 license = "MIT"
