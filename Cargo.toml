@@ -59,8 +59,13 @@ clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
 
-# Hashing (for ETags)
+# Hashing (for ETags and HMAC signing)
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
+# SSE streaming
+async-stream = "0.3"
 
 [package.metadata.deb]
 maintainer = "muimsd"
@@ -80,6 +85,10 @@ assets = [
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[[example]]
+name = "webhook_sse_demo"
+path = "examples/webhook-sse/demo.rs"
 
 [build-dependencies]
 prost-build = "0.13"

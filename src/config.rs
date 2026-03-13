@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub ogr2ogr_bin: Option<String>,
     #[serde(default)]
     pub serve: ServeConfig,
+    #[serde(default)]
+    pub webhook: WebhookConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -297,6 +299,55 @@ pub enum DerivedGeomType {
     BoundaryLine,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebhookConfig {
+    /// URLs to send POST notifications to
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// HTTP timeout in milliseconds (default: 5000)
+    pub timeout_ms: Option<u64>,
+    /// Number of retries on failure (default: 2)
+    pub retry_count: Option<u32>,
+    /// Send webhook on full tile generation completion
+    pub on_generate: Option<bool>,
+    /// Send webhook on incremental tile update completion
+    pub on_update: Option<bool>,
+    /// HMAC-SHA256 secret for signing payloads
+    pub secret: Option<String>,
+    /// Minimum seconds between notifications per source (default: 0 = no cooldown).
+    /// During rapid updates, events are accumulated and a single aggregated
+    /// notification is sent after the cooldown expires.
+    pub cooldown_secs: Option<u64>,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
+            timeout_ms: Some(5000),
+            retry_count: Some(2),
+            on_generate: Some(true),
+            on_update: Some(true),
+            secret: None,
+            cooldown_secs: None,
+        }
+    }
+}
+
+impl WebhookConfig {
+    pub fn on_generate_enabled(&self) -> bool {
+        self.on_generate.unwrap_or(true)
+    }
+
+    pub fn on_update_enabled(&self) -> bool {
+        self.on_update.unwrap_or(true)
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.urls.is_empty()
+    }
+}
+
 pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
     let settings = config::Config::builder()
         .add_source(config::File::with_name(path))
@@ -357,6 +408,7 @@ mod tests {
             tippecanoe_bin: None,
             ogr2ogr_bin: None,
             serve: ServeConfig::default(),
+            webhook: WebhookConfig::default(),
         }
     }
 
@@ -824,6 +876,43 @@ mod tests {
         assert!(cfg.publish.publish_on_generate_enabled());
         assert!(!cfg.publish.publish_on_update_enabled());
         assert!(cfg.sources[0].layers[0].generate_label_points);
+    }
+
+    #[test]
+    fn test_load_webhook_sse_config() {
+        let cfg = load_config("examples/webhook-sse/config").unwrap();
+        assert!(cfg.webhook.is_configured());
+        assert_eq!(cfg.webhook.urls.len(), 1);
+        assert_eq!(
+            cfg.webhook.urls[0],
+            "http://localhost:9000/hooks/tile-update"
+        );
+        assert_eq!(cfg.webhook.timeout_ms, Some(5000));
+        assert_eq!(cfg.webhook.retry_count, Some(2));
+        assert!(cfg.webhook.on_generate_enabled());
+        assert!(cfg.webhook.on_update_enabled());
+        assert!(cfg.webhook.secret.is_none());
+        assert_eq!(cfg.webhook.cooldown_secs, Some(300));
+    }
+
+    #[test]
+    fn test_webhook_config_defaults() {
+        let config = WebhookConfig::default();
+        assert!(config.urls.is_empty());
+        assert!(!config.is_configured());
+        assert!(config.on_generate_enabled());
+        assert!(config.on_update_enabled());
+        assert_eq!(config.timeout_ms, Some(5000));
+        assert_eq!(config.retry_count, Some(2));
+        assert!(config.secret.is_none());
+        assert!(config.cooldown_secs.is_none());
+    }
+
+    #[test]
+    fn test_webhook_not_configured_by_default() {
+        // Existing configs without [webhook] should still load fine
+        let cfg = load_config("examples/local-parks/config").unwrap();
+        assert!(!cfg.webhook.is_configured());
     }
 
     #[test]

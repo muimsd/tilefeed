@@ -8,6 +8,7 @@ use tokio_postgres::{AsyncMessage, NoTls};
 use tracing::{error, info, warn};
 
 use crate::config::{AppConfig, DerivedGeomType};
+use crate::events::EventSender;
 use crate::mbtiles::MbtilesStore;
 use crate::mvt;
 use crate::postgis::{Bounds, PostgisReader};
@@ -26,12 +27,13 @@ pub async fn start_listener(
     config: Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     publisher: Option<Arc<StoragePublisher>>,
+    event_tx: Option<EventSender>,
 ) -> Result<()> {
     let mut retry_count: u32 = 0;
     let max_retry_delay_secs: u64 = 60;
 
     loop {
-        match run_listener(&config, &stores, publisher.as_ref()).await {
+        match run_listener(&config, &stores, publisher.as_ref(), event_tx.as_ref()).await {
             Ok(()) => {
                 // Clean exit (channel closed)
                 info!("Listener exited cleanly");
@@ -54,6 +56,7 @@ async fn run_listener(
     config: &AppConfig,
     stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
     publisher: Option<&Arc<StoragePublisher>>,
+    event_tx: Option<&EventSender>,
 ) -> Result<()> {
     let (client, mut connection) =
         tokio_postgres::connect(&config.database.connection_string(), NoTls)
@@ -130,7 +133,8 @@ async fn run_listener(
 
         if !parsed_events.is_empty() {
             if let Err(e) =
-                handle_batch_update(config, &reader, stores, publisher, &parsed_events).await
+                handle_batch_update(config, &reader, stores, publisher, event_tx, &parsed_events)
+                    .await
             {
                 error!("Failed to handle update batch: {}", e);
             }
@@ -273,6 +277,7 @@ async fn handle_batch_update(
     reader: &PostgisReader,
     stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
     publisher: Option<&Arc<StoragePublisher>>,
+    event_tx: Option<&EventSender>,
     events: &[UpdateEvent],
 ) -> Result<()> {
     // Group events by source name
@@ -308,7 +313,7 @@ async fn handle_batch_update(
             }
         };
 
-        update_source(config, reader, source, store, publisher, source_events).await?;
+        update_source(config, reader, source, store, publisher, event_tx, source_events).await?;
     }
 
     Ok(())
@@ -321,6 +326,7 @@ async fn update_source(
     source: &crate::config::SourceConfig,
     mbtiles: &Arc<Mutex<MbtilesStore>>,
     publisher: Option<&Arc<StoragePublisher>>,
+    event_tx: Option<&EventSender>,
     events: &[&UpdateEvent],
 ) -> Result<()> {
     let mut all_affected: Vec<TileCoord> = Vec::new();
@@ -425,6 +431,26 @@ async fn update_source(
         source.name,
         all_affected.len()
     );
+
+    // Emit event for webhooks and SSE
+    if let Some(event_tx) = event_tx {
+        let zooms: std::collections::HashSet<u8> =
+            all_affected.iter().map(|t| t.z).collect();
+        let layers: Vec<String> = events
+            .iter()
+            .map(|e| e.layer_name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let _ = event_tx.send(crate::events::TileEvent::update_complete(
+            source.name.clone(),
+            all_affected.len(),
+            &zooms,
+            source.max_zoom,
+            layers,
+        ));
+    }
+
     Ok(())
 }
 

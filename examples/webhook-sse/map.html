@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Tilefeed Live Map — MapLibre + SSE</title>
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+    <style>
+        body { margin: 0; }
+        #map { width: 100vw; height: 100vh; }
+        #status {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #0f0;
+            padding: 10px 16px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 13px;
+            z-index: 10;
+            max-width: 350px;
+        }
+        #status .event {
+            margin-top: 6px;
+            padding: 4px 0;
+            border-top: 1px solid rgba(255,255,255,0.2);
+        }
+        #status .connected { color: #0f0; }
+        #status .disconnected { color: #f44; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="status">
+        <div id="sse-status" class="disconnected">SSE: connecting...</div>
+        <div id="events"></div>
+    </div>
+
+    <script>
+        // ── Config ──────────────────────────────────────────────
+        const TILE_SERVER = 'http://localhost:3000';
+        const SOURCE_NAME = 'parks';
+
+        // ── Map ─────────────────────────────────────────────────
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: {
+                version: 8,
+                sources: {
+                    [SOURCE_NAME]: {
+                        type: 'vector',
+                        tiles: [`${TILE_SERVER}/${SOURCE_NAME}/{z}/{x}/{y}.pbf`],
+                        minzoom: 0,
+                        maxzoom: 14,
+                    },
+                },
+                layers: [
+                    {
+                        id: `${SOURCE_NAME}-fill`,
+                        type: 'fill',
+                        source: SOURCE_NAME,
+                        'source-layer': SOURCE_NAME,
+                        paint: {
+                            'fill-color': '#2ecc71',
+                            'fill-opacity': 0.5,
+                        },
+                    },
+                    {
+                        id: `${SOURCE_NAME}-outline`,
+                        type: 'line',
+                        source: SOURCE_NAME,
+                        'source-layer': SOURCE_NAME,
+                        paint: {
+                            'line-color': '#27ae60',
+                            'line-width': 1.5,
+                        },
+                    },
+                ],
+            },
+            center: [0, 30],
+            zoom: 3,
+        });
+
+        // ── SSE — live tile refresh ─────────────────────────────
+        const statusEl = document.getElementById('sse-status');
+        const eventsEl = document.getElementById('events');
+
+        function addEventLog(msg) {
+            const div = document.createElement('div');
+            div.className = 'event';
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            eventsEl.prepend(div);
+            // Keep last 10 events
+            while (eventsEl.children.length > 10) {
+                eventsEl.removeChild(eventsEl.lastChild);
+            }
+        }
+
+        function refreshSource(sourceName) {
+            const source = map.getSource(sourceName);
+            if (!source) return;
+
+            // Force MapLibre to re-fetch all visible tiles by
+            // updating the tiles URL with a cache-busting parameter
+            const ts = Date.now();
+            source.setTiles([
+                `${TILE_SERVER}/${sourceName}/{z}/{x}/{y}.pbf?_t=${ts}`
+            ]);
+            addEventLog(`Refreshed tiles for "${sourceName}"`);
+        }
+
+        function connectSSE() {
+            const es = new EventSource(`${TILE_SERVER}/events`);
+
+            es.onopen = () => {
+                statusEl.textContent = 'SSE: connected';
+                statusEl.className = 'connected';
+                addEventLog('Connected to SSE');
+            };
+
+            es.addEventListener('update_complete', (e) => {
+                const data = JSON.parse(e.data);
+                const currentZoom = Math.floor(map.getZoom());
+                const maxZoom = data.max_zoom || 14;
+                // Check if the current view is affected — either at a
+                // directly updated zoom or overzooming beyond max_zoom
+                const isOverzooming = currentZoom > maxZoom && data.affected_zooms.includes(maxZoom);
+                const isDirectHit = data.affected_zooms.includes(currentZoom);
+
+                addEventLog(
+                    `Update: ${data.tiles_updated} tiles in "${data.source}" ` +
+                    `(zooms ${data.affected_zooms.join(',')}, max_zoom=${maxZoom})`
+                );
+
+                // Always refresh — MapLibre needs new tiles at the source
+                // zoom levels, and overzoomed views derive from those same tiles
+                refreshSource(data.source);
+            });
+
+            es.addEventListener('generate_complete', (e) => {
+                const data = JSON.parse(e.data);
+                addEventLog(
+                    `Generate: "${data.source}" completed in ${data.duration_ms}ms`
+                );
+                refreshSource(data.source);
+            });
+
+            es.onerror = () => {
+                statusEl.textContent = 'SSE: disconnected — retrying...';
+                statusEl.className = 'disconnected';
+                es.close();
+                // Reconnect after 3s
+                setTimeout(connectSSE, 3000);
+            };
+        }
+
+        map.on('load', connectSSE);
+    </script>
+</body>
+</html>

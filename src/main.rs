@@ -1,5 +1,6 @@
 mod config;
 mod diff;
+mod events;
 mod generator;
 mod inspect;
 mod mbtiles;
@@ -10,6 +11,7 @@ mod storage;
 mod tiles;
 mod updater;
 mod validate;
+mod webhook;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -91,6 +93,19 @@ async fn main() -> Result<()> {
             let publisher =
                 storage::StoragePublisher::from_config(&app_config.publish)?.map(Arc::new);
 
+            // Create event bus for webhooks and SSE
+            let event_tx = events::create_event_bus();
+
+            // Start webhook notifier if configured
+            if app_config.webhook.is_configured() {
+                let notifier = webhook::WebhookNotifier::new(app_config.webhook.clone());
+                notifier.start(&event_tx);
+                info!(
+                    "Webhook notifier started for {} URL(s)",
+                    app_config.webhook.urls.len()
+                );
+            }
+
             // Check required external tools before starting
             generator::check_required_tools(
                 &app_config.sources,
@@ -101,26 +116,26 @@ async fn main() -> Result<()> {
             match cli.command {
                 Commands::Generate => {
                     let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-                    generate_all_sources(&app_config, &reader).await?;
+                    generate_all_sources(&app_config, &reader, &event_tx).await?;
                     publish_after_generate(&app_config, publisher.as_deref()).await?;
                     info!("Tile generation complete");
                 }
                 Commands::Watch => {
-                    watch_updates(app_config, publisher).await?;
+                    watch_updates(app_config, publisher, event_tx).await?;
                 }
                 Commands::Run => {
                     let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-                    generate_all_sources(&app_config, &reader).await?;
+                    generate_all_sources(&app_config, &reader, &event_tx).await?;
                     publish_after_generate(&app_config, publisher.as_deref()).await?;
                     info!("Tile generation complete, starting incremental watcher...");
-                    watch_updates(app_config, publisher).await?;
+                    watch_updates(app_config, publisher, event_tx).await?;
                 }
                 Commands::Serve => {
                     let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-                    generate_all_sources(&app_config, &reader).await?;
+                    generate_all_sources(&app_config, &reader, &event_tx).await?;
                     publish_after_generate(&app_config, publisher.as_deref()).await?;
                     info!("Tile generation complete, starting server and watcher...");
-                    serve_and_watch(app_config, publisher).await?;
+                    serve_and_watch(app_config, publisher, event_tx).await?;
                 }
                 Commands::Validate => {
                     let valid = validate::validate_config(&app_config).await?;
@@ -140,8 +155,10 @@ async fn main() -> Result<()> {
 async fn generate_all_sources(
     config: &config::AppConfig,
     reader: &postgis::PostgisReader,
+    event_tx: &events::EventSender,
 ) -> Result<()> {
     for source in &config.sources {
+        let start = std::time::Instant::now();
         generator::generate_source(
             source,
             reader,
@@ -149,6 +166,11 @@ async fn generate_all_sources(
             config.ogr2ogr_bin.as_deref(),
         )
         .await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let _ = event_tx.send(events::TileEvent::GenerateComplete {
+            source: source.name.clone(),
+            duration_ms,
+        });
     }
     Ok(())
 }
@@ -186,6 +208,7 @@ fn open_stores(
 async fn watch_updates(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
+    event_tx: events::EventSender,
 ) -> Result<()> {
     let stores = open_stores(&config)?;
 
@@ -194,7 +217,12 @@ async fn watch_updates(
         stores.len()
     );
 
-    let mut listener_task = tokio::spawn(start_listener(config.clone(), stores, publisher.clone()));
+    let mut listener_task = tokio::spawn(start_listener(
+        config.clone(),
+        stores,
+        publisher.clone(),
+        Some(event_tx),
+    ));
 
     tokio::select! {
         result = &mut listener_task => {
@@ -213,6 +241,7 @@ async fn watch_updates(
 async fn serve_and_watch(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
+    event_tx: events::EventSender,
 ) -> Result<()> {
     let stores = open_stores(&config)?;
 
@@ -222,8 +251,10 @@ async fn serve_and_watch(
         config.clone(),
         stores.clone(),
         publisher.clone(),
+        Some(event_tx.clone()),
     ));
-    let mut server_task = tokio::spawn(server::start_server(config.clone(), stores));
+    let mut server_task =
+        tokio::spawn(server::start_server(config.clone(), stores, Some(event_tx)));
 
     tokio::select! {
         result = &mut listener_task => {

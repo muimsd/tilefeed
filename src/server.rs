@@ -2,24 +2,29 @@ use anyhow::Result;
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Router,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::config::{AppConfig, ServeConfig};
+use crate::events::{EventSender, TileEvent};
 use crate::mbtiles::MbtilesStore;
 
 #[derive(Clone)]
 struct AppState {
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     config: Arc<AppConfig>,
+    event_tx: Option<EventSender>,
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -29,6 +34,7 @@ fn to_hex(bytes: &[u8]) -> String {
 pub async fn start_server(
     config: Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
+    event_tx: Option<EventSender>,
 ) -> Result<()> {
     let serve_config = &config.serve;
     let host = serve_config.host.as_deref().unwrap_or("127.0.0.1");
@@ -37,6 +43,7 @@ pub async fn start_server(
     let state = AppState {
         stores,
         config: config.clone(),
+        event_tx,
     };
 
     let cors = build_cors_layer(serve_config);
@@ -45,6 +52,7 @@ pub async fn start_server(
         .route("/{source}/{z}/{x}/{y}.pbf", get(serve_tile))
         .route("/{source}.json", get(serve_tilejson))
         .route("/health", get(health_check))
+        .route("/events", get(sse_handler))
         .layer(cors)
         .with_state(state);
 
@@ -185,6 +193,108 @@ async fn health_check() -> &'static str {
     "ok"
 }
 
+async fn sse_handler(
+    State(state): State<AppState>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>>, StatusCode>
+{
+    let event_tx = state.event_tx.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let mut rx = event_tx.subscribe();
+
+    let cooldown = state
+        .config
+        .webhook
+        .cooldown_secs
+        .filter(|&s| s > 0)
+        .map(std::time::Duration::from_secs);
+
+    let stream = async_stream::stream! {
+        match cooldown {
+            None => {
+                // No cooldown — forward every event immediately
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            if let Some(sse) = event_to_sse(&event) {
+                                yield Ok(sse);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+            Some(cooldown) => {
+                // Trailing-edge throttle per source
+                let mut pending: HashMap<String, (TileEvent, tokio::time::Instant)> = HashMap::new();
+
+                loop {
+                    let next_flush = pending
+                        .values()
+                        .map(|(_, started)| *started + cooldown)
+                        .min();
+                    let sleep_until = next_flush
+                        .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
+
+                    tokio::select! {
+                        result = rx.recv() => {
+                            match result {
+                                Ok(event) => {
+                                    let source = event.source().to_string();
+                                    match pending.get_mut(&source) {
+                                        Some((existing, _)) => {
+                                            existing.merge(&event);
+                                        }
+                                        None => {
+                                            pending.insert(source, (event, tokio::time::Instant::now()));
+                                        }
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    for (_, (event, _)) in pending.drain() {
+                                        if let Some(sse) = event_to_sse(&event) {
+                                            yield Ok(sse);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep_until(sleep_until) => {
+                            let now = tokio::time::Instant::now();
+                            let expired: Vec<String> = pending
+                                .iter()
+                                .filter(|(_, (_, started))| now >= *started + cooldown)
+                                .map(|(source, _)| source.clone())
+                                .collect();
+
+                            for source in expired {
+                                if let Some((event, _)) = pending.remove(&source) {
+                                    if let Some(sse) = event_to_sse(&event) {
+                                        yield Ok(sse);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn event_to_sse(event: &TileEvent) -> Option<SseEvent> {
+    let event_type = match event {
+        TileEvent::GenerateComplete { .. } => "generate_complete",
+        TileEvent::UpdateComplete { .. } => "update_complete",
+    };
+    serde_json::to_string(event)
+        .ok()
+        .map(|data| SseEvent::default().event(event_type).data(data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +342,7 @@ mod tests {
             tippecanoe_bin: None,
             ogr2ogr_bin: None,
             serve: ServeConfig::default(),
+            webhook: WebhookConfig::default(),
         }
     }
 
@@ -254,15 +365,25 @@ mod tests {
     }
 
     fn make_app(config: AppConfig, stores: HashMap<String, Arc<Mutex<MbtilesStore>>>) -> Router {
+        make_app_with_events(config, stores, None)
+    }
+
+    fn make_app_with_events(
+        config: AppConfig,
+        stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
+        event_tx: Option<EventSender>,
+    ) -> Router {
         let state = AppState {
             stores,
             config: Arc::new(config),
+            event_tx,
         };
         let cors = build_cors_layer(&ServeConfig::default());
         Router::new()
             .route("/{source}/{z}/{x}/{y_pbf}", get(serve_tile_test))
             .route("/{source_json}", get(serve_tilejson_test))
             .route("/health", get(health_check))
+            .route("/events", get(sse_handler))
             .layer(cors)
             .with_state(state)
     }
@@ -505,5 +626,131 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- SSE endpoint tests ---
+
+    #[tokio::test]
+    async fn test_sse_returns_404_without_event_bus() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_sse_returns_200_with_event_bus() {
+        let config = make_test_config();
+        let event_tx = crate::events::create_event_bus();
+        let app = make_app_with_events(config, HashMap::new(), Some(event_tx));
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_receives_generate_event() {
+        let config = make_test_config();
+        let event_tx = crate::events::create_event_bus();
+        let app = make_app_with_events(config, HashMap::new(), Some(event_tx.clone()));
+
+        // Connect to SSE endpoint
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Send an event through the bus
+        event_tx
+            .send(TileEvent::GenerateComplete {
+                source: "test_source".to_string(),
+                duration_ms: 1234,
+            })
+            .unwrap();
+
+        // Drop sender to close the stream so we can read it
+        drop(event_tx);
+
+        // Read the SSE body
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("event: generate_complete"));
+        assert!(body_str.contains("test_source"));
+        assert!(body_str.contains("1234"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_receives_update_event() {
+        let config = make_test_config();
+        let event_tx = crate::events::create_event_bus();
+        let app = make_app_with_events(config, HashMap::new(), Some(event_tx.clone()));
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut zooms = std::collections::HashSet::new();
+        zooms.insert(10u8);
+        zooms.insert(11u8);
+
+        event_tx
+            .send(TileEvent::update_complete(
+                "parks".to_string(),
+                42,
+                &zooms,
+                14,
+                vec!["parks".to_string()],
+            ))
+            .unwrap();
+
+        drop(event_tx);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("event: update_complete"));
+        assert!(body_str.contains("\"tiles_updated\":42"));
+        assert!(body_str.contains("parks"));
+        assert!(body_str.contains("10"));
+        assert!(body_str.contains("11"));
     }
 }

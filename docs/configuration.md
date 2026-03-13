@@ -163,6 +163,31 @@ simplify_tolerance = 0.00001
 | `below_zoom` | int | Zoom threshold |
 | `exclude` | string[] | Properties to exclude below this zoom |
 
+### `[webhook]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `urls` | string[] | `[]` | Webhook endpoint URLs to receive HTTP POST notifications |
+| `secret` | string | — | HMAC-SHA256 signing secret. When set, requests include `X-Tilefeed-Signature: sha256=...` header |
+| `cooldown_secs` | int | — | Trailing-edge throttle window in seconds. Events are accumulated per source and sent as one aggregated notification when the window expires. Also applies to SSE. |
+| `timeout_ms` | int | 5000 | HTTP request timeout per webhook call |
+| `retry_count` | int | 2 | Number of retries with exponential backoff on failure |
+| `on_generate` | bool | true | Send webhook after full generation completes |
+| `on_update` | bool | true | Send webhook after incremental tile updates |
+
+Example:
+
+```toml
+[webhook]
+urls = ["https://example.com/hooks/tilefeed"]
+secret = "my-signing-secret"
+cooldown_secs = 300  # aggregate events for 5 minutes
+on_generate = true
+on_update = true
+```
+
+The webhook payload is a JSON object with an `event` field (`"generate_complete"` or `"update_complete"`). The `update_complete` payload includes `max_zoom` so frontends can invalidate overzoomed tile views (tiles rendered beyond the source's max zoom level).
+
 ### `[sources.tippecanoe]`
 
 See [Tippecanoe Settings](tippecanoe.md).

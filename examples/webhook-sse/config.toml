@@ -1,0 +1,44 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_example"
+
+[updates]
+debounce_ms = 300
+worker_concurrency = 4
+
+[serve]
+host = "0.0.0.0"
+port = 3000
+cors_origins = ["http://localhost:8080"]
+
+# Webhook configuration — POST to these URLs on tile updates
+[webhook]
+urls = ["http://localhost:9000/hooks/tile-update"]
+timeout_ms = 5000
+retry_count = 2
+on_generate = true
+on_update = true
+# Cooldown in seconds — during rapid DB changes, events are accumulated
+# per source and a single aggregated notification is sent after the window.
+# Set to 0 or omit to send every event immediately.
+cooldown_secs = 300  # 5 minutes
+# Uncomment to sign payloads with HMAC-SHA256:
+# secret = "my-webhook-secret"
+
+[[sources]]
+name = "parks"
+mbtiles_path = "./examples/webhook-sse/parks.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[[sources.layers]]
+name = "parks"
+schema = "public"
+table = "parks"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type", "area_sqm"]

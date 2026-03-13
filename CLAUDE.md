@@ -58,7 +58,9 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **`mbtiles.rs`** — SQLite MBTiles store with WAL mode. Auto-materializes Tippecanoe's `tiles` view into a writable table on open. Includes inspect/diff query methods.
 - **`mvt.rs`** — Native MVT/protobuf encoder with geometry simplification (Douglas-Peucker via `geo` crate) and per-zoom property filtering. Uses `prost` with generated code from `vector_tile.proto`.
 - **`updater.rs`** — LISTEN/NOTIFY consumer with debounced batching and auto-reconnect with exponential backoff. Groups events by source, deduplicates affected tiles, regenerates concurrently (semaphore-bounded).
-- **`server.rs`** — HTTP tile server (axum) with ETag support, TileJSON endpoints, CORS, and health check.
+- **`server.rs`** — HTTP tile server (axum) with ETag support, TileJSON endpoints, CORS, health check, and SSE (`GET /events`) for live tile refresh.
+- **`events.rs`** — Shared event types (`TileEvent` enum) and broadcast channel for fan-out to webhook and SSE consumers. Supports event merging during cooldown windows.
+- **`webhook.rs`** — Webhook notifier with HMAC-SHA256 signing, retry with exponential backoff, and optional trailing-edge cooldown/throttle per source.
 - **`storage.rs`** — Publishing abstraction for MBTiles artifact sync to local filesystem, S3 (`aws s3 cp`), Mapbox Studio, or custom shell command.
 - **`tiles.rs`** — Tile math: XYZ coordinate ↔ lon/lat bounds conversion, tiles-for-bounds enumeration.
 - **`config.rs`** — Config deserialization from TOML + env vars (prefix `TILES_`).
@@ -82,6 +84,7 @@ Layers within each source are defined under `[[sources.layers]]` with: `name`, `
 Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
 Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
 HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`).
+Webhook settings live under `[webhook]` (`urls`, `secret`, `cooldown_secs`, `timeout_ms`, `retry_count`, `on_generate`, `on_update`).
 
 ### Database setup
 

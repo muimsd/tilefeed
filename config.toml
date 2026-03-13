@@ -24,6 +24,15 @@ backend = "none" # "none", "local", "s3", "mapbox", "command"
 publish_on_generate = true
 publish_on_update = true
 
+# [webhook]
+# urls = ["https://example.com/hooks/tilefeed"]
+# secret = "my-signing-secret"           # HMAC-SHA256 signing (optional)
+# cooldown_secs = 300                    # aggregate events per source for 5 minutes (optional)
+# timeout_ms = 5000                      # per-request timeout (default: 5000)
+# retry_count = 2                        # retries with exponential backoff (default: 2)
+# on_generate = true                     # notify on full generation (default: true)
+# on_update = true                       # notify on incremental updates (default: true)
+
 [[sources]]
 name = "basemap"
 mbtiles_path = "./basemap.mbtiles"

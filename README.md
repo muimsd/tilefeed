@@ -13,7 +13,9 @@ PostGIS ──┬── Tippecanoe ──┐
           └── Native Rust ─┘             ├── Local copy
                                          ├── S3 upload
 LISTEN/NOTIFY ── Debounce ── MVT encode ─├── Mapbox Studio
-                                         └── Custom command
+                                         ├── Custom command
+                                         ├── Webhooks (HTTP POST)
+                                         └── SSE (Server-Sent Events)
 ```
 
 Full generation exports PostGIS layers through one of three backends (Tippecanoe, GDAL, or native Rust) to produce MBTiles. Incremental updates listen for PostgreSQL notifications, debounce and deduplicate affected tiles, re-encode them as MVT protobuf, and write them into the existing MBTiles file. The built-in HTTP server serves tiles directly from MBTiles with ETag caching and TileJSON metadata.
@@ -38,6 +40,8 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - Geometry simplification (Douglas-Peucker) with per-zoom scaling
 - Per-zoom property filtering to reduce tile sizes at low zooms
 - Storage backends: local copy, S3, [Mapbox Studio](https://docs.mapbox.com/api/maps/uploads/), custom command
+- [Webhook notifications](docs/serving.md#webhooks) with HMAC-SHA256 signing and configurable cooldown
+- [Server-Sent Events](docs/serving.md#server-sent-events-sse) (`GET /events`) for live tile refresh in frontends
 - CLI tools: `inspect`, `validate`, `diff` for MBTiles diagnostics
 - Docker support with multi-stage build
 - Auto-reconnect on PostgreSQL connection loss with exponential backoff
@@ -173,6 +177,11 @@ dbname = "geodata"
 host = "0.0.0.0"
 port = 3000
 
+# [webhook]
+# urls = ["https://example.com/hooks/tilefeed"]
+# secret = "my-signing-secret"
+# cooldown_secs = 300
+
 [[sources]]
 name = "basemap"
 mbtiles_path = "./basemap.mbtiles"
@@ -214,7 +223,7 @@ tilefeed watch      # incremental updates only
 |-----|-------------|
 | [Configuration Reference](docs/configuration.md) | All config fields, sections, and generation backends |
 | [Tippecanoe Settings](docs/tippecanoe.md) | Fine-tuning Tippecanoe tile generation |
-| [Tile Serving](docs/serving.md) | Built-in HTTP server and external alternatives |
+| [Tile Serving](docs/serving.md) | Built-in HTTP server, SSE, webhooks, and external alternatives |
 | [Derived Layers](docs/derived-layers.md) | Auto-generated label points and boundary lines |
 | [OGR_FDW Integration](docs/ogr-fdw.md) | Using external data sources via PostgreSQL FDW |
 
@@ -226,6 +235,7 @@ tilefeed watch      # incremental updates only
 4. Affected tiles are derived from new/old feature bounds
 5. Tiles are regenerated and written into the source's MBTiles
 6. MBTiles artifact is published if `publish_on_update = true`
+7. Webhook and SSE consumers are notified with affected zooms, tile counts, and `max_zoom` for overzoom awareness
 
 ## Support
 
