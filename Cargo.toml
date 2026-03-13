@@ -1,6 +1,6 @@
 [package]
 name = "tilefeed"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
 license = "MIT"
@@ -85,6 +85,7 @@ assets = [
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt"] }
 
 [[example]]
 name = "webhook_sse_demo"
