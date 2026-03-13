@@ -313,7 +313,16 @@ async fn handle_batch_update(
             }
         };
 
-        update_source(config, reader, source, store, publisher, event_tx, source_events).await?;
+        update_source(
+            config,
+            reader,
+            source,
+            store,
+            publisher,
+            event_tx,
+            source_events,
+        )
+        .await?;
     }
 
     Ok(())
@@ -434,8 +443,7 @@ async fn update_source(
 
     // Emit event for webhooks and SSE
     if let Some(event_tx) = event_tx {
-        let zooms: std::collections::HashSet<u8> =
-            all_affected.iter().map(|t| t.z).collect();
+        let zooms: std::collections::HashSet<u8> = all_affected.iter().map(|t| t.z).collect();
         let layers: Vec<String> = events
             .iter()
             .map(|e| e.layer_name.clone())

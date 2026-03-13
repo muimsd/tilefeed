@@ -195,8 +195,10 @@ async fn health_check() -> &'static str {
 
 async fn sse_handler(
     State(state): State<AppState>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>>, StatusCode>
-{
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>>,
+    StatusCode,
+> {
     let event_tx = state.event_tx.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let mut rx = event_tx.subscribe();
 

@@ -76,7 +76,8 @@ impl WebhookNotifier {
                     .map(|(_, started)| *started + cooldown)
                     .min();
 
-                let sleep_until = next_flush.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+                let sleep_until =
+                    next_flush.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
 
                 tokio::select! {
                     result = rx.recv() => {
@@ -272,19 +273,17 @@ mod tests {
 
         let app = Router::new().route(
             "/hook",
-            post(
-                move |headers: axum::http::HeaderMap, body: String| {
-                    let body_clone = body_clone.clone();
-                    let header_clone = header_clone.clone();
-                    async move {
-                        *body_clone.lock().await = Some(body);
-                        *header_clone.lock().await = headers
-                            .get("X-Tilefeed-Event")
-                            .map(|v| v.to_str().unwrap_or("").to_string());
-                        "ok"
-                    }
-                },
-            ),
+            post(move |headers: axum::http::HeaderMap, body: String| {
+                let body_clone = body_clone.clone();
+                let header_clone = header_clone.clone();
+                async move {
+                    *body_clone.lock().await = Some(body);
+                    *header_clone.lock().await = headers
+                        .get("X-Tilefeed-Event")
+                        .map(|v| v.to_str().unwrap_or("").to_string());
+                    "ok"
+                }
+            }),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -340,19 +339,17 @@ mod tests {
 
         let app = Router::new().route(
             "/hook",
-            post(
-                move |headers: axum::http::HeaderMap, body: String| {
-                    let sig_clone = sig_clone.clone();
-                    let body_clone = body_clone.clone();
-                    async move {
-                        *sig_clone.lock().await = headers
-                            .get("X-Tilefeed-Signature")
-                            .map(|v| v.to_str().unwrap_or("").to_string());
-                        *body_clone.lock().await = Some(body);
-                        "ok"
-                    }
-                },
-            ),
+            post(move |headers: axum::http::HeaderMap, body: String| {
+                let sig_clone = sig_clone.clone();
+                let body_clone = body_clone.clone();
+                async move {
+                    *sig_clone.lock().await = headers
+                        .get("X-Tilefeed-Signature")
+                        .map(|v| v.to_str().unwrap_or("").to_string());
+                    *body_clone.lock().await = Some(body);
+                    "ok"
+                }
+            }),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -539,7 +536,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
         let bodies = received_bodies.lock().await;
-        assert_eq!(bodies.len(), 1, "Should receive exactly 1 aggregated webhook");
+        assert_eq!(
+            bodies.len(),
+            1,
+            "Should receive exactly 1 aggregated webhook"
+        );
 
         let json: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
         assert_eq!(json["event"], "update_complete");

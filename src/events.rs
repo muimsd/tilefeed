@@ -7,10 +7,7 @@ use tokio::sync::broadcast;
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum TileEvent {
     /// Full generation completed for a source
-    GenerateComplete {
-        source: String,
-        duration_ms: u64,
-    },
+    GenerateComplete { source: String, duration_ms: u64 },
     /// Incremental update completed for a source
     UpdateComplete {
         source: String,
@@ -83,7 +80,10 @@ impl TileEvent {
                 layers_affected.sort();
             }
             // Generate replaces update
-            (this @ TileEvent::UpdateComplete { .. }, other @ TileEvent::GenerateComplete { .. }) => {
+            (
+                this @ TileEvent::UpdateComplete { .. },
+                other @ TileEvent::GenerateComplete { .. },
+            ) => {
                 *this = other.clone();
             }
             // Latest generate wins
@@ -225,13 +225,7 @@ mod tests {
         };
         assert_eq!(e1.source(), "parks");
 
-        let e2 = TileEvent::update_complete(
-            "basemap".to_string(),
-            5,
-            &HashSet::new(),
-            14,
-            vec![],
-        );
+        let e2 = TileEvent::update_complete("basemap".to_string(), 5, &HashSet::new(), 14, vec![]);
         assert_eq!(e2.source(), "basemap");
     }
 

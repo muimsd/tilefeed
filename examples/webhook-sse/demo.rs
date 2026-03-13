@@ -121,10 +121,7 @@ async fn main() {
     // ── 2. Start tile server with SSE on port 3000 ──────────────
     let sse_app = Router::new()
         .route("/events", get(sse_handler))
-        .route(
-            "/health",
-            get(|| async { "ok" }),
-        )
+        .route("/health", get(|| async { "ok" }))
         .with_state(event_tx.clone());
 
     let sse_listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
