@@ -39,25 +39,43 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-pub async fn start_server(
-    config: Arc<AppConfig>,
+/// Build the tile server, ready to run.
+///
+/// Assembling the router is separated from running it so callers can do it on the
+/// startup path: a bad route pattern panics inside `Router::route`, and a bad
+/// `[metrics] path` returns an error — neither is any use surfacing from inside a
+/// spawned task after the process has already reported itself started.
+pub fn build_server(
+    config: &Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     event_tx: Option<EventSender>,
-) -> Result<()> {
+) -> Result<TileServer> {
     let state = AppState {
         stores,
         config: config.clone(),
         event_tx,
     };
 
-    let app = build_router(&config, state)?;
+    Ok(TileServer {
+        addr: crate::metrics::bind_addr(config.serve.host(), config.serve.port()),
+        router: build_router(config, state)?,
+    })
+}
 
-    let addr = crate::metrics::bind_addr(config.serve.host(), config.serve.port());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("Tile server listening on http://{}", addr);
+/// A built tile server: routes assembled, nothing bound yet.
+pub struct TileServer {
+    addr: String,
+    router: Router,
+}
 
-    axum::serve(listener, app).await?;
-    Ok(())
+impl TileServer {
+    pub async fn run(self) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind(&self.addr).await?;
+        info!("Tile server listening on http://{}", self.addr);
+
+        axum::serve(listener, self.router).await?;
+        Ok(())
+    }
 }
 
 /// Assemble the tile server's routes. Shared with the tests so they exercise the
@@ -130,7 +148,8 @@ async fn serve_tile(
     let y: u32 = match y_pbf.strip_suffix(".pbf").and_then(|y| y.parse().ok()) {
         Some(y) => y,
         None => {
-            return (StatusCode::NOT_FOUND, "Expected /{source}/{z}/{x}/{y}.pbf").into_response()
+            m.tile_requests.with(&[UNKNOWN_SOURCE, "bad_request"]).inc();
+            return (StatusCode::NOT_FOUND, "Expected /{source}/{z}/{x}/{y}.pbf").into_response();
         }
     };
 
@@ -218,9 +237,18 @@ async fn serve_tilejson(
     State(state): State<AppState>,
     Path(source_json): Path<String>,
 ) -> Response {
+    // This route is a single-segment catch-all, so it also collects /favicon.ico
+    // and anything else a browser or scraper tries; count those rather than
+    // 404-ing them invisibly.
     let source = match source_json.strip_suffix(".json") {
         Some(source) => source.to_string(),
-        None => return (StatusCode::NOT_FOUND, "Expected /{source}.json").into_response(),
+        None => {
+            metrics()
+                .tilejson_requests
+                .with(&[UNKNOWN_SOURCE, "bad_request"])
+                .inc();
+            return (StatusCode::NOT_FOUND, "Expected /{source}.json").into_response();
+        }
     };
 
     let source_config = match state.config.sources.iter().find(|s| s.name == source) {
@@ -888,7 +916,7 @@ mod tests {
         // one segment ("/{y}.pbf"), and it panics at startup, inside the spawned
         // server task. Building the real router here is what catches that.
         let config = make_test_config();
-        try_make_app_with_events(config, HashMap::new(), None)
+        let _router = try_make_app_with_events(config, HashMap::new(), None)
             .expect("the production router must build");
     }
 

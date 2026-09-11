@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use anyhow::{anyhow, bail, Context, Result};
+use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
 use tracing::info;
 
@@ -14,16 +14,26 @@ impl MbtilesStore {
     /// create an empty database here, and the caller would serve or inspect it as
     /// if it were real, failing later with "no such table: tiles".
     pub fn open(path: &str) -> Result<Self> {
-        if !Path::new(path).exists() {
-            bail!(
-                "MBTiles file not found: {}. Run `tilefeed generate` to build it first.",
-                path
-            );
-        }
+        // Without SQLITE_OPEN_CREATE, SQLite itself refuses to conjure a file up.
+        // A `Path::exists()` pre-check would race a concurrent `generate`, and
+        // would report an unreadable directory as a missing file.
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
-        let conn = Connection::open(path)
-            .with_context(|| format!("Failed to open MBTiles at {}", path))?;
+        let conn = Connection::open_with_flags(path, flags).map_err(|e| {
+            if Path::new(path).exists() {
+                anyhow!("Failed to open MBTiles at {}: {}", path, e)
+            } else {
+                anyhow!(
+                    "MBTiles file not found: {}. Run `tilefeed generate` to build it first.",
+                    path
+                )
+            }
+        })?;
 
+        // Distinguish "no tiles table" from "could not read the schema at all":
+        // a corrupt or locked database must not be reported as a file to rebuild.
         let has_tiles: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM sqlite_master
@@ -31,7 +41,7 @@ impl MbtilesStore {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or(false);
+            .with_context(|| format!("Failed to read the MBTiles schema of {}", path))?;
 
         if !has_tiles {
             bail!(
@@ -574,6 +584,27 @@ mod tests {
             err.to_string().contains("not a valid MBTiles"),
             "got: {}",
             err
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_open_corrupt_file_reports_the_real_error() {
+        // Telling someone to rebuild a 40GB planet file because a read failed is
+        // worse than useless, so corruption must not be reported as "no tiles table".
+        let path = temp_mbtiles_path();
+        std::fs::write(&path, b"this is definitely not a sqlite database").unwrap();
+
+        let err = match MbtilesStore::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("opening a corrupt file must fail"),
+        };
+        let message = format!("{:#}", err);
+        assert!(
+            !message.contains("not a valid MBTiles"),
+            "corruption should not be reported as a missing tiles table: {}",
+            message
         );
 
         cleanup(&path);

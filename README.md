@@ -47,7 +47,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - [Prometheus metrics](docs/metrics.md) (`GET /metrics`) for tile serving, generation, updates, webhooks, and publishing
 - CLI tools: `inspect`, `validate`, `diff` for MBTiles diagnostics
 - Docker support with multi-stage build
-- `--skip-generate` for instant restarts: serve an existing MBTiles without rebuilding or touching PostGIS
+- `--skip-generate` for fast restarts: serve an existing MBTiles without rebuilding, PostGIS, or Tippecanoe
 - Auto-reconnect on PostgreSQL connection loss with exponential backoff
 - WAL mode for concurrent MBTiles reads during writes
 

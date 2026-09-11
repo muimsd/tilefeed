@@ -94,11 +94,23 @@ impl Commands {
 
     /// Whether this invocation will run a full tile generation.
     fn generates(&self) -> bool {
+        // Spelled out rather than `_ => false`, so a new subcommand that generates
+        // has to answer this question instead of silently skipping the tool check.
         match self {
             Commands::Generate => true,
             Commands::Run { skip_generate } | Commands::Serve { skip_generate } => !skip_generate,
-            _ => false,
+            Commands::Watch
+            | Commands::Validate
+            | Commands::Inspect { .. }
+            | Commands::Diff { .. } => false,
         }
+    }
+
+    /// Whether Tippecanoe/GDAL must be present. `validate` is a dry run of
+    /// generation, so it reports a missing toolchain rather than passing and
+    /// leaving the next `generate` to fail.
+    fn needs_generation_tools(&self) -> bool {
+        self.generates() || matches!(self, Commands::Validate)
     }
 }
 
@@ -117,6 +129,7 @@ async fn main() -> Result<()> {
     metrics::init();
 
     let cli = Cli::parse();
+    metrics::record_startup(cli.command.name(), cli.command.generates());
 
     match cli.command {
         Commands::Inspect { path } => {
@@ -144,16 +157,15 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // Tippecanoe and GDAL are only needed to generate; a serving-only
-            // process should not require them to be installed at all.
-            if cli.command.generates() {
+            // Tippecanoe and GDAL are only needed to generate or to validate; a
+            // serving-only process should not require them to be installed at all.
+            if cli.command.needs_generation_tools() {
                 generator::check_required_tools(
                     &app_config.sources,
                     app_config.tippecanoe_bin.as_deref(),
                     app_config.ogr2ogr_bin.as_deref(),
                 )?;
             }
-            metrics::record_startup(cli.command.name(), cli.command.generates());
 
             match cli.command {
                 Commands::Generate => {
@@ -262,26 +274,42 @@ fn open_stores(
     for source in &config.sources {
         let store = mbtiles::MbtilesStore::open(&source.mbtiles_path)
             .with_context(|| format!("Cannot open source '{}'", source.name))?;
-
-        // Worth stating plainly: without a generation step, this line is the only
-        // confirmation that the file being served actually holds tiles.
-        match store.tile_count() {
-            Ok(count) => {
-                info!(
-                    "Source '{}': {} tiles from {}",
-                    source.name, count, source.mbtiles_path
-                );
-                metrics::metrics()
-                    .mbtiles_tiles
-                    .with(&[&source.name])
-                    .set(count as i64);
-            }
-            Err(e) => warn!("Could not count tiles for source '{}': {}", source.name, e),
-        }
-
         stores.insert(source.name.clone(), Arc::new(Mutex::new(store)));
     }
     Ok(stores)
+}
+
+/// Count each source's tiles in the background and report them.
+///
+/// `SELECT COUNT(*)` is a full scan, seconds of it on a large MBTiles, so it must
+/// not sit between process start and the first served tile — the whole point of
+/// `--skip-generate`. Tiles are served while this runs.
+fn spawn_tile_count_report(
+    stores: &HashMap<String, Arc<Mutex<mbtiles::MbtilesStore>>>,
+) -> tokio::task::JoinHandle<()> {
+    let stores: Vec<(String, Arc<Mutex<mbtiles::MbtilesStore>>)> = stores
+        .iter()
+        .map(|(name, store)| (name.clone(), store.clone()))
+        .collect();
+
+    tokio::spawn(async move {
+        for (name, store) in stores {
+            let count = {
+                let store = store.lock().await;
+                store.tile_count()
+            };
+            match count {
+                Ok(count) => {
+                    info!("Source '{}': {} tiles", name, count);
+                    metrics::metrics()
+                        .mbtiles_tiles_at_open
+                        .with(&[&name])
+                        .set(count as i64);
+                }
+                Err(e) => warn!("Could not count tiles for source '{}': {}", name, e),
+            }
+        }
+    })
 }
 
 /// Start the dedicated metrics listener configured by `[metrics] port`.
@@ -320,6 +348,7 @@ async fn watch_updates(
         "Watching PostgreSQL notifications for {} source(s)",
         stores.len()
     );
+    spawn_tile_count_report(&stores);
 
     let metrics_task = spawn_metrics_exporter(&config, false);
 
@@ -356,6 +385,7 @@ async fn serve_and_watch(
     let stores = open_stores(&config)?;
 
     info!("Starting server and watcher for {} source(s)", stores.len());
+    spawn_tile_count_report(&stores);
 
     let metrics_task = spawn_metrics_exporter(&config, true);
 
@@ -365,8 +395,10 @@ async fn serve_and_watch(
         publisher.clone(),
         Some(event_tx.clone()),
     ));
-    let mut server_task =
-        tokio::spawn(server::start_server(config.clone(), stores, Some(event_tx)));
+    // Built before spawning: a routing or `[metrics] path` problem must stop
+    // startup here, not from inside a background task.
+    let server = server::build_server(&config, stores, Some(event_tx))?;
+    let mut server_task = tokio::spawn(server.run());
 
     tokio::select! {
         result = &mut listener_task => {
@@ -477,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn test_command_names_are_stable_metric_labels() {
+    fn test_command_names_are_stable() {
         for (args, name) in [
             (vec!["tilefeed", "generate"], "generate"),
             (vec!["tilefeed", "watch"], "watch"),
@@ -499,9 +531,13 @@ mod tests {
     }
 
     #[test]
-    fn test_record_startup_exports_mode() {
-        metrics::record_startup("serve", false);
-        let out = metrics::metrics().render();
+    fn test_startup_info_records_command_and_mode() {
+        // A local registry: the process-wide one is shared with every other test
+        // in this binary, and rendering it is not something to make order-dependent.
+        let registry = metrics::Metrics::new();
+        registry.record_startup("serve", false);
+
+        let out = registry.render();
         assert!(out.contains("tilefeed_startup_info{command=\"serve\",generated=\"false\"} 1"));
     }
 }

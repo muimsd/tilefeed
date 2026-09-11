@@ -51,6 +51,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 2. **Incremental updates** (`updater.rs`): PostgreSQL NOTIFY → debounce window → route to source → query affected features → re-encode MVT → write source's MBTiles
 3. **Publishing** (`storage.rs`): copy/upload each source's MBTiles artifact to local path, S3, Mapbox, or custom command backend
 4. **HTTP serving** (`server.rs`): Serve tiles at `/{source}/{z}/{x}/{y}.pbf` with ETags and TileJSON
+5. **Notifications** (`events.rs`, `webhook.rs`, `server.rs`): Webhook HTTP POST and SSE push to notify frontends of tile changes
 
 ### Key modules
 

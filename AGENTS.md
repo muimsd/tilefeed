@@ -89,6 +89,7 @@ Layers within each source are defined under `[[sources.layers]]` with: `name`, `
 Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
 Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
 HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`).
+Metrics settings live under `[metrics]` (`enabled`, `path`, `host`, `port`).
 Webhook settings live under `[webhook]` (`urls`, `secret`, `cooldown_secs`, `timeout_ms`, `retry_count`, `on_generate`, `on_update`).
 
 ### Database setup

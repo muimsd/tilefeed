@@ -34,24 +34,56 @@ pub async fn start_listener(
     let max_retry_delay_secs: u64 = 60;
 
     loop {
-        match run_listener(&config, &stores, publisher.as_ref(), event_tx.as_ref()).await {
-            Ok(()) => {
-                // Clean exit (channel closed)
-                info!("Listener exited cleanly");
-                return Ok(());
-            }
-            Err(e) => {
-                retry_count += 1;
-                metrics().listener_reconnects.get().inc();
-                let delay_secs = (2u64.pow(retry_count.min(6))).min(max_retry_delay_secs);
-                error!(
-                    "Listener connection lost: {}. Reconnecting in {}s (attempt {})...",
-                    e, delay_secs, retry_count
-                );
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-            }
+        // The listener only stops when the connection is gone. A real shutdown
+        // aborts this task instead, so neither outcome here means "we are done":
+        // returning would end the process, taking the HTTP tile server with it.
+        let reason =
+            match run_listener(&config, &stores, publisher.as_ref(), event_tx.as_ref()).await {
+                Ok(()) => "listener stopped without an error".to_string(),
+                Err(e) => e.to_string(),
+            };
+
+        retry_count += 1;
+        metrics().listener_reconnects.get().inc();
+        let delay_secs = (2u64.pow(retry_count.min(6))).min(max_retry_delay_secs);
+        error!(
+            "Listener connection lost: {}. Reconnecting in {}s (attempt {})...",
+            reason, delay_secs, retry_count
+        );
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+    }
+}
+
+/// Collect a debounced batch of notifications.
+///
+/// Returns `Err` when the channel closes, which only happens when the PostgreSQL
+/// connection task has exited — the caller must reconnect rather than treat it as
+/// a clean stop.
+async fn next_batch<T>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+    debounce_ms: u64,
+) -> Result<Vec<T>> {
+    let first = rx
+        .recv()
+        .await
+        .context("PostgreSQL notification channel closed")?;
+    let mut batch = vec![first];
+
+    let deadline = Instant::now() + Duration::from_millis(debounce_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(n)) => batch.push(n),
+            // Timed out, or the channel closed mid-window: hand back what we have
+            // and let the next call surface the closure.
+            _ => break,
         }
     }
+
+    Ok(batch)
 }
 
 async fn run_listener(
@@ -101,26 +133,7 @@ async fn run_listener(
 
     // Debounce loop: collect events over a window, then batch-process
     loop {
-        // Wait for the first notification
-        let first = match rx.recv().await {
-            Some(n) => n,
-            None => return Ok(()), // channel closed, will trigger reconnect in outer loop
-        };
-
-        let mut events = vec![first];
-
-        // Collect more notifications within the debounce window
-        let deadline = Instant::now() + Duration::from_millis(debounce_ms);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(n)) => events.push(n),
-                _ => break,
-            }
-        }
+        let events = next_batch(&mut rx, debounce_ms).await?;
 
         info!("Processing batch of {} notification(s)", events.len());
 
@@ -186,6 +199,47 @@ fn parse_notification(payload: &str) -> Result<UpdateEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- next_batch tests ---
+
+    #[tokio::test]
+    async fn test_next_batch_errors_when_channel_closes() {
+        // A closed channel means the PostgreSQL connection task died. Reporting
+        // that as a clean stop ends `start_listener`, which in `serve` ends the
+        // process and takes the HTTP tile server down with it.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        drop(tx);
+
+        let result = next_batch(&mut rx, 10).await;
+        assert!(
+            result.is_err(),
+            "a closed channel must not look like a clean stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_batch_collects_within_debounce_window() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tx.send("a".to_string()).unwrap();
+        tx.send("b".to_string()).unwrap();
+        tx.send("c".to_string()).unwrap();
+
+        let batch = next_batch(&mut rx, 50).await.unwrap();
+        assert_eq!(batch, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn test_next_batch_returns_pending_items_when_channel_closes_mid_window() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tx.send("only".to_string()).unwrap();
+        drop(tx);
+
+        // What arrived before the closure is still processed...
+        let batch = next_batch(&mut rx, 50).await.unwrap();
+        assert_eq!(batch, vec!["only"]);
+        // ...and the closure surfaces on the next call
+        assert!(next_batch(&mut rx, 50).await.is_err());
+    }
 
     // --- parse_notification tests ---
 
