@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 use crate::config::{AppConfig, DerivedGeomType};
 use crate::events::EventSender;
 use crate::mbtiles::MbtilesStore;
+use crate::metrics::metrics;
 use crate::mvt;
 use crate::postgis::{Bounds, PostgisReader};
 use crate::storage::StoragePublisher;
@@ -41,6 +42,7 @@ pub async fn start_listener(
             }
             Err(e) => {
                 retry_count += 1;
+                metrics().listener_reconnects.get().inc();
                 let delay_secs = (2u64.pow(retry_count.min(6))).min(max_retry_delay_secs);
                 error!(
                     "Listener connection lost: {}. Reconnecting in {}s (attempt {})...",
@@ -127,7 +129,10 @@ async fn run_listener(
             let payload = notification.payload();
             match parse_notification(payload) {
                 Ok(event) => parsed_events.push(event),
-                Err(e) => warn!("Invalid notification payload '{}': {}", payload, e),
+                Err(e) => {
+                    metrics().notifications.with(&["invalid_payload"]).inc();
+                    warn!("Invalid notification payload '{}': {}", payload, e);
+                }
             }
         }
 
@@ -286,12 +291,14 @@ async fn handle_batch_update(
     for event in events {
         match config.find_source_for_layer(&event.layer_name) {
             Some(source) => {
+                metrics().notifications.with(&["routed"]).inc();
                 events_by_source
                     .entry(source.name.clone())
                     .or_default()
                     .push(event);
             }
             None => {
+                metrics().notifications.with(&["unknown_layer"]).inc();
                 warn!("Unknown layer '{}', not in any source", event.layer_name);
             }
         }
@@ -313,7 +320,8 @@ async fn handle_batch_update(
             }
         };
 
-        update_source(
+        let started = std::time::Instant::now();
+        let result = update_source(
             config,
             reader,
             source,
@@ -322,7 +330,17 @@ async fn handle_batch_update(
             event_tx,
             source_events,
         )
-        .await?;
+        .await;
+
+        metrics()
+            .update_duration
+            .with(&[source_name])
+            .observe_since(started);
+        metrics().update_batches.with(&[source_name]).inc();
+        if result.is_err() {
+            metrics().update_errors.with(&[source_name]).inc();
+        }
+        result?;
     }
 
     Ok(())
@@ -400,10 +418,19 @@ async fn update_source(
     for (coord, handle) in handles {
         match handle.await {
             Ok(Ok(data)) => encoded.push((coord, data)),
-            Ok(Err(e)) => error!("Failed to regenerate tile {:?}: {}", coord, e),
-            Err(e) => error!("Task panicked for tile {:?}: {}", coord, e),
+            Ok(Err(e)) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Failed to regenerate tile {:?}: {}", coord, e);
+            }
+            Err(e) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Task panicked for tile {:?}: {}", coord, e);
+            }
         }
     }
+
+    let written = encoded.iter().filter(|(_, d)| d.is_some()).count();
+    let deleted = encoded.len() - written;
 
     // Write to MBTiles under lock (no .await while holding)
     let store = mbtiles.lock().await;
@@ -426,6 +453,15 @@ async fn update_source(
 
     store.commit_transaction()?;
     drop(store);
+
+    metrics()
+        .tiles_written
+        .with(&[&source.name])
+        .add(written as u64);
+    metrics()
+        .tiles_deleted
+        .with(&[&source.name])
+        .add(deleted as u64);
 
     if let Some(publisher) = publisher {
         if config.publish.publish_on_update_enabled() {

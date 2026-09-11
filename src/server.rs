@@ -19,6 +19,7 @@ use tracing::info;
 use crate::config::{AppConfig, ServeConfig};
 use crate::events::{EventSender, TileEvent};
 use crate::mbtiles::MbtilesStore;
+use crate::metrics::{metrics, GaugeGuard};
 
 #[derive(Clone)]
 struct AppState {
@@ -48,13 +49,19 @@ pub async fn start_server(
 
     let cors = build_cors_layer(serve_config);
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/{source}/{z}/{x}/{y}.pbf", get(serve_tile))
         .route("/{source}.json", get(serve_tilejson))
         .route("/health", get(health_check))
-        .route("/events", get(sse_handler))
-        .layer(cors)
-        .with_state(state);
+        .route("/events", get(sse_handler));
+
+    if config.metrics.enabled() {
+        let path = config.metrics.path();
+        info!("Prometheus metrics exposed at {}", path);
+        app = app.route(&path, get(crate::metrics::render_handler));
+    }
+
+    let app = app.layer(cors).with_state(state);
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -86,23 +93,36 @@ async fn serve_tile(
     Path((source, z, x, y)): Path<(String, u8, u32, u32)>,
     headers: HeaderMap,
 ) -> Response {
+    let m = metrics();
+
     let store = match state.stores.get(&source) {
         Some(s) => s,
-        None => return (StatusCode::NOT_FOUND, "Source not found").into_response(),
+        None => {
+            m.tile_requests.with(&[&source, "source_not_found"]).inc();
+            return (StatusCode::NOT_FOUND, "Source not found").into_response();
+        }
     };
 
+    let read_started = std::time::Instant::now();
     let tile_data = {
         let store = store.lock().await;
         match store.get_tile(z, x, y) {
             Ok(data) => data,
             Err(_) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read tile").into_response()
+                m.tile_requests.with(&[&source, "error"]).inc();
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read tile").into_response();
             }
         }
     };
+    m.tile_read_duration
+        .with(&[&source])
+        .observe_since(read_started);
 
     match tile_data {
-        None => StatusCode::NO_CONTENT.into_response(),
+        None => {
+            m.tile_requests.with(&[&source, "empty"]).inc();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Some(data) => {
             // Compute ETag
             let mut hasher = Sha256::new();
@@ -113,30 +133,60 @@ async fn serve_tile(
             if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
                 if let Ok(val) = if_none_match.to_str() {
                     if val == etag || val == "*" {
+                        m.tile_requests.with(&[&source, "not_modified"]).inc();
                         return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
                     }
                 }
             }
 
-            (
-                [
-                    (header::CONTENT_TYPE, "application/x-protobuf".to_string()),
-                    (header::CONTENT_ENCODING, "gzip".to_string()),
-                    (header::ETAG, etag),
-                    (header::CACHE_CONTROL, "public, max-age=300".to_string()),
-                ],
-                data,
-            )
-                .into_response()
+            m.tile_requests.with(&[&source, "hit"]).inc();
+            m.tile_bytes.with(&[&source]).add(data.len() as u64);
+
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/x-protobuf"),
+            );
+            response_headers.insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("public, max-age=300"),
+            );
+            if let Ok(value) = header::HeaderValue::from_str(&etag) {
+                response_headers.insert(header::ETAG, value);
+            }
+
+            // Tiles are gzipped by the native encoder and by Tippecanoe's default,
+            // but not when `no_tile_compression` is set, so advertise the encoding
+            // the stored bytes actually have rather than assuming gzip.
+            if is_gzipped(&data) {
+                response_headers.insert(
+                    header::CONTENT_ENCODING,
+                    header::HeaderValue::from_static("gzip"),
+                );
+            }
+
+            (response_headers, data).into_response()
         }
     }
+}
+
+/// Gzip magic number (RFC 1952): 0x1f 0x8b, followed by deflate method 0x08.
+fn is_gzipped(data: &[u8]) -> bool {
+    data.len() >= 3 && data[0] == 0x1f && data[1] == 0x8b && data[2] == 0x08
 }
 
 async fn serve_tilejson(State(state): State<AppState>, Path(source): Path<String>) -> Response {
     let source_config = match state.config.sources.iter().find(|s| s.name == source) {
         Some(s) => s,
-        None => return (StatusCode::NOT_FOUND, "Source not found").into_response(),
+        None => {
+            metrics()
+                .tilejson_requests
+                .with(&[&source, "source_not_found"])
+                .inc();
+            return (StatusCode::NOT_FOUND, "Source not found").into_response();
+        }
     };
+    metrics().tilejson_requests.with(&[&source, "ok"]).inc();
 
     let host = state.config.serve.host.as_deref().unwrap_or("127.0.0.1");
     let port = state.config.serve.port.unwrap_or(3000);
@@ -202,6 +252,10 @@ async fn sse_handler(
     let event_tx = state.event_tx.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let mut rx = event_tx.subscribe();
 
+    metrics().sse_connections.get().inc();
+    // Held by the stream below, so the gauge drops when the client disconnects.
+    let _client_guard = GaugeGuard::new(metrics().sse_clients.get());
+
     let cooldown = state
         .config
         .webhook
@@ -210,6 +264,9 @@ async fn sse_handler(
         .map(std::time::Duration::from_secs);
 
     let stream = async_stream::stream! {
+        // Move the gauge guard into the stream so it lives as long as the connection.
+        let _client_guard = _client_guard;
+
         match cooldown {
             None => {
                 // No cooldown — forward every event immediately
@@ -345,6 +402,7 @@ mod tests {
             ogr2ogr_bin: None,
             serve: ServeConfig::default(),
             webhook: WebhookConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 
@@ -386,6 +444,7 @@ mod tests {
             .route("/{source_json}", get(serve_tilejson_test))
             .route("/health", get(health_check))
             .route("/events", get(sse_handler))
+            .route("/metrics", get(crate::metrics::render_handler))
             .layer(cors)
             .with_state(state)
     }
@@ -411,6 +470,153 @@ mod tests {
 
     async fn send_request(app: Router, request: Request<Body>) -> Response {
         app.oneshot(request).await.unwrap()
+    }
+
+    #[test]
+    fn test_is_gzipped() {
+        // gzip magic + deflate method
+        assert!(is_gzipped(&[0x1f, 0x8b, 0x08, 0x00]));
+        assert!(!is_gzipped(b"raw protobuf bytes"));
+        assert!(!is_gzipped(&[0x1f, 0x8b]));
+        assert!(!is_gzipped(&[]));
+    }
+
+    #[tokio::test]
+    async fn test_uncompressed_tile_has_no_content_encoding() {
+        // Tippecanoe with `no_tile_compression` stores raw protobuf; advertising
+        // gzip on those bytes makes them undecodable in the browser.
+        let config = make_test_config();
+        let (_path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+
+        let app = make_app(config, stores);
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gzipped_tile_advertises_content_encoding() {
+        let config = make_test_config();
+        let (path, store) = make_test_store();
+        // Minimal gzip stream header, enough for the sniff
+        store
+            .put_tile(1, 0, 0, &[0x1f, 0x8b, 0x08, 0x00, 0x00])
+            .unwrap();
+        let _ = path;
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+
+        let app = make_app(config, stores);
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source/1/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_exposes_tile_counters() {
+        let config = make_test_config();
+        let (_path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+
+        let app = make_app(config, stores);
+
+        let tile_response = send_request(
+            app.clone(),
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(tile_response.status(), StatusCode::OK);
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::metrics::CONTENT_TYPE)
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("tilefeed_build_info"));
+        assert!(
+            body.contains("tilefeed_tile_requests_total{source=\"test_source\",result=\"hit\"}")
+        );
+        assert!(body.contains("tilefeed_tile_bytes_total{source=\"test_source\"}"));
+        assert!(body.contains("tilefeed_tile_read_duration_seconds_count"));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_records_missing_source() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app.clone(),
+            Request::builder()
+                .uri("/ghost_source/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains(
+            "tilefeed_tile_requests_total{source=\"ghost_source\",result=\"source_not_found\"}"
+        ));
     }
 
     #[test]
@@ -669,6 +875,33 @@ mod tests {
             response.headers().get("content-type").unwrap(),
             "text/event-stream"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sse_client_gauge_tracks_open_connection() {
+        // The gauge guard has to be moved into the stream, otherwise the count
+        // drops as soon as the handler returns rather than when the client leaves.
+        let gauge = crate::metrics::metrics().sse_clients.get();
+        let connections_before = crate::metrics::metrics().sse_connections.get().get();
+
+        let config = make_test_config();
+        let event_tx = crate::events::create_event_bus();
+        let app = make_app_with_events(config, HashMap::new(), Some(event_tx));
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Other tests share the process-wide registry, so assert on the floor:
+        // while this response body is alive, at least one client is counted.
+        assert!(gauge.get() >= 1);
+        assert!(crate::metrics::metrics().sse_connections.get().get() > connections_before);
     }
 
     #[tokio::test]

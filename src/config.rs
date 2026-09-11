@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub serve: ServeConfig,
     #[serde(default)]
     pub webhook: WebhookConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +240,50 @@ impl Default for ServeConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Expose Prometheus metrics (default: true)
+    pub enabled: Option<bool>,
+    /// Path the metrics are served under (default: "/metrics")
+    pub path: Option<String>,
+    /// Host for the standalone metrics exporter (default: the `[serve]` host)
+    pub host: Option<String>,
+    /// Port for a standalone metrics-only HTTP listener. Required to expose
+    /// metrics from `watch` and `run`, which have no tile server of their own.
+    pub port: Option<u16>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(true),
+            path: Some("/metrics".to_string()),
+            host: None,
+            port: None,
+        }
+    }
+}
+
+impl MetricsConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Metrics path, normalized to always start with `/`.
+    pub fn path(&self) -> String {
+        match self
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            Some(p) if p.starts_with('/') => p.to_string(),
+            Some(p) => format!("/{}", p),
+            None => "/metrics".to_string(),
+        }
+    }
+}
+
 impl DatabaseConfig {
     pub fn connection_string(&self) -> String {
         format!(
@@ -409,6 +455,7 @@ mod tests {
             ogr2ogr_bin: None,
             serve: ServeConfig::default(),
             webhook: WebhookConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 
@@ -906,6 +953,68 @@ mod tests {
         assert_eq!(config.retry_count, Some(2));
         assert!(config.secret.is_none());
         assert!(config.cooldown_secs.is_none());
+    }
+
+    // --- metrics config ---
+
+    #[test]
+    fn test_metrics_config_defaults() {
+        let config = MetricsConfig::default();
+        assert!(config.enabled());
+        assert_eq!(config.path(), "/metrics");
+        assert!(config.port.is_none());
+    }
+
+    #[test]
+    fn test_metrics_enabled_by_default_for_existing_configs() {
+        // Configs written before [metrics] existed should still expose metrics
+        let cfg = load_config("examples/local-parks/config").unwrap();
+        assert!(cfg.metrics.enabled());
+        assert_eq!(cfg.metrics.path(), "/metrics");
+    }
+
+    #[test]
+    fn test_metrics_path_normalizes_leading_slash() {
+        let config = MetricsConfig {
+            enabled: Some(true),
+            path: Some("internal/metrics".to_string()),
+            host: None,
+            port: None,
+        };
+        assert_eq!(config.path(), "/internal/metrics");
+    }
+
+    #[test]
+    fn test_metrics_path_falls_back_when_blank() {
+        let config = MetricsConfig {
+            enabled: None,
+            path: Some("   ".to_string()),
+            host: None,
+            port: None,
+        };
+        assert_eq!(config.path(), "/metrics");
+        // enabled defaults to true when unset
+        assert!(config.enabled());
+    }
+
+    #[test]
+    fn test_metrics_can_be_disabled() {
+        let config = MetricsConfig {
+            enabled: Some(false),
+            path: None,
+            host: None,
+            port: None,
+        };
+        assert!(!config.enabled());
+    }
+
+    #[test]
+    fn test_load_metrics_config() {
+        let cfg = load_config("examples/metrics/config").unwrap();
+        assert!(cfg.metrics.enabled());
+        assert_eq!(cfg.metrics.port, Some(9090));
+        assert_eq!(cfg.metrics.host, Some("0.0.0.0".to_string()));
+        assert_eq!(cfg.metrics.path(), "/metrics");
     }
 
     #[test]

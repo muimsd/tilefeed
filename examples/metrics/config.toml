@@ -1,0 +1,40 @@
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "tilefeed_example"
+
+[updates]
+debounce_ms = 300
+worker_concurrency = 4
+
+[serve]
+host = "0.0.0.0"
+port = 3000
+
+# Prometheus metrics.
+#
+# `serve` always exposes them on the tile server itself (http://0.0.0.0:3000/metrics
+# with the settings above). `port` additionally starts a metrics-only listener, which
+# is what makes `watch` and `run` observable — those commands have no tile server.
+[metrics]
+enabled = true
+host = "0.0.0.0"
+port = 9090
+path = "/metrics"
+
+[[sources]]
+name = "parks"
+mbtiles_path = "./examples/metrics/parks.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[[sources.layers]]
+name = "parks"
+schema = "public"
+table = "parks"
+geometry_column = "geom"
+id_column = "id"
+srid = 4326
+properties = ["name", "type", "area_sqm"]

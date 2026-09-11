@@ -5,6 +5,7 @@ use tokio::process::Command;
 use tracing::info;
 
 use crate::config::{PublishBackend, PublishConfig};
+use crate::metrics::{metrics, result_label};
 
 #[derive(Debug, Clone)]
 pub enum StoragePublisher {
@@ -74,13 +75,37 @@ impl StoragePublisher {
     }
 
     pub async fn publish_mbtiles(&self, source_path: &str, reason: &str) -> Result<()> {
-        match self {
+        let backend = self.backend_name();
+        let started = std::time::Instant::now();
+
+        let result = match self {
             Self::Local { destination } => publish_to_local(source_path, destination).await,
             Self::S3 { destination, args } => publish_to_s3(source_path, destination, args).await,
             Self::Mapbox { tileset_id, token } => {
                 publish_to_mapbox(source_path, tileset_id, token).await
             }
             Self::Command { command } => run_publish_command(command, source_path, reason).await,
+        };
+
+        metrics()
+            .publish_duration
+            .with(&[backend])
+            .observe_since(started);
+        metrics()
+            .publish_total
+            .with(&[backend, result_label(&result)])
+            .inc();
+
+        result
+    }
+
+    /// Backend name used as a metric label
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Local { .. } => "local",
+            Self::S3 { .. } => "s3",
+            Self::Mapbox { .. } => "mapbox",
+            Self::Command { .. } => "command",
         }
     }
 }

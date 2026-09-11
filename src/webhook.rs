@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 
 use crate::config::WebhookConfig;
 use crate::events::{EventSender, TileEvent};
+use crate::metrics::metrics;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -178,6 +179,7 @@ async fn send_with_retries(
 
     for attempt in 0..=max_retries {
         if attempt > 0 {
+            metrics().webhook_retries.get().inc();
             let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
             tokio::time::sleep(backoff).await;
         }
@@ -193,12 +195,18 @@ async fn send_with_retries(
             req = req.header("X-Tilefeed-Signature", format!("sha256={}", signature));
         }
 
-        match req.body(payload.to_string()).send().await {
+        let started = std::time::Instant::now();
+        let response = req.body(payload.to_string()).send().await;
+        metrics().webhook_duration.get().observe_since(started);
+
+        match response {
             Ok(resp) if resp.status().is_success() => {
+                metrics().webhook_requests.with(&["success"]).inc();
                 info!("Webhook delivered to {}", url);
                 return;
             }
             Ok(resp) => {
+                metrics().webhook_requests.with(&["http_error"]).inc();
                 warn!(
                     "Webhook to {} returned status {} (attempt {}/{})",
                     url,
@@ -208,6 +216,7 @@ async fn send_with_retries(
                 );
             }
             Err(e) => {
+                metrics().webhook_requests.with(&["transport_error"]).inc();
                 warn!(
                     "Webhook to {} failed: {} (attempt {}/{})",
                     url,
@@ -218,6 +227,7 @@ async fn send_with_retries(
             }
         }
     }
+    metrics().webhook_failures.get().inc();
     error!(
         "Webhook delivery to {} failed after {} retries",
         url, max_retries
