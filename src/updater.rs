@@ -382,7 +382,7 @@ async fn update_source(
     }
 
     // Deduplicate
-    all_affected.sort_by(|a, b| (a.z, a.x, a.y).cmp(&(b.z, b.x, b.y)));
+    all_affected.sort_by_key(|t| (t.z, t.x, t.y));
     all_affected.dedup();
 
     if all_affected.is_empty() {
