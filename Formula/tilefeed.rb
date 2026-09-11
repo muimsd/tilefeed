@@ -1,23 +1,23 @@
 class Tilefeed < Formula
   desc "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
   homepage "https://github.com/muimsd/tilefeed"
-  version "0.7.1"
+  version "0.8.1"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/muimsd/tilefeed/releases/download/v0.7.1/tilefeed-aarch64-apple-darwin.tar.gz"
-      sha256 "152f4dbbed44327e06c25aaebdff0d277d7ab30e38673423a7bfca1926c54d8d"
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-aarch64-apple-darwin.tar.gz"
+      sha256 "338edc964f2fe660b876212e3212947ae2084e0e25d3b766d25196b46b271c62"
     end
     on_intel do
-      url "https://github.com/muimsd/tilefeed/releases/download/v0.7.1/tilefeed-x86_64-apple-darwin.tar.gz"
-      sha256 "84e200e8c6e1e1065a557a6650e113104b4728bbf44580d354ba340660a22979"
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-x86_64-apple-darwin.tar.gz"
+      sha256 "61fa512819f66e1cbda06ea3636584e10568a2e810d95ca760c8d60e9cded698"
     end
   end
 
   on_linux do
-    url "https://github.com/muimsd/tilefeed/releases/download/v0.7.1/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
-    sha256 "2e7afc9ee769008fbd02cca7fc56d071ee018e5cec6ddda8cae044032f1c9fc0"
+    url "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "0f5a741998da40d0d13ad1c7db629862cc8a6be00a9fe5d3e9e7eb2915a3a90a"
   end
 
   def install
