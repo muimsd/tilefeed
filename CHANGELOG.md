@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`--skip-generate` for `serve` and `run`**: start from the MBTiles already on disk instead of rebuilding it first. Restarts are immediate, Tippecanoe/GDAL are no longer required for a serving-only process, and the server comes up while PostgreSQL is unreachable — the LISTEN/NOTIFY watcher reconnects on its own.
+- `tilefeed_startup_info{command,generated}` and `tilefeed_mbtiles_tiles{source}` metrics, so a scrape shows whether a process regenerated at startup and how many tiles it is serving
+
+### Fixed
+
+- **The HTTP tile server could not start.** `serve` panicked immediately with `Invalid route "/{source}/{z}/{x}/{y}.pbf": Only one parameter is allowed per path segment` — axum does not allow a literal next to a parameter in one path segment. The published URLs are unchanged; the handlers now parse the `.pbf`/`.json` suffix. The tests had declared their own route patterns, which is why this went unnoticed; they now build the same router the binary does.
+- Opening a missing or invalid MBTiles file now fails with a clear message naming the file. SQLite was creating an empty database instead, which `serve`, `watch`, `inspect`, and `diff` then treated as real.
+
 ## [0.8.0] - 2026-09-11
 
 ### Added

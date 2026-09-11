@@ -14,12 +14,12 @@ mod updater;
 mod validate;
 mod webhook;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use updater::start_listener;
 
 #[derive(Parser)]
@@ -45,10 +45,20 @@ enum Commands {
     Watch,
 
     /// Generate tiles, optionally publish, then watch for incremental updates
-    Run,
+    Run {
+        /// Start from the existing MBTiles instead of rebuilding it first
+        #[arg(long)]
+        skip_generate: bool,
+    },
 
     /// Generate, then serve tiles over HTTP and watch for updates
-    Serve,
+    Serve {
+        /// Serve the existing MBTiles immediately instead of rebuilding it first.
+        /// Skips Tippecanoe/GDAL entirely, so restarts are instant and the server
+        /// comes up even while PostgreSQL is unreachable.
+        #[arg(long)]
+        skip_generate: bool,
+    },
 
     /// Inspect an MBTiles file (metadata, tile counts, sizes)
     Inspect {
@@ -66,6 +76,30 @@ enum Commands {
         /// Path to the second MBTiles file
         path_b: String,
     },
+}
+
+impl Commands {
+    /// Short name used for logging and the startup metric.
+    fn name(&self) -> &'static str {
+        match self {
+            Commands::Generate => "generate",
+            Commands::Watch => "watch",
+            Commands::Run { .. } => "run",
+            Commands::Serve { .. } => "serve",
+            Commands::Inspect { .. } => "inspect",
+            Commands::Validate => "validate",
+            Commands::Diff { .. } => "diff",
+        }
+    }
+
+    /// Whether this invocation will run a full tile generation.
+    fn generates(&self) -> bool {
+        match self {
+            Commands::Generate => true,
+            Commands::Run { skip_generate } | Commands::Serve { skip_generate } => !skip_generate,
+            _ => false,
+        }
+    }
 }
 
 #[tokio::main]
@@ -110,12 +144,16 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // Check required external tools before starting
-            generator::check_required_tools(
-                &app_config.sources,
-                app_config.tippecanoe_bin.as_deref(),
-                app_config.ogr2ogr_bin.as_deref(),
-            )?;
+            // Tippecanoe and GDAL are only needed to generate; a serving-only
+            // process should not require them to be installed at all.
+            if cli.command.generates() {
+                generator::check_required_tools(
+                    &app_config.sources,
+                    app_config.tippecanoe_bin.as_deref(),
+                    app_config.ogr2ogr_bin.as_deref(),
+                )?;
+            }
+            metrics::record_startup(cli.command.name(), cli.command.generates());
 
             match cli.command {
                 Commands::Generate => {
@@ -127,18 +165,26 @@ async fn main() -> Result<()> {
                 Commands::Watch => {
                     watch_updates(app_config, publisher, event_tx).await?;
                 }
-                Commands::Run => {
-                    let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-                    generate_all_sources(&app_config, &reader, &event_tx).await?;
-                    publish_after_generate(&app_config, publisher.as_deref()).await?;
-                    info!("Tile generation complete, starting incremental watcher...");
+                Commands::Run { skip_generate } => {
+                    if skip_generate {
+                        info!("Skipping generation, watching existing MBTiles for updates...");
+                    } else {
+                        let reader = postgis::PostgisReader::connect(&app_config.database).await?;
+                        generate_all_sources(&app_config, &reader, &event_tx).await?;
+                        publish_after_generate(&app_config, publisher.as_deref()).await?;
+                        info!("Tile generation complete, starting incremental watcher...");
+                    }
                     watch_updates(app_config, publisher, event_tx).await?;
                 }
-                Commands::Serve => {
-                    let reader = postgis::PostgisReader::connect(&app_config.database).await?;
-                    generate_all_sources(&app_config, &reader, &event_tx).await?;
-                    publish_after_generate(&app_config, publisher.as_deref()).await?;
-                    info!("Tile generation complete, starting server and watcher...");
+                Commands::Serve { skip_generate } => {
+                    if skip_generate {
+                        info!("Skipping generation, serving the existing MBTiles...");
+                    } else {
+                        let reader = postgis::PostgisReader::connect(&app_config.database).await?;
+                        generate_all_sources(&app_config, &reader, &event_tx).await?;
+                        publish_after_generate(&app_config, publisher.as_deref()).await?;
+                        info!("Tile generation complete, starting server and watcher...");
+                    }
                     serve_and_watch(app_config, publisher, event_tx).await?;
                 }
                 Commands::Validate => {
@@ -214,7 +260,25 @@ fn open_stores(
 ) -> Result<HashMap<String, Arc<Mutex<mbtiles::MbtilesStore>>>> {
     let mut stores = HashMap::new();
     for source in &config.sources {
-        let store = mbtiles::MbtilesStore::open(&source.mbtiles_path)?;
+        let store = mbtiles::MbtilesStore::open(&source.mbtiles_path)
+            .with_context(|| format!("Cannot open source '{}'", source.name))?;
+
+        // Worth stating plainly: without a generation step, this line is the only
+        // confirmation that the file being served actually holds tiles.
+        match store.tile_count() {
+            Ok(count) => {
+                info!(
+                    "Source '{}': {} tiles from {}",
+                    source.name, count, source.mbtiles_path
+                );
+                metrics::metrics()
+                    .mbtiles_tiles
+                    .with(&[&source.name])
+                    .set(count as i64);
+            }
+            Err(e) => warn!("Could not count tiles for source '{}': {}", source.name, e),
+        }
+
         stores.insert(source.name.clone(), Arc::new(Mutex::new(store)));
     }
     Ok(stores)
@@ -348,5 +412,96 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
         _ = terminate => info!("Received SIGTERM, shutting down..."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn test_serve_generates_by_default() {
+        let cli = parse(&["tilefeed", "serve"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                skip_generate: false
+            }
+        ));
+        assert!(cli.command.generates());
+        assert_eq!(cli.command.name(), "serve");
+    }
+
+    #[test]
+    fn test_serve_skip_generate() {
+        let cli = parse(&["tilefeed", "serve", "--skip-generate"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                skip_generate: true
+            }
+        ));
+        // Drives both the Tippecanoe/GDAL precondition check and the startup metric
+        assert!(!cli.command.generates());
+    }
+
+    #[test]
+    fn test_run_skip_generate() {
+        let cli = parse(&["tilefeed", "run", "--skip-generate"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Run {
+                skip_generate: true
+            }
+        ));
+        assert!(!cli.command.generates());
+        assert_eq!(cli.command.name(), "run");
+    }
+
+    #[test]
+    fn test_only_generating_commands_report_generates() {
+        assert!(parse(&["tilefeed", "generate"]).command.generates());
+        assert!(!parse(&["tilefeed", "watch"]).command.generates());
+        assert!(!parse(&["tilefeed", "validate"]).command.generates());
+        assert!(!parse(&["tilefeed", "inspect", "a.mbtiles"])
+            .command
+            .generates());
+        assert!(!parse(&["tilefeed", "diff", "a.mbtiles", "b.mbtiles"])
+            .command
+            .generates());
+    }
+
+    #[test]
+    fn test_command_names_are_stable_metric_labels() {
+        for (args, name) in [
+            (vec!["tilefeed", "generate"], "generate"),
+            (vec!["tilefeed", "watch"], "watch"),
+            (vec!["tilefeed", "run"], "run"),
+            (vec!["tilefeed", "serve"], "serve"),
+            (vec!["tilefeed", "validate"], "validate"),
+            (vec!["tilefeed", "inspect", "a.mbtiles"], "inspect"),
+            (vec!["tilefeed", "diff", "a.mbtiles", "b.mbtiles"], "diff"),
+        ] {
+            assert_eq!(parse(&args).command.name(), name);
+        }
+    }
+
+    #[test]
+    fn test_skip_generate_is_rejected_on_non_generating_commands() {
+        // `watch` never generated in the first place, so the flag would be a lie
+        assert!(Cli::try_parse_from(["tilefeed", "watch", "--skip-generate"]).is_err());
+        assert!(Cli::try_parse_from(["tilefeed", "generate", "--skip-generate"]).is_err());
+    }
+
+    #[test]
+    fn test_record_startup_exports_mode() {
+        metrics::record_startup("serve", false);
+        let out = metrics::metrics().render();
+        assert!(out.contains("tilefeed_startup_info{command=\"serve\",generated=\"false\"} 1"));
     }
 }

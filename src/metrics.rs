@@ -321,9 +321,13 @@ pub struct Metrics {
     // --- Process ---
     /// Always 1; carries the version as a label for dashboards to join on.
     pub build_info: Family<Gauge>,
+    /// Always 1; says which command is running and whether it generated at startup.
+    pub startup_info: Family<Gauge>,
+    /// Tiles present in each source's MBTiles when it was opened.
+    pub mbtiles_tiles: Family<Gauge>,
 
     // --- HTTP tile serving ---
-    /// `result` is one of: hit, empty, not_modified, source_not_found, error.
+    /// `result` is one of: hit, empty, not_modified, not_found, error.
     pub tile_requests: Family<Counter>,
     pub tile_bytes: Family<Counter>,
     pub tile_read_duration: Family<Histogram>,
@@ -370,6 +374,18 @@ impl Metrics {
                 "tilefeed_build_info",
                 "Build information; always 1, the version is carried as a label.",
                 &["version"],
+                Gauge::default,
+            ),
+            startup_info: Family::new(
+                "tilefeed_startup_info",
+                "Always 1; the command being run and whether it generated tiles at startup.",
+                &["command", "generated"],
+                Gauge::default,
+            ),
+            mbtiles_tiles: Family::new(
+                "tilefeed_mbtiles_tiles",
+                "Tiles present in a source's MBTiles file when it was opened.",
+                &["source"],
                 Gauge::default,
             ),
 
@@ -541,6 +557,8 @@ impl Metrics {
         let mut out = String::with_capacity(4096);
 
         self.build_info.encode(&mut out);
+        self.startup_info.encode(&mut out);
+        self.mbtiles_tiles.encode(&mut out);
 
         out.push_str("# HELP tilefeed_uptime_seconds Seconds since the process started.\n");
         out.push_str("# TYPE tilefeed_uptime_seconds gauge\n");
@@ -626,6 +644,16 @@ impl Drop for GaugeGuard {
     fn drop(&mut self) {
         self.0.dec();
     }
+}
+
+/// Record which command is running and whether it generated tiles at startup.
+/// `tilefeed_startup_info{command="serve",generated="false"}` is what tells you a
+/// restart served the existing MBTiles rather than rebuilding it.
+pub fn record_startup(command: &str, generated: bool) {
+    metrics()
+        .startup_info
+        .with(&[command, if generated { "true" } else { "false" }])
+        .set(1);
 }
 
 /// `success` / `failure` label for a `Result`, so call sites stay one-liners.

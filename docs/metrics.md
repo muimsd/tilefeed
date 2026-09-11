@@ -59,6 +59,8 @@ scrape_configs:
 |--------|------|--------|-------------|
 | `tilefeed_build_info` | gauge | `version` | Always 1; carries the running version as a label |
 | `tilefeed_uptime_seconds` | gauge | — | Seconds since the process started |
+| `tilefeed_startup_info` | gauge | `command`, `generated` | Always 1; which command is running and whether it generated tiles at startup |
+| `tilefeed_mbtiles_tiles` | gauge | `source` | Tiles present in the source's MBTiles when it was opened |
 
 ### Tile serving
 

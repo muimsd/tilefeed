@@ -47,6 +47,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - [Prometheus metrics](docs/metrics.md) (`GET /metrics`) for tile serving, generation, updates, webhooks, and publishing
 - CLI tools: `inspect`, `validate`, `diff` for MBTiles diagnostics
 - Docker support with multi-stage build
+- `--skip-generate` for instant restarts: serve an existing MBTiles without rebuilding or touching PostGIS
 - Auto-reconnect on PostgreSQL connection loss with exponential backoff
 - WAL mode for concurrent MBTiles reads during writes
 
@@ -137,6 +138,7 @@ tilefeed generate            # full tile generation from PostGIS
 tilefeed watch               # watch LISTEN/NOTIFY for incremental updates
 tilefeed run                 # generate then watch
 tilefeed serve               # generate, start HTTP server, and watch
+tilefeed serve --skip-generate  # serve the existing MBTiles immediately (no rebuild)
 tilefeed inspect <file>      # inspect MBTiles metadata and statistics
 tilefeed validate            # validate config against the database
 tilefeed diff <a> <b>        # compare two MBTiles files
@@ -221,6 +223,10 @@ tilefeed serve
 # Or step by step:
 tilefeed generate   # build MBTiles
 tilefeed watch      # incremental updates only
+
+# Restart without rebuilding — serves the existing MBTiles right away,
+# needs neither Tippecanoe nor a reachable database to start
+tilefeed serve --skip-generate
 ```
 
 ## Documentation

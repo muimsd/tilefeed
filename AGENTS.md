@@ -21,13 +21,14 @@ cargo run -- generate              # full tile generation from PostGIS via Tippe
 cargo run -- watch                 # watch LISTEN/NOTIFY and apply incremental updates
 cargo run -- run                   # generate then watch
 cargo run -- serve                 # generate, watch, and serve tiles over HTTP
+cargo run -- serve --skip-generate # serve the existing MBTiles without rebuilding
 cargo run -- inspect out.mbtiles   # dump MBTiles metadata and stats
 cargo run -- validate              # check config against database
 cargo run -- diff a.mbtiles b.mbtiles  # compare two MBTiles files
 cargo run -- -c other.toml watch   # use alternate config file
 ```
 
-Requires PostgreSQL with PostGIS extension. Tippecanoe is needed for `generate`, `run`, and `serve`.
+Requires PostgreSQL with PostGIS extension. Tippecanoe is needed for `generate`, and for `run`/`serve` unless `--skip-generate` is passed.
 
 ## Docker
 

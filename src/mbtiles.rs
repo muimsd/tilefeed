@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
 use tracing::info;
@@ -8,10 +8,38 @@ pub struct MbtilesStore {
 }
 
 impl MbtilesStore {
-    /// Open an existing MBTiles file, materializing the tiles view if needed
+    /// Open an existing MBTiles file, materializing the tiles view if needed.
+    ///
+    /// The file must already exist and hold tiles. SQLite would otherwise happily
+    /// create an empty database here, and the caller would serve or inspect it as
+    /// if it were real, failing later with "no such table: tiles".
     pub fn open(path: &str) -> Result<Self> {
+        if !Path::new(path).exists() {
+            bail!(
+                "MBTiles file not found: {}. Run `tilefeed generate` to build it first.",
+                path
+            );
+        }
+
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open MBTiles at {}", path))?;
+
+        let has_tiles: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master
+                 WHERE name = 'tiles' AND type IN ('table', 'view')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !has_tiles {
+            bail!(
+                "{} is not a valid MBTiles file (no `tiles` table). \
+                 Run `tilefeed generate` to rebuild it.",
+                path
+            );
+        }
 
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
@@ -509,6 +537,44 @@ mod tests {
         assert_eq!(store.get_tile(1, 0, 0).unwrap(), None);
         // The previously committed tile should still exist
         assert_eq!(store.get_tile(0, 0, 0).unwrap(), Some(b"existing".to_vec()));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_open_missing_file_errors() {
+        // SQLite would create an empty database here; serving it would look fine
+        // at startup and fail on every tile request instead.
+        let path = temp_mbtiles_path();
+        let err = match MbtilesStore::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("opening a missing MBTiles file must fail"),
+        };
+        assert!(err.to_string().contains("not found"), "got: {}", err);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a failed open must not leave a file behind"
+        );
+    }
+
+    #[test]
+    fn test_open_file_without_tiles_table_errors() {
+        let path = temp_mbtiles_path();
+        // A real file, but not an MBTiles one
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE something_else (id INTEGER);")
+            .unwrap();
+
+        let err = match MbtilesStore::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("opening a non-MBTiles file must fail"),
+        };
+        assert!(
+            err.to_string().contains("not a valid MBTiles"),
+            "got: {}",
+            err
+        );
 
         cleanup(&path);
     }
