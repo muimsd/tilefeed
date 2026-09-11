@@ -19,6 +19,7 @@ tilefeed -c myconfig.toml serve
 | `GET /{source}.json` | TileJSON 3.0.0 metadata |
 | `GET /events` | Server-Sent Events stream for live tile updates |
 | `GET /health` | Health check (returns `ok`) |
+| `GET /metrics` | [Prometheus metrics](metrics.md) (enabled by default, unless `[metrics] port` moves them to their own listener) |
 
 ### Features
 
@@ -26,6 +27,8 @@ tilefeed -c myconfig.toml serve
 - **CORS** — Configurable origins or wildcard (default)
 - **Cache-Control** — `public, max-age=300` on tile responses
 - **TileJSON 3.0.0** — Auto-generated from source config, includes derived layers (`_labels`, `_boundary`)
+- **Content-Encoding** — `gzip` is advertised only when the stored tile bytes are actually gzipped
+- **[Prometheus metrics](metrics.md)** — Request counts, bytes served, and read latency per source
 
 ### Configuration
 
@@ -34,6 +37,11 @@ tilefeed -c myconfig.toml serve
 host = "0.0.0.0"     # bind address (default: 127.0.0.1)
 port = 3000           # port (default: 3000)
 cors_origins = ["http://localhost:8080"]  # omit for wildcard
+
+[metrics]
+enabled = true        # expose /metrics (default: true)
+path = "/metrics"     # metrics path (default: /metrics)
+# port = 9090         # serve metrics on their own listener instead of the tile port
 ```
 
 ## Server-Sent Events (SSE)

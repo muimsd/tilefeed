@@ -62,6 +62,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **`server.rs`** — HTTP tile server (axum) with ETag support, TileJSON endpoints, CORS, health check, and SSE (`GET /events`) for live tile refresh.
 - **`events.rs`** — Shared event types (`TileEvent` enum) and broadcast channel for fan-out to webhook and SSE consumers. Supports event merging during cooldown windows.
 - **`webhook.rs`** — Webhook notifier with HMAC-SHA256 signing, retry with exponential backoff, and optional trailing-edge cooldown/throttle per source.
+- **`metrics.rs`** — Prometheus registry (counters, gauges, histograms) and text exposition format, plus a dedicated listener for commands with no tile server. Process-wide singleton via `metrics()`. Labels must stay low-cardinality and must never carry request-supplied values.
 - **`storage.rs`** — Publishing abstraction for MBTiles artifact sync to local filesystem, S3 (`aws s3 cp`), Mapbox Studio, or custom shell command.
 - **`tiles.rs`** — Tile math: XYZ coordinate ↔ lon/lat bounds conversion, tiles-for-bounds enumeration.
 - **`config.rs`** — Config deserialization from TOML + env vars (prefix `TILES_`).

@@ -4,6 +4,7 @@ mod events;
 mod generator;
 mod inspect;
 mod mbtiles;
+mod metrics;
 mod mvt;
 mod postgis;
 mod server;
@@ -18,7 +19,7 @@ use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 use updater::start_listener;
 
 #[derive(Parser)]
@@ -77,6 +78,9 @@ async fn main() -> Result<()> {
         .init();
 
     let _ = dotenvy::dotenv();
+
+    // Before anything else: uptime is measured from here.
+    metrics::init();
 
     let cli = Cli::parse();
 
@@ -159,13 +163,24 @@ async fn generate_all_sources(
 ) -> Result<()> {
     for source in &config.sources {
         let start = std::time::Instant::now();
-        generator::generate_source(
+        let result = generator::generate_source(
             source,
             reader,
             config.tippecanoe_bin.as_deref(),
             config.ogr2ogr_bin.as_deref(),
         )
-        .await?;
+        .await;
+
+        metrics::metrics()
+            .generate_duration
+            .with(&[&source.name])
+            .observe_since(start);
+        metrics::metrics()
+            .generate_total
+            .with(&[&source.name, metrics::result_label(&result)])
+            .inc();
+        result?;
+
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = event_tx.send(events::TileEvent::GenerateComplete {
             source: source.name.clone(),
@@ -205,6 +220,31 @@ fn open_stores(
     Ok(stores)
 }
 
+/// Start the dedicated metrics listener configured by `[metrics] port`.
+///
+/// `skip_if_serve_addr` is set by commands that run a tile server: that server
+/// serves the metrics path itself when the two addresses coincide, so starting a
+/// second listener on the same socket would just fail to bind.
+fn spawn_metrics_exporter(
+    config: &config::AppConfig,
+    skip_if_serve_addr: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if skip_if_serve_addr && config.metrics_addr_is_serve_addr() {
+        return None;
+    }
+
+    let (host, port) = config.metrics_addr()?;
+    let path = config.metrics.path();
+
+    Some(tokio::spawn(async move {
+        // A metrics endpoint that can't bind must not take the pipeline down with
+        // it, but it also must not fail silently — nothing else would notice.
+        if let Err(e) = metrics::start_metrics_server(&host, port, &path).await {
+            error!("Metrics server on port {} stopped: {}", port, e);
+        }
+    }))
+}
+
 async fn watch_updates(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
@@ -216,6 +256,8 @@ async fn watch_updates(
         "Watching PostgreSQL notifications for {} source(s)",
         stores.len()
     );
+
+    let metrics_task = spawn_metrics_exporter(&config, false);
 
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
@@ -235,6 +277,10 @@ async fn watch_updates(
         }
     }
 
+    if let Some(task) = metrics_task {
+        task.abort();
+    }
+
     Ok(())
 }
 
@@ -246,6 +292,8 @@ async fn serve_and_watch(
     let stores = open_stores(&config)?;
 
     info!("Starting server and watcher for {} source(s)", stores.len());
+
+    let metrics_task = spawn_metrics_exporter(&config, true);
 
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
@@ -270,6 +318,10 @@ async fn serve_and_watch(
             let _ = server_task.await;
             info!("Server and watcher shut down");
         }
+    }
+
+    if let Some(task) = metrics_task {
+        task.abort();
     }
 
     Ok(())
