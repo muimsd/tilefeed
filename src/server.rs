@@ -39,25 +39,43 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-pub async fn start_server(
-    config: Arc<AppConfig>,
+/// Build the tile server, ready to run.
+///
+/// Assembling the router is separated from running it so callers can do it on the
+/// startup path: a bad route pattern panics inside `Router::route`, and a bad
+/// `[metrics] path` returns an error — neither is any use surfacing from inside a
+/// spawned task after the process has already reported itself started.
+pub fn build_server(
+    config: &Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     event_tx: Option<EventSender>,
-) -> Result<()> {
+) -> Result<TileServer> {
     let state = AppState {
         stores,
         config: config.clone(),
         event_tx,
     };
 
-    let app = build_router(&config, state)?;
+    Ok(TileServer {
+        addr: crate::metrics::bind_addr(config.serve.host(), config.serve.port()),
+        router: build_router(config, state)?,
+    })
+}
 
-    let addr = crate::metrics::bind_addr(config.serve.host(), config.serve.port());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("Tile server listening on http://{}", addr);
+/// A built tile server: routes assembled, nothing bound yet.
+pub struct TileServer {
+    addr: String,
+    router: Router,
+}
 
-    axum::serve(listener, app).await?;
-    Ok(())
+impl TileServer {
+    pub async fn run(self) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind(&self.addr).await?;
+        info!("Tile server listening on http://{}", self.addr);
+
+        axum::serve(listener, self.router).await?;
+        Ok(())
+    }
 }
 
 /// Assemble the tile server's routes. Shared with the tests so they exercise the
@@ -65,9 +83,13 @@ pub async fn start_server(
 fn build_router(config: &AppConfig, state: AppState) -> Result<Router> {
     let cors = build_cors_layer(&config.serve);
 
+    // The extension is part of the path parameter, not the route pattern: axum
+    // allows only one parameter per path segment, so "/{y}.pbf" is rejected at
+    // startup. The handlers strip and validate the suffix instead, which keeps the
+    // published URLs (`/{source}/{z}/{x}/{y}.pbf`, `/{source}.json`) unchanged.
     let app = Router::new()
-        .route("/{source}/{z}/{x}/{y}.pbf", get(serve_tile))
-        .route("/{source}.json", get(serve_tilejson))
+        .route("/{source}/{z}/{x}/{y_pbf}", get(serve_tile))
+        .route("/{source_json}", get(serve_tilejson))
         .route("/health", get(health_check))
         .route("/events", get(sse_handler))
         .layer(cors);
@@ -118,10 +140,18 @@ fn build_cors_layer(config: &ServeConfig) -> CorsLayer {
 
 async fn serve_tile(
     State(state): State<AppState>,
-    Path((source, z, x, y)): Path<(String, u8, u32, u32)>,
+    Path((source, z, x, y_pbf)): Path<(String, u8, u32, String)>,
     headers: HeaderMap,
 ) -> Response {
     let m = metrics();
+
+    let y: u32 = match y_pbf.strip_suffix(".pbf").and_then(|y| y.parse().ok()) {
+        Some(y) => y,
+        None => {
+            m.tile_requests.with(&[UNKNOWN_SOURCE, "bad_request"]).inc();
+            return (StatusCode::NOT_FOUND, "Expected /{source}/{z}/{x}/{y}.pbf").into_response();
+        }
+    };
 
     let store = match state.stores.get(&source) {
         Some(s) => s,
@@ -203,7 +233,24 @@ fn is_gzipped(data: &[u8]) -> bool {
     data.len() >= 3 && data[0] == 0x1f && data[1] == 0x8b && data[2] == 0x08
 }
 
-async fn serve_tilejson(State(state): State<AppState>, Path(source): Path<String>) -> Response {
+async fn serve_tilejson(
+    State(state): State<AppState>,
+    Path(source_json): Path<String>,
+) -> Response {
+    // This route is a single-segment catch-all, so it also collects /favicon.ico
+    // and anything else a browser or scraper tries; count those rather than
+    // 404-ing them invisibly.
+    let source = match source_json.strip_suffix(".json") {
+        Some(source) => source.to_string(),
+        None => {
+            metrics()
+                .tilejson_requests
+                .with(&[UNKNOWN_SOURCE, "bad_request"])
+                .inc();
+            return (StatusCode::NOT_FOUND, "Expected /{source}.json").into_response();
+        }
+    };
+
     let source_config = match state.config.sources.iter().find(|s| s.name == source) {
         Some(s) => s,
         None => {
@@ -464,47 +511,23 @@ mod tests {
         try_make_app_with_events(config, stores, event_tx).unwrap()
     }
 
-    /// Mirrors `build_router`, but with test-only tile routes: axum cannot bind a
-    /// `{y}.pbf` suffix param through `oneshot`, so those two paths differ. The
-    /// metrics mounting goes through the same `mount_metrics` the binary uses.
+    /// Builds exactly what the binary serves. Nothing about the routing is
+    /// re-stated here: a test harness that declared its own routes is what let a
+    /// startup panic in the real ones go unnoticed.
     fn try_make_app_with_events(
         config: AppConfig,
         stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
         event_tx: Option<EventSender>,
     ) -> Result<Router> {
-        let cors = build_cors_layer(&config.serve);
-        let app = Router::new()
-            .route("/{source}/{z}/{x}/{y_pbf}", get(serve_tile_test))
-            .route("/{source_json}", get(serve_tilejson_test))
-            .route("/health", get(health_check))
-            .route("/events", get(sse_handler))
-            .layer(cors);
-
-        let app = mount_metrics(app, &config)?;
-        Ok(app.with_state(AppState {
-            stores,
-            config: Arc::new(config),
-            event_tx,
-        }))
-    }
-
-    /// Test-only handler that parses z/x/y.pbf from path segments
-    async fn serve_tile_test(
-        State(state): State<AppState>,
-        Path((source, z, x, y_pbf)): Path<(String, u8, u32, String)>,
-        headers: HeaderMap,
-    ) -> Response {
-        let y: u32 = y_pbf.trim_end_matches(".pbf").parse().unwrap_or(0);
-        serve_tile(State(state), Path((source, z, x, y)), headers).await
-    }
-
-    /// Test-only handler that strips .json suffix
-    async fn serve_tilejson_test(
-        State(state): State<AppState>,
-        Path(source_json): Path<String>,
-    ) -> Response {
-        let source = source_json.trim_end_matches(".json").to_string();
-        serve_tilejson(State(state), Path(source)).await
+        let config = Arc::new(config);
+        build_router(
+            &config,
+            AppState {
+                stores,
+                config: config.clone(),
+                event_tx,
+            },
+        )
     }
 
     async fn send_request(app: Router, request: Request<Body>) -> Response {
@@ -885,6 +908,54 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_production_routes_are_valid() {
+        // axum panics when a route pattern puts a literal next to a parameter in
+        // one segment ("/{y}.pbf"), and it panics at startup, inside the spawned
+        // server task. Building the real router here is what catches that.
+        let config = make_test_config();
+        let _router = try_make_app_with_events(config, HashMap::new(), None)
+            .expect("the production router must build");
+    }
+
+    #[tokio::test]
+    async fn test_tile_requires_pbf_extension() {
+        let config = make_test_config();
+        let (_path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+        let app = make_app(config, stores);
+
+        for uri in [
+            "/test_source/0/0/0.png",
+            "/test_source/0/0/0",
+            "/test_source/0/0/abc.pbf",
+        ] {
+            let response = send_request(
+                app.clone(),
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "for {}", uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_requires_json_extension() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

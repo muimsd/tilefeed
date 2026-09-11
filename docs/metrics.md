@@ -59,23 +59,28 @@ scrape_configs:
 |--------|------|--------|-------------|
 | `tilefeed_build_info` | gauge | `version` | Always 1; carries the running version as a label |
 | `tilefeed_uptime_seconds` | gauge | — | Seconds since the process started |
+| `tilefeed_startup_info` | gauge | `command`, `generated` | Always 1; which command is running and whether it generated tiles at startup |
+| `tilefeed_mbtiles_tiles_at_open` | gauge | `source` | Tiles in the source's MBTiles at startup. A snapshot — incremental updates do not move it |
 
 ### Tile serving
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `tilefeed_tile_requests_total` | counter | `source`, `result` | Tile requests. `result`: `hit`, `empty`, `not_modified`, `not_found`, `error` |
+| `tilefeed_tile_requests_total` | counter | `source`, `result` | Tile requests. `result`: `hit`, `empty`, `not_modified`, `not_found`, `bad_request`, `error` |
 | `tilefeed_tile_bytes_total` | counter | `source` | Bytes of tile data served |
 | `tilefeed_tile_read_duration_seconds` | histogram | `source` | Time spent reading a tile out of MBTiles |
-| `tilefeed_tilejson_requests_total` | counter | `source`, `result` | TileJSON requests. `result`: `ok`, `not_found` |
+| `tilefeed_tilejson_requests_total` | counter | `source`, `result` | TileJSON requests. `result`: `ok`, `not_found`, `bad_request` |
 | `tilefeed_sse_clients` | gauge | — | SSE clients currently connected to `/events` |
 | `tilefeed_sse_connections_total` | counter | — | SSE connections opened since start |
 
 `empty` is a 204: the tile is genuinely absent from the MBTiles (no features there),
 which is normal and not an error.
 
-Requests for a source that isn't configured are counted under the fixed label
-`source="__unknown__"` rather than the name from the URL — otherwise a scanner
+`bad_request` is a malformed path — a tile URL without a `.pbf` extension, or a
+single-segment request like `/favicon.ico` that reaches the TileJSON route.
+
+Requests for a source that isn't configured, and malformed ones, are counted under
+the fixed label `source="__unknown__"` rather than the name from the URL — otherwise a scanner
 walking `/aaa/0/0/0.pbf`, `/aab/0/0/0.pbf`, … could grow the registry without bound.
 
 ### Full generation

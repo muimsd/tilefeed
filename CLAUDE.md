@@ -21,13 +21,14 @@ cargo run -- generate              # full tile generation from PostGIS via Tippe
 cargo run -- watch                 # watch LISTEN/NOTIFY and apply incremental updates
 cargo run -- run                   # generate then watch
 cargo run -- serve                 # generate, watch, and serve tiles over HTTP
+cargo run -- serve --skip-generate # serve the existing MBTiles without rebuilding
 cargo run -- inspect out.mbtiles   # dump MBTiles metadata and stats
 cargo run -- validate              # check config against database
 cargo run -- diff a.mbtiles b.mbtiles  # compare two MBTiles files
 cargo run -- -c other.toml watch   # use alternate config file
 ```
 
-Requires PostgreSQL with PostGIS extension. Tippecanoe is needed for `generate`, `run`, and `serve`.
+Requires PostgreSQL with PostGIS extension. Tippecanoe is needed for `generate`, and for `run`/`serve` unless `--skip-generate` is passed.
 
 ## Docker
 
@@ -50,6 +51,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 2. **Incremental updates** (`updater.rs`): PostgreSQL NOTIFY → debounce window → route to source → query affected features → re-encode MVT → write source's MBTiles
 3. **Publishing** (`storage.rs`): copy/upload each source's MBTiles artifact to local path, S3, Mapbox, or custom command backend
 4. **HTTP serving** (`server.rs`): Serve tiles at `/{source}/{z}/{x}/{y}.pbf` with ETags and TileJSON
+5. **Notifications** (`events.rs`, `webhook.rs`, `server.rs`): Webhook HTTP POST and SSE push to notify frontends of tile changes
 
 ### Key modules
 
@@ -77,6 +79,8 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **Tippecanoe creates views, not tables**: The MBTiles `open()` method detects and materializes the `tiles` view into a real table so incremental writes work.
 - **Layer→source routing**: `AppConfig::find_source_for_layer()` maps a notification's layer name to the owning source. Each source maintains its own MBTiles store.
 - **Auto-reconnect**: The LISTEN/NOTIFY listener reconnects with exponential backoff if the PostgreSQL connection drops.
+- **One route parameter per path segment**: axum rejects patterns like `/{y}.pbf` or `/{source}.json` at startup (a panic, inside the spawned server task). File extensions are captured as part of the parameter and parsed in the handler.
+- **Server tests build the production router**: `build_router()` is what both `start_server` and the tests use. Tests must never declare their own route patterns — a test harness that did exactly that hid a startup panic through two releases.
 
 ### Config (`config.toml`)
 

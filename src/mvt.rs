@@ -585,8 +585,9 @@ mod tests {
 
     #[test]
     fn test_json_to_mvt_value_float() {
-        let val = json_to_mvt_value(&json!(3.14));
-        assert_eq!(val.double_value, Some(3.14));
+        // Not 3.14: clippy denies approximations of PI, and the value is arbitrary
+        let val = json_to_mvt_value(&json!(12.5));
+        assert_eq!(val.double_value, Some(12.5));
         assert_eq!(val.int_value, None);
         assert_eq!(val.string_value, None);
     }

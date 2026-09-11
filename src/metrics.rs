@@ -321,9 +321,14 @@ pub struct Metrics {
     // --- Process ---
     /// Always 1; carries the version as a label for dashboards to join on.
     pub build_info: Family<Gauge>,
+    /// Always 1; says which command is running and whether it generated at startup.
+    pub startup_info: Family<Gauge>,
+    /// Tiles present in each source's MBTiles when it was opened. A snapshot, not
+    /// a live count — incremental updates do not move it.
+    pub mbtiles_tiles_at_open: Family<Gauge>,
 
     // --- HTTP tile serving ---
-    /// `result` is one of: hit, empty, not_modified, source_not_found, error.
+    /// `result` is one of: hit, empty, not_modified, not_found, error.
     pub tile_requests: Family<Counter>,
     pub tile_bytes: Family<Counter>,
     pub tile_read_duration: Family<Histogram>,
@@ -362,7 +367,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             started: Instant::now(),
 
@@ -370,6 +375,19 @@ impl Metrics {
                 "tilefeed_build_info",
                 "Build information; always 1, the version is carried as a label.",
                 &["version"],
+                Gauge::default,
+            ),
+            startup_info: Family::new(
+                "tilefeed_startup_info",
+                "Always 1; the command being run and whether it generated tiles at startup.",
+                &["command", "generated"],
+                Gauge::default,
+            ),
+            mbtiles_tiles_at_open: Family::new(
+                "tilefeed_mbtiles_tiles_at_open",
+                "Tiles present in a source's MBTiles file when the process opened it. \
+                 A startup snapshot; incremental updates do not change it.",
+                &["source"],
                 Gauge::default,
             ),
 
@@ -531,6 +549,14 @@ impl Metrics {
         }
     }
 
+    /// See the free [`record_startup`]; takes `&self` so tests can use a registry
+    /// of their own instead of the process-wide one.
+    pub fn record_startup(&self, command: &str, generated: bool) {
+        self.startup_info
+            .with(&[command, if generated { "true" } else { "false" }])
+            .set(1);
+    }
+
     /// Seconds since the registry was created (process start, in practice).
     pub fn uptime_seconds(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
@@ -541,6 +567,8 @@ impl Metrics {
         let mut out = String::with_capacity(4096);
 
         self.build_info.encode(&mut out);
+        self.startup_info.encode(&mut out);
+        self.mbtiles_tiles_at_open.encode(&mut out);
 
         out.push_str("# HELP tilefeed_uptime_seconds Seconds since the process started.\n");
         out.push_str("# TYPE tilefeed_uptime_seconds gauge\n");
@@ -626,6 +654,13 @@ impl Drop for GaugeGuard {
     fn drop(&mut self) {
         self.0.dec();
     }
+}
+
+/// Record which command is running and whether it generated tiles at startup.
+/// `tilefeed_startup_info{command="serve",generated="false"}` is what tells you a
+/// restart served the existing MBTiles rather than rebuilding it.
+pub fn record_startup(command: &str, generated: bool) {
+    metrics().record_startup(command, generated);
 }
 
 /// `success` / `failure` label for a `Result`, so call sites stay one-liners.

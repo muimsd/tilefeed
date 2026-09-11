@@ -11,6 +11,47 @@ tilefeed serve
 tilefeed -c myconfig.toml serve
 ```
 
+### Serving without rebuilding
+
+By default `serve` runs a full generation before it serves anything, so a restart
+re-runs Tippecanoe over every source. Pass `--skip-generate` to serve the MBTiles
+already on disk:
+
+```bash
+tilefeed serve --skip-generate
+```
+
+This changes three things:
+
+- **Startup is immediate** — no generation, however large the sources are. (One
+  exception: the first open of a file Tippecanoe just produced materializes its
+  `tiles` view into a writable table, which copies every tile once. Subsequent
+  starts skip that.)
+- **No external tools are required.** Tippecanoe and GDAL are only checked for when
+  a run will actually generate, so a serving-only container needs neither installed.
+- **The database is not needed to start.** Tiles are served straight away; the
+  LISTEN/NOTIFY watcher connects in the background and retries with backoff, so
+  incremental updates resume by themselves once PostgreSQL is reachable.
+
+The MBTiles file has to exist — `tilefeed generate` builds it. Starting with a
+missing or non-MBTiles file fails immediately with a message naming the source,
+rather than serving an empty database.
+
+Two metrics describe what a process did at startup:
+
+```
+tilefeed_startup_info{command="serve",generated="false"} 1
+tilefeed_mbtiles_tiles_at_open{source="basemap"} 41532
+```
+
+The tile count is a snapshot taken in the background just after startup, so it
+never delays the first request — and it does not move as incremental updates write
+new tiles.
+
+`run --skip-generate` does the same for the watch-only pipeline; it is equivalent
+to `watch`, and exists so a deployment already running `run` can switch by adding a
+flag rather than changing its command.
+
 ### Endpoints
 
 | Endpoint | Description |

@@ -32,6 +32,9 @@ services:
       TILES_DATABASE__DBNAME: tiles
     ports:
       - "3000:3000"
+    # Rebuilds every source on each start. Once the MBTiles exists on the
+    # tiles-data volume, append --skip-generate to the command below so restarts
+    # serve it immediately instead of re-running Tippecanoe.
     command: ["serve", "-c", "/data/config.toml"]
 
 volumes:
