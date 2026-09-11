@@ -240,28 +240,32 @@ impl Default for ServeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl ServeConfig {
+    pub fn host(&self) -> &str {
+        self.host.as_deref().unwrap_or("127.0.0.1")
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(3000)
+    }
+}
+
+/// Paths the tile server already owns; mounting metrics on one of them would
+/// panic axum at startup, so the config is rejected instead.
+pub const RESERVED_SERVER_PATHS: &[&str] = &["/health", "/events"];
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct MetricsConfig {
     /// Expose Prometheus metrics (default: true)
     pub enabled: Option<bool>,
     /// Path the metrics are served under (default: "/metrics")
     pub path: Option<String>,
-    /// Host for the standalone metrics exporter (default: the `[serve]` host)
+    /// Host for the dedicated metrics listener (default: the `[serve]` host)
     pub host: Option<String>,
-    /// Port for a standalone metrics-only HTTP listener. Required to expose
-    /// metrics from `watch` and `run`, which have no tile server of their own.
+    /// Port for a dedicated metrics listener. Metrics move off the tile server
+    /// onto it, and it is the only way to expose metrics from `watch` and `run`,
+    /// which have no tile server of their own.
     pub port: Option<u16>,
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: Some(true),
-            path: Some("/metrics".to_string()),
-            host: None,
-            port: None,
-        }
-    }
 }
 
 impl MetricsConfig {
@@ -281,6 +285,41 @@ impl MetricsConfig {
             Some(p) => format!("/{}", p),
             None => "/metrics".to_string(),
         }
+    }
+}
+
+impl AppConfig {
+    /// Address of the dedicated metrics listener, when `[metrics] port` names one.
+    /// The host falls back to the `[serve]` host.
+    pub fn metrics_addr(&self) -> Option<(String, u16)> {
+        if !self.metrics.enabled() {
+            return None;
+        }
+        let port = self.metrics.port?;
+        let host = self
+            .metrics
+            .host
+            .as_deref()
+            .unwrap_or_else(|| self.serve.host())
+            .to_string();
+        Some((host, port))
+    }
+
+    /// Whether that dedicated address is the socket the tile server already binds,
+    /// in which case the two would collide and the tile server serves metrics.
+    pub fn metrics_addr_is_serve_addr(&self) -> bool {
+        self.metrics_addr().is_some_and(|(host, port)| {
+            (host.as_str(), port) == (self.serve.host(), self.serve.port())
+        })
+    }
+
+    /// Whether the tile server itself should serve the metrics path. Metrics live
+    /// in exactly one place: on a separate listener when one is configured, on the
+    /// tile server otherwise — so setting `[metrics] port` really does take the
+    /// scrape endpoint off the tile port.
+    pub fn metrics_on_tile_server(&self) -> bool {
+        self.metrics.enabled()
+            && (self.metrics_addr().is_none() || self.metrics_addr_is_serve_addr())
     }
 }
 
@@ -1006,6 +1045,66 @@ mod tests {
             port: None,
         };
         assert!(!config.enabled());
+    }
+
+    #[test]
+    fn test_metrics_addr_defaults_host_to_serve_host() {
+        let mut cfg = sample_config(vec![sample_source("a", &["l"])]);
+        cfg.serve.host = Some("0.0.0.0".to_string());
+        cfg.metrics.port = Some(9090);
+
+        assert_eq!(cfg.metrics_addr(), Some(("0.0.0.0".to_string(), 9090)));
+    }
+
+    #[test]
+    fn test_separate_metrics_port_takes_endpoint_off_the_tile_server() {
+        let mut cfg = sample_config(vec![sample_source("a", &["l"])]);
+        cfg.serve.port = Some(3000);
+        cfg.metrics.port = Some(9090);
+
+        assert!(!cfg.metrics_addr_is_serve_addr());
+        assert!(!cfg.metrics_on_tile_server());
+    }
+
+    #[test]
+    fn test_metrics_port_matching_serve_port_stays_on_the_tile_server() {
+        // Both would bind the same socket; the tile server wins and the
+        // standalone listener is skipped rather than failing to bind.
+        let mut cfg = sample_config(vec![sample_source("a", &["l"])]);
+        cfg.serve.host = Some("127.0.0.1".to_string());
+        cfg.serve.port = Some(3000);
+        cfg.metrics.port = Some(3000);
+
+        assert!(cfg.metrics_addr_is_serve_addr());
+        assert!(cfg.metrics_on_tile_server());
+    }
+
+    #[test]
+    fn test_metrics_on_tile_server_by_default() {
+        let cfg = sample_config(vec![sample_source("a", &["l"])]);
+        assert!(cfg.metrics_addr().is_none());
+        assert!(cfg.metrics_on_tile_server());
+    }
+
+    #[test]
+    fn test_disabled_metrics_have_no_address_and_no_route() {
+        let mut cfg = sample_config(vec![sample_source("a", &["l"])]);
+        cfg.metrics.enabled = Some(false);
+        cfg.metrics.port = Some(9090);
+
+        assert!(cfg.metrics_addr().is_none());
+        assert!(!cfg.metrics_on_tile_server());
+    }
+
+    #[test]
+    fn test_serve_config_accessor_defaults() {
+        let cfg = ServeConfig {
+            host: None,
+            port: None,
+            cors_origins: None,
+        };
+        assert_eq!(cfg.host(), "127.0.0.1");
+        assert_eq!(cfg.port(), 3000);
     }
 
     #[test]

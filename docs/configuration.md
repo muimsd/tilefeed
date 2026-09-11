@@ -43,7 +43,7 @@ cors_origins = ["http://localhost:8080"]
 [metrics]
 enabled = true
 path = "/metrics"
-# port = 9090  # standalone exporter, required to scrape `watch` and `run`
+# port = 9090  # dedicated metrics listener, required to scrape `watch` and `run`
 
 [publish]
 backend = "none" # none | local | s3 | mapbox | command
@@ -128,8 +128,8 @@ simplify_tolerance = 0.00001
 |-------|------|---------|-------------|
 | `enabled` | bool | true | Expose Prometheus metrics |
 | `path` | string | `"/metrics"` | Path the metrics are served under |
-| `host` | string | `[serve]` host | Bind address for the standalone metrics exporter |
-| `port` | int | — | Port for a metrics-only listener. Required to scrape `watch` and `run`, which have no tile server. |
+| `host` | string | `[serve]` host | Bind address for the dedicated metrics listener |
+| `port` | int | — | Port for a dedicated metrics listener. Required to scrape `watch` and `run`, which have no tile server; when set for `serve`, metrics move off the tile port to this one. |
 
 See [Metrics](metrics.md) for the full metric reference.
 

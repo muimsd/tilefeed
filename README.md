@@ -181,7 +181,7 @@ host = "0.0.0.0"
 port = 3000
 
 # [metrics]
-# port = 9090   # also scrapeable at /metrics on the serve port
+# port = 9090   # dedicated metrics listener; omit to serve /metrics on the tile port
 
 # [webhook]
 # urls = ["https://example.com/hooks/tilefeed"]

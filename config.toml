@@ -24,14 +24,14 @@ backend = "none" # "none", "local", "s3", "mapbox", "command"
 publish_on_generate = true
 publish_on_update = true
 
-# Prometheus metrics (enabled by default).
-# `serve` exposes them on the tile server; set `port` to also run a metrics-only
-# listener, which is what makes `watch` and `run` scrapeable.
+# Prometheus metrics (enabled by default). Served in exactly one place: on the tile
+# server, or — when `port` is set — on a dedicated listener instead, which is also
+# what makes `watch` and `run` scrapeable.
 # [metrics]
 # enabled = true                         # expose metrics at all (default: true)
 # path = "/metrics"                      # metrics path (default: /metrics)
-# host = "127.0.0.1"                     # standalone exporter host (default: [serve] host)
-# port = 9090                            # standalone exporter port (no default)
+# host = "127.0.0.1"                     # dedicated listener host (default: [serve] host)
+# port = 9090                            # dedicated metrics port (no default)
 
 # [webhook]
 # urls = ["https://example.com/hooks/tilefeed"]

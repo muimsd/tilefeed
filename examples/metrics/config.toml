@@ -15,9 +15,10 @@ port = 3000
 
 # Prometheus metrics.
 #
-# `serve` always exposes them on the tile server itself (http://0.0.0.0:3000/metrics
-# with the settings above). `port` additionally starts a metrics-only listener, which
-# is what makes `watch` and `run` observable — those commands have no tile server.
+# With `port` set, metrics are served *only* on that listener — scrape
+# http://0.0.0.0:9090/metrics, not the tile port. This is also what makes `watch`
+# and `run` observable, since those commands have no tile server at all.
+# Drop `port` to serve metrics on the tile server itself instead.
 [metrics]
 enabled = true
 host = "0.0.0.0"

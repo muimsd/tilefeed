@@ -63,10 +63,14 @@ impl Gauge {
     }
 }
 
-/// Cumulative histogram with fixed bucket bounds.
+/// Histogram with fixed bucket bounds.
+///
+/// Each observation touches exactly one bucket; the cumulative counts Prometheus
+/// wants are summed at render time. That keeps the hot path to a single atomic
+/// increment rather than one per bound.
 pub struct Histogram {
     bounds: &'static [f64],
-    /// One counter per bound, plus nothing for `+Inf` (derived from `count`).
+    /// Observations falling in each bound's slot, plus a final slot for `+Inf`.
     counts: Vec<AtomicU64>,
     count: AtomicU64,
     /// Sum of observed values, stored as `f64` bits.
@@ -77,18 +81,20 @@ impl Histogram {
     fn new(bounds: &'static [f64]) -> Self {
         Self {
             bounds,
-            counts: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
+            // One slot per bound, plus the +Inf overflow slot
+            counts: (0..bounds.len() + 1).map(|_| AtomicU64::new(0)).collect(),
             count: AtomicU64::new(0),
             sum_bits: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
     pub fn observe(&self, value: f64) {
-        for (i, bound) in self.bounds.iter().enumerate() {
-            if value <= *bound {
-                self.counts[i].fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        let slot = self
+            .bounds
+            .iter()
+            .position(|bound| value <= *bound)
+            .unwrap_or(self.bounds.len());
+        self.counts[slot].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
 
         // f64 has no atomic type; accumulate through a compare-exchange loop.
@@ -159,20 +165,24 @@ impl<M> Family<M> {
 
         let key: Vec<String> = labels.iter().map(|l| l.to_string()).collect();
 
-        if let Ok(children) = self.children.read() {
-            if let Some(child) = children.get(&key) {
-                return child.clone();
-            }
+        // A map of counters is still perfectly usable after a panic elsewhere, so
+        // recover through the poison rather than losing every metric for the rest
+        // of the process lifetime.
+        if let Some(child) = self
+            .children
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return child.clone();
         }
 
-        match self.children.write() {
-            Ok(mut children) => children
-                .entry(key)
-                .or_insert_with(|| Arc::new((self.factory)()))
-                .clone(),
-            // A poisoned lock must not take down a tile server; drop the sample.
-            Err(_) => Arc::new((self.factory)()),
-        }
+        self.children
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| Arc::new((self.factory)()))
+            .clone()
     }
 
     /// Child metric of a family declared without labels.
@@ -182,13 +192,13 @@ impl<M> Family<M> {
 
     /// Label sets sorted by label values, so exposition output is deterministic.
     fn sorted_children(&self) -> Vec<(Vec<String>, Arc<M>)> {
-        let mut entries: Vec<(Vec<String>, Arc<M>)> = match self.children.read() {
-            Ok(children) => children
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let mut entries: Vec<(Vec<String>, Arc<M>)> = self
+            .children
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
     }
@@ -267,9 +277,14 @@ impl Family<Histogram> {
         }
         self.write_header("histogram", out);
         for (labels, histogram) in children {
+            // Read the total first, then clamp every bucket to it. Observations
+            // landing mid-render would otherwise push a finite bucket above
+            // `+Inf`, which Prometheus reads as a corrupt histogram; clamping
+            // defers at most one observation to the next scrape instead.
+            let total = histogram.count();
             let mut cumulative = 0u64;
             for (i, bound) in histogram.bounds.iter().enumerate() {
-                cumulative = histogram.counts[i].load(Ordering::Relaxed).max(cumulative);
+                cumulative = (cumulative + histogram.counts[i].load(Ordering::Relaxed)).min(total);
                 out.push_str(&format!(
                     "{}_bucket{} {}\n",
                     self.name,
@@ -281,7 +296,7 @@ impl Family<Histogram> {
                 "{}_bucket{} {}\n",
                 self.name,
                 self.label_block(&labels, Some(("le", "+Inf".to_string()))),
-                histogram.count()
+                total
             ));
             out.push_str(&format!(
                 "{}_sum{} {}\n",
@@ -293,7 +308,7 @@ impl Family<Histogram> {
                 "{}_count{} {}\n",
                 self.name,
                 self.label_block(&labels, None),
-                histogram.count()
+                total
             ));
         }
     }
@@ -497,6 +512,25 @@ impl Metrics {
         }
     }
 
+    /// Materialize the series whose label sets are known up front, so they read 0
+    /// instead of being absent. A counter that first appears at 1 gives `rate()`
+    /// nothing to compare against, which would keep an alert written for a rare
+    /// failure silent on the very first occurrence it was meant to catch.
+    fn register_known_series(&self) {
+        self.sse_clients.get().set(0);
+        self.sse_connections.get().add(0);
+        self.listener_reconnects.get().add(0);
+        self.webhook_retries.get().add(0);
+        self.webhook_failures.get().add(0);
+
+        for result in ["routed", "unknown_layer", "invalid_payload"] {
+            self.notifications.with(&[result]).add(0);
+        }
+        for result in ["success", "http_error", "transport_error"] {
+            self.webhook_requests.with(&[result]).add(0);
+        }
+    }
+
     /// Seconds since the registry was created (process start, in practice).
     pub fn uptime_seconds(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
@@ -552,12 +586,31 @@ pub fn metrics() -> &'static Metrics {
     REGISTRY.get_or_init(|| {
         let m = Metrics::new();
         m.build_info.with(&[env!("CARGO_PKG_VERSION")]).set(1);
+        m.register_known_series();
         m
     })
 }
 
+/// Create the registry now rather than on the first recorded sample. Call this at
+/// startup: `uptime_seconds` counts from the registry's creation, so without it a
+/// `watch` process that sits idle for days would report an uptime of milliseconds
+/// on its first scrape.
+pub fn init() {
+    let _ = metrics();
+}
+
 /// Content type for the Prometheus text exposition format.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Join a configured host and port into a bindable address. A bare IPv6 host has
+/// to be bracketed, or `::1` + 9090 would parse as the address `::1:9090`.
+pub fn bind_addr(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
 
 /// Increments a gauge and decrements it again when dropped.
 pub struct GaugeGuard(Arc<Gauge>);
@@ -615,7 +668,7 @@ fn escape_help(value: &str) -> String {
 /// Run a metrics-only HTTP server. Used by commands that have no tile server of
 /// their own (`watch`, `run`) so long-lived processes stay observable.
 pub async fn start_metrics_server(host: &str, port: u16, path: &str) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+    let listener = tokio::net::TcpListener::bind(bind_addr(host, port)).await?;
     info!(
         "Metrics server listening on http://{}{}",
         listener.local_addr()?,
@@ -633,7 +686,7 @@ async fn serve_metrics(listener: tokio::net::TcpListener, path: &str) -> Result<
 }
 
 /// Axum handler for the metrics endpoint, shared by the tile server and the
-/// standalone exporter.
+/// dedicated metrics listener.
 pub async fn render_handler() -> impl axum::response::IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, CONTENT_TYPE)],
@@ -680,15 +733,66 @@ mod tests {
         let h = Histogram::new(FAST_BUCKETS);
         h.observe(0.002);
         h.observe(0.2);
-        h.observe(100.0); // above every bound, only lands in +Inf
+        h.observe(100.0); // above every bound, so it lands in the +Inf slot
 
         assert_eq!(h.count(), 3);
         assert!((h.sum() - 100.202).abs() < 1e-9);
 
-        // 0.005 bucket holds the 0.002 observation
-        assert_eq!(h.counts[1].load(Ordering::Relaxed), 1);
-        // 0.25 bucket holds 0.002 and 0.2
-        assert_eq!(h.counts[6].load(Ordering::Relaxed), 2);
+        // Each observation lands in exactly one slot; cumulative counts are
+        // summed at render time rather than stored.
+        assert_eq!(h.counts[1].load(Ordering::Relaxed), 1); // 0.002 -> le=0.005
+        assert_eq!(h.counts[6].load(Ordering::Relaxed), 1); // 0.2   -> le=0.25
+        assert_eq!(h.counts[FAST_BUCKETS.len()].load(Ordering::Relaxed), 1); // 100.0 -> +Inf
+    }
+
+    #[test]
+    fn test_histogram_observe_touches_one_slot() {
+        let h = Histogram::new(FAST_BUCKETS);
+        h.observe(0.002);
+        let touched = h
+            .counts
+            .iter()
+            .filter(|c| c.load(Ordering::Relaxed) > 0)
+            .count();
+        assert_eq!(touched, 1);
+    }
+
+    #[test]
+    fn test_bind_addr_brackets_ipv6() {
+        assert_eq!(bind_addr("127.0.0.1", 3000), "127.0.0.1:3000");
+        assert_eq!(bind_addr("0.0.0.0", 9090), "0.0.0.0:9090");
+        assert_eq!(bind_addr("::1", 9090), "[::1]:9090");
+        assert_eq!(bind_addr("::", 9090), "[::]:9090");
+        // Already bracketed hosts are left alone
+        assert_eq!(bind_addr("[::1]", 9090), "[::1]:9090");
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_host_binds() {
+        // `::1` + port must not be pasted together as `::1:9090`
+        let addr = bind_addr("::1", 0);
+        let listener = tokio::net::TcpListener::bind(&addr).await;
+        assert!(
+            listener.is_ok(),
+            "failed to bind {}: {:?}",
+            addr,
+            listener.err()
+        );
+    }
+
+    #[test]
+    fn test_known_series_are_registered_at_zero() {
+        // A counter that first appears at 1 gives rate() nothing to compare
+        // against, so the alerts documented for rare failures would stay silent.
+        let m = Metrics::new();
+        m.register_known_series();
+        let out = m.render();
+
+        assert!(out.contains("tilefeed_listener_reconnects_total 0"));
+        assert!(out.contains("tilefeed_webhook_failures_total 0"));
+        assert!(out.contains("tilefeed_webhook_retries_total 0"));
+        assert!(out.contains("tilefeed_notifications_total{result=\"unknown_layer\"} 0"));
+        assert!(out.contains("tilefeed_webhook_requests_total{result=\"transport_error\"} 0"));
     }
 
     #[test]

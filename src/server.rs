@@ -28,6 +28,13 @@ struct AppState {
     event_tx: Option<EventSender>,
 }
 
+/// Stand-in `source` label for requests naming a source that does not exist.
+///
+/// The requested name comes straight off the URL, so recording it verbatim would
+/// let any client mint permanent label sets in the registry — a scanner walking
+/// `/aaa/0/0/0.pbf`, `/aab/...` would grow it without bound.
+const UNKNOWN_SOURCE: &str = "__unknown__";
+
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
@@ -37,38 +44,59 @@ pub async fn start_server(
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     event_tx: Option<EventSender>,
 ) -> Result<()> {
-    let serve_config = &config.serve;
-    let host = serve_config.host.as_deref().unwrap_or("127.0.0.1");
-    let port = serve_config.port.unwrap_or(3000);
-
     let state = AppState {
         stores,
         config: config.clone(),
         event_tx,
     };
 
-    let cors = build_cors_layer(serve_config);
+    let app = build_router(&config, state)?;
 
-    let mut app = Router::new()
-        .route("/{source}/{z}/{x}/{y}.pbf", get(serve_tile))
-        .route("/{source}.json", get(serve_tilejson))
-        .route("/health", get(health_check))
-        .route("/events", get(sse_handler));
-
-    if config.metrics.enabled() {
-        let path = config.metrics.path();
-        info!("Prometheus metrics exposed at {}", path);
-        app = app.route(&path, get(crate::metrics::render_handler));
-    }
-
-    let app = app.layer(cors).with_state(state);
-
-    let addr = format!("{}:{}", host, port);
+    let addr = crate::metrics::bind_addr(config.serve.host(), config.serve.port());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Tile server listening on http://{}", addr);
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Assemble the tile server's routes. Shared with the tests so they exercise the
+/// same wiring the binary does, metrics mounting included.
+fn build_router(config: &AppConfig, state: AppState) -> Result<Router> {
+    let cors = build_cors_layer(&config.serve);
+
+    let app = Router::new()
+        .route("/{source}/{z}/{x}/{y}.pbf", get(serve_tile))
+        .route("/{source}.json", get(serve_tilejson))
+        .route("/health", get(health_check))
+        .route("/events", get(sse_handler))
+        .layer(cors);
+
+    Ok(mount_metrics(app, config)?.with_state(state))
+}
+
+/// Add the metrics route if this server is the one serving metrics.
+///
+/// Call it *after* the CORS layer: the tile API is deliberately readable from any
+/// origin, but a deployment's source names and traffic volumes should not be
+/// readable by any page the operator's browser happens to visit.
+fn mount_metrics(app: Router<AppState>, config: &AppConfig) -> Result<Router<AppState>> {
+    if !config.metrics_on_tile_server() {
+        return Ok(app);
+    }
+
+    let path = config.metrics.path();
+    if crate::config::RESERVED_SERVER_PATHS.contains(&path.as_str()) {
+        // Handing this path to axum would panic inside a spawned task, a long
+        // way from the config line that caused it.
+        anyhow::bail!(
+            "[metrics] path = \"{}\" collides with a built-in endpoint; choose another path",
+            path
+        );
+    }
+
+    info!("Prometheus metrics exposed at {}", path);
+    Ok(app.route(&path, get(crate::metrics::render_handler)))
 }
 
 fn build_cors_layer(config: &ServeConfig) -> CorsLayer {
@@ -98,7 +126,7 @@ async fn serve_tile(
     let store = match state.stores.get(&source) {
         Some(s) => s,
         None => {
-            m.tile_requests.with(&[&source, "source_not_found"]).inc();
+            m.tile_requests.with(&[UNKNOWN_SOURCE, "not_found"]).inc();
             return (StatusCode::NOT_FOUND, "Source not found").into_response();
         }
     };
@@ -181,7 +209,7 @@ async fn serve_tilejson(State(state): State<AppState>, Path(source): Path<String
         None => {
             metrics()
                 .tilejson_requests
-                .with(&[&source, "source_not_found"])
+                .with(&[UNKNOWN_SOURCE, "not_found"])
                 .inc();
             return (StatusCode::NOT_FOUND, "Source not found").into_response();
         }
@@ -433,20 +461,31 @@ mod tests {
         stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
         event_tx: Option<EventSender>,
     ) -> Router {
-        let state = AppState {
-            stores,
-            config: Arc::new(config),
-            event_tx,
-        };
-        let cors = build_cors_layer(&ServeConfig::default());
-        Router::new()
+        try_make_app_with_events(config, stores, event_tx).unwrap()
+    }
+
+    /// Mirrors `build_router`, but with test-only tile routes: axum cannot bind a
+    /// `{y}.pbf` suffix param through `oneshot`, so those two paths differ. The
+    /// metrics mounting goes through the same `mount_metrics` the binary uses.
+    fn try_make_app_with_events(
+        config: AppConfig,
+        stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
+        event_tx: Option<EventSender>,
+    ) -> Result<Router> {
+        let cors = build_cors_layer(&config.serve);
+        let app = Router::new()
             .route("/{source}/{z}/{x}/{y_pbf}", get(serve_tile_test))
             .route("/{source_json}", get(serve_tilejson_test))
             .route("/health", get(health_check))
             .route("/events", get(sse_handler))
-            .route("/metrics", get(crate::metrics::render_handler))
-            .layer(cors)
-            .with_state(state)
+            .layer(cors);
+
+        let app = mount_metrics(app, &config)?;
+        Ok(app.with_state(AppState {
+            stores,
+            config: Arc::new(config),
+            event_tx,
+        }))
     }
 
     /// Test-only handler that parses z/x/y.pbf from path segments
@@ -614,9 +653,186 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(body.contains(
-            "tilefeed_tile_requests_total{source=\"ghost_source\",result=\"source_not_found\"}"
-        ));
+        // The requested name must not become a label — it comes from the URL, so
+        // recording it would let any client grow the registry without bound.
+        assert!(body
+            .contains("tilefeed_tile_requests_total{source=\"__unknown__\",result=\"not_found\"}"));
+        assert!(!body.contains("ghost_source"));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_sources_share_one_label_set() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        for name in ["scan_a", "scan_b", "scan_c"] {
+            let response = send_request(
+                app.clone(),
+                Request::builder()
+                    .uri(format!("/{}/0/0/0.pbf", name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+            let response = send_request(
+                app.clone(),
+                Request::builder()
+                    .uri(format!("/{}.json", name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        for name in ["scan_a", "scan_b", "scan_c"] {
+            assert!(
+                !body.contains(name),
+                "'{}' leaked into a metric label",
+                name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metrics_route_not_mounted_when_disabled() {
+        let mut config = make_test_config();
+        config.metrics.enabled = Some(false);
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        // Falls through to the `/{source_json}` catch-all rather than serving metrics
+        assert_ne!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::metrics::CONTENT_TYPE)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_served_on_custom_path() {
+        let mut config = make_test_config();
+        config.metrics.path = Some("internal/metrics".to_string());
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/internal/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::metrics::CONTENT_TYPE)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_not_mounted_when_a_separate_listener_serves_them() {
+        // Setting a distinct [metrics] port is documented as the way to keep the
+        // scrape endpoint off the tile port, so the tile server must not mount it.
+        let mut config = make_test_config();
+        config.serve.port = Some(3000);
+        config.metrics.port = Some(9090);
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_ne!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::metrics::CONTENT_TYPE)
+        );
+    }
+
+    #[test]
+    fn test_metrics_path_colliding_with_builtin_is_rejected() {
+        let mut config = make_test_config();
+        config.metrics.path = Some("/health".to_string());
+
+        let err = try_make_app_with_events(config, HashMap::new(), None)
+            .expect_err("a colliding metrics path must be reported, not panic inside axum");
+        assert!(err.to_string().contains("collides"));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_route_is_not_cors_exposed() {
+        let config = make_test_config();
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app.clone(),
+            Request::builder()
+                .uri("/metrics")
+                .header("Origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "metrics must not be readable cross-origin"
+        );
+
+        // ...while tiles still are
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .header("Origin", "https://example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_some());
     }
 
     #[test]

@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Prometheus metrics**: `GET /metrics` on the tile server, exposing counters, gauges, and histograms for tile serving, full generation, incremental updates, webhook delivery, and artifact publishing
-- **Standalone metrics exporter**: `[metrics] port` starts a metrics-only HTTP listener, making `watch` and `run` scrapeable — they have no tile server of their own
+- **Dedicated metrics listener**: `[metrics] port` serves metrics on their own listener instead of the tile port, and makes `watch` and `run` scrapeable — they have no tile server of their own
 - `[metrics]` config section (`enabled`, `path`, `host`, `port`); metrics are on by default at `/metrics`
 - Metrics documentation with a full metric reference, PromQL examples, and alerting starters (`docs/metrics.md`)
 

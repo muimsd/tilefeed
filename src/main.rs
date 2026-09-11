@@ -79,6 +79,9 @@ async fn main() -> Result<()> {
 
     let _ = dotenvy::dotenv();
 
+    // Before anything else: uptime is measured from here.
+    metrics::init();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -217,28 +220,20 @@ fn open_stores(
     Ok(stores)
 }
 
-/// Start the standalone metrics exporter when `[metrics] port` is set.
-/// `serve` exposes metrics on the tile server itself, so it only needs this
-/// when the configured metrics port differs from the tile server's.
+/// Start the dedicated metrics listener configured by `[metrics] port`.
+///
+/// `skip_if_serve_addr` is set by commands that run a tile server: that server
+/// serves the metrics path itself when the two addresses coincide, so starting a
+/// second listener on the same socket would just fail to bind.
 fn spawn_metrics_exporter(
     config: &config::AppConfig,
-    skip_port: Option<u16>,
+    skip_if_serve_addr: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !config.metrics.enabled() {
+    if skip_if_serve_addr && config.metrics_addr_is_serve_addr() {
         return None;
     }
 
-    let port = config.metrics.port?;
-    if Some(port) == skip_port {
-        return None;
-    }
-
-    let host = config
-        .metrics
-        .host
-        .clone()
-        .or_else(|| config.serve.host.clone())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let (host, port) = config.metrics_addr()?;
     let path = config.metrics.path();
 
     Some(tokio::spawn(async move {
@@ -262,7 +257,7 @@ async fn watch_updates(
         stores.len()
     );
 
-    let metrics_task = spawn_metrics_exporter(&config, None);
+    let metrics_task = spawn_metrics_exporter(&config, false);
 
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
@@ -298,7 +293,7 @@ async fn serve_and_watch(
 
     info!("Starting server and watcher for {} source(s)", stores.len());
 
-    let metrics_task = spawn_metrics_exporter(&config, Some(config.serve.port.unwrap_or(3000)));
+    let metrics_task = spawn_metrics_exporter(&config, true);
 
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
