@@ -79,6 +79,8 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **Tippecanoe creates views, not tables**: The MBTiles `open()` method detects and materializes the `tiles` view into a real table so incremental writes work.
 - **Layer→source routing**: `AppConfig::find_source_for_layer()` maps a notification's layer name to the owning source. Each source maintains its own MBTiles store.
 - **Auto-reconnect**: The LISTEN/NOTIFY listener reconnects with exponential backoff if the PostgreSQL connection drops.
+- **One route parameter per path segment**: axum rejects patterns like `/{y}.pbf` or `/{source}.json` at startup (a panic, inside the spawned server task). File extensions are captured as part of the parameter and parsed in the handler.
+- **Server tests build the production router**: `build_router()` is what both `start_server` and the tests use. Tests must never declare their own route patterns — a test harness that did exactly that hid a startup panic through two releases.
 
 ### Config (`config.toml`)
 
