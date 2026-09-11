@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.1] - 2026-09-11
+
+This is the first published build of the 0.8 line: 0.8.0 was prepared but never
+tagged, so everything under it below ships here too. Anyone on 0.7.x should
+upgrade — the HTTP tile server could not start at all in those releases.
 
 ### Added
 
@@ -19,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A dropped PostgreSQL connection killed the process.** Only the *initial* connect retried; a connection lost mid-run closed the notification channel, which the listener reported as a clean exit — ending `serve` and taking the HTTP tile server down with it. Both cases now reconnect with backoff.
 - `tilefeed validate` no longer reports success when Tippecanoe or GDAL is missing.
 
-## [0.8.0] - 2026-09-11
+## [0.8.0] - unreleased
+
+Prepared but never tagged; released as part of 0.8.1.
 
 ### Added
 
@@ -61,6 +67,6 @@ Initial release.
 - CI with tests on all platforms, clippy, formatting checks, and release builds
 - Local-parks example with end-to-end walkthrough
 
-[0.8.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.8.0
+[0.8.1]: https://github.com/muimsd/tilefeed/releases/tag/v0.8.1
 [0.7.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.7.0
 [0.1.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.1.0
