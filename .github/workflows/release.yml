@@ -175,92 +175,14 @@ jobs:
       - name: Get version
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-      - name: Download release assets and compute checksums
-        run: |
-          VERSION=${{ steps.version.outputs.version }}
-          BASE_URL="https://github.com/muimsd/tilefeed/releases/download/v${VERSION}"
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
-            curl -sL "${BASE_URL}/tilefeed-${target}.tar.gz" -o "tilefeed-${target}.tar.gz"
-            sha256sum "tilefeed-${target}.tar.gz" >> checksums.txt
-          done
-          curl -sL "${BASE_URL}/tilefeed-x86_64-pc-windows-msvc.zip" -o tilefeed-windows.zip
-          sha256sum tilefeed-windows.zip >> checksums.txt
-          cat checksums.txt
-      - name: Update Homebrew formula
-        run: |
-          VERSION=${{ steps.version.outputs.version }}
-          SHA_ARM=$(grep aarch64-apple-darwin checksums.txt | awk '{print $1}')
-          SHA_INTEL=$(grep x86_64-apple-darwin checksums.txt | awk '{print $1}')
-          SHA_LINUX=$(grep x86_64-unknown-linux-gnu checksums.txt | awk '{print $1}')
-          cat > Formula/tilefeed.rb <<EOF
-          class Tilefeed < Formula
-            desc "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
-            homepage "https://github.com/muimsd/tilefeed"
-            version "${VERSION}"
-            license "MIT"
-
-            on_macos do
-              on_arm do
-                url "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-aarch64-apple-darwin.tar.gz"
-                sha256 "${SHA_ARM}"
-              end
-              on_intel do
-                url "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-x86_64-apple-darwin.tar.gz"
-                sha256 "${SHA_INTEL}"
-              end
-            end
-
-            on_linux do
-              url "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
-              sha256 "${SHA_LINUX}"
-            end
-
-            def install
-              bin.install "tilefeed"
-            end
-
-            test do
-              assert_match "tilefeed", shell_output("\#{bin}/tilefeed --help")
-            end
-          end
-          EOF
-          sed -i 's/^          //' Formula/tilefeed.rb
-      - name: Update Scoop manifest
-        run: |
-          VERSION=${{ steps.version.outputs.version }}
-          SHA_WIN=$(grep windows checksums.txt | awk '{print $1}')
-          cat > bucket/tilefeed.json <<EOF
-          {
-              "version": "${VERSION}",
-              "description": "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY",
-              "homepage": "https://github.com/muimsd/tilefeed",
-              "license": "MIT",
-              "architecture": {
-                  "64bit": {
-                      "url": "https://github.com/muimsd/tilefeed/releases/download/v${VERSION}/tilefeed-x86_64-pc-windows-msvc.zip",
-                      "hash": "${SHA_WIN}"
-                  }
-              },
-              "bin": "tilefeed.exe",
-              "checkver": {
-                  "github": "https://github.com/muimsd/tilefeed"
-              },
-              "autoupdate": {
-                  "architecture": {
-                      "64bit": {
-                          "url": "https://github.com/muimsd/tilefeed/releases/download/v\$version/tilefeed-x86_64-pc-windows-msvc.zip"
-                      }
-                  }
-              }
-          }
-          EOF
-          sed -i 's/^          //' bucket/tilefeed.json
+      - name: Update all package manifests
+        run: scripts/update-manifests.sh "${{ steps.version.outputs.version }}"
       - name: Commit and push manifest updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/tilefeed.rb bucket/tilefeed.json
-          git commit -m "Update package manifests for v${{ steps.version.outputs.version }}"
+          git add Formula/tilefeed.rb bucket/tilefeed.json packaging/
+          git diff --cached --quiet || git commit -m "Update package manifests for v${{ steps.version.outputs.version }}"
           git push
       - name: Update Homebrew tap
         run: |

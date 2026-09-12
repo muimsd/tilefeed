@@ -1,6 +1,6 @@
 # Maintainer: muimsd
 pkgname=tilefeed
-pkgver=0.1.0
+pkgver=0.8.1
 pkgrel=1
 pkgdesc="PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
 arch=('x86_64')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('gcc-libs')
 makedepends=('cargo' 'protobuf')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/muimsd/tilefeed/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('7562010c4343e95133f099bb46746116bb3ad89c4b2796578e67aac71c8b934f')
 
 prepare() {
     cd "$pkgname-$pkgver"

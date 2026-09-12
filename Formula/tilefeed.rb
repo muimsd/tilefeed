@@ -25,6 +25,6 @@ class Tilefeed < Formula
   end
 
   test do
-    assert_match "tilefeed", shell_output("\#{bin}/tilefeed --help")
+    assert_match "tilefeed", shell_output("#{bin}/tilefeed --help")
   end
 end
