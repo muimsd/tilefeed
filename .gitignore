@@ -1,4 +1,9 @@
 /target
 *.mbtiles
+# SQLite writes these next to a database in WAL mode
+*.mbtiles-wal
+*.mbtiles-shm
+*.pmtiles
+*.pmtiles.tiles-staging
 .env
 .DS_Store
