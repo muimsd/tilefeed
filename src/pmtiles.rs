@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use tracing::info;
 
 use crate::mbtiles::MbtilesStore;
@@ -154,7 +154,16 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
 }
 
 /// Serialize directory entries: a count, then one varint column per field.
+///
+/// Entries must be sorted by ascending `tile_id`: the IDs are delta-encoded, so
+/// an unsorted slice underflows into a directory that still parses and resolves
+/// nothing.
 pub fn serialize_directory(entries: &[Entry]) -> Vec<u8> {
+    debug_assert!(
+        entries.windows(2).all(|w| w[0].tile_id <= w[1].tile_id),
+        "directory entries must be sorted by ascending tile_id"
+    );
+
     let mut out = Vec::with_capacity(entries.len() * 4);
     write_varint(&mut out, entries.len() as u64);
 
@@ -376,8 +385,8 @@ fn build_directories(entries: &[Entry]) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         return Ok((root, Vec::new(), 0));
     }
 
-    // Halve the leaf size until the root fits. Each leaf holds a slice of the
-    // entries; the root then holds one run_length=0 pointer per leaf.
+    // Grow the leaf size until the root fits: bigger leaves mean fewer of them,
+    // and the root holds one run_length=0 pointer per leaf.
     let mut leaf_size = 4096;
     loop {
         let mut root_entries = Vec::new();
@@ -423,69 +432,268 @@ pub struct ExportStats {
     pub bytes_written: u64,
     pub min_zoom: u8,
     pub max_zoom: u8,
+    /// Tiles re-read from the finished archive and compared against the source
+    pub tiles_verified: usize,
+}
+
+/// Reads an archive through any seekable source — a file, or a `Cursor` in tests.
+///
+/// Every read is bounds-checked by the reader itself, so a truncated or
+/// malformed archive produces an error rather than a panic, and nothing loads
+/// the whole archive into memory.
+pub struct ArchiveReader<R: Read + Seek> {
+    inner: R,
+    header: Header,
+    len: u64,
+}
+
+impl<R: Read + Seek> ArchiveReader<R> {
+    pub fn open(mut inner: R) -> Result<Self> {
+        let len = inner.seek(SeekFrom::End(0))?;
+        inner.seek(SeekFrom::Start(0))?;
+
+        let mut buf = [0u8; HEADER_LEN];
+        inner
+            .read_exact(&mut buf)
+            .context("archive is shorter than a PMTiles header")?;
+        let header = Header::from_bytes(&buf)?;
+
+        Ok(Self { inner, header, len })
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn read_at(&mut self, offset: u64, length: usize) -> Result<Vec<u8>> {
+        // Offsets come from the file being read, so they can be anything at all
+        let end = offset
+            .checked_add(length as u64)
+            .context("archive section offset overflows")?;
+        if end > self.len {
+            bail!(
+                "archive is {} bytes but a section at {}+{} was requested",
+                self.len,
+                offset,
+                length
+            );
+        }
+        self.inner.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; length];
+        self.inner.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn directory(&mut self, offset: u64, length: u64) -> Result<Vec<Entry>> {
+        let raw = self.read_at(offset, length as usize)?;
+        deserialize_directory(&ungzip(&raw)?)
+    }
+
+    fn root(&mut self) -> Result<Vec<Entry>> {
+        self.directory(self.header.root_offset, self.header.root_length)
+    }
+
+    /// Read one tile, following a leaf directory when the root points at one.
+    pub fn get_tile(&mut self, z: u8, x: u32, y: u32) -> Result<Option<Vec<u8>>> {
+        let wanted = tile_id(z, x, y);
+        let mut entries = self.root()?;
+
+        // At most one level of leaves, as the spec recommends
+        for _ in 0..2 {
+            let entry = match entries.iter().rev().find(|e| e.tile_id <= wanted).cloned() {
+                Some(entry) => entry,
+                None => return Ok(None),
+            };
+
+            if entry.run_length == 0 {
+                let offset = self
+                    .header
+                    .leaf_offset
+                    .checked_add(entry.offset)
+                    .context("leaf directory offset overflows")?;
+                entries = self.directory(offset, entry.length as u64)?;
+                continue;
+            }
+
+            if wanted >= entry.tile_id.saturating_add(entry.run_length as u64) {
+                return Ok(None);
+            }
+            let offset = self
+                .header
+                .data_offset
+                .checked_add(entry.offset)
+                .context("tile offset overflows")?;
+            return Ok(Some(self.read_at(offset, entry.length as usize)?));
+        }
+
+        Ok(None)
+    }
+
+    /// Check the archive describes itself consistently: sections are inside the
+    /// file, directories parse, and every entry points inside the tile data.
+    ///
+    /// This is a structural check only. It cannot tell whether tiles ended up at
+    /// the right coordinates, which is why [`export_mbtiles`] also compares
+    /// sampled tiles against the source.
+    pub fn verify(&mut self) -> Result<()> {
+        let declared_end = self
+            .header
+            .data_offset
+            .checked_add(self.header.data_length)
+            .context("header describes a tile data section that overflows")?;
+        if declared_end > self.len {
+            bail!(
+                "archive is {} bytes but the header describes {}",
+                self.len,
+                declared_end
+            );
+        }
+
+        let data_length = self.header.data_length;
+        let leaf_offset = self.header.leaf_offset;
+
+        fn check(entry: &Entry, data_length: u64) -> Result<()> {
+            let end = entry
+                .offset
+                .checked_add(entry.length as u64)
+                .context("directory entry offset overflows")?;
+            if end > data_length {
+                bail!(
+                    "tile {} points outside the tile data section",
+                    entry.tile_id
+                );
+            }
+            Ok(())
+        }
+
+        let root = self.root()?;
+        let mut tile_entries = 0u64;
+        for entry in &root {
+            if entry.run_length == 0 {
+                let offset = leaf_offset
+                    .checked_add(entry.offset)
+                    .context("leaf directory offset overflows")?;
+                let leaf = self.directory(offset, entry.length as u64)?;
+                for leaf_entry in &leaf {
+                    check(leaf_entry, data_length)?;
+                }
+                tile_entries += leaf.len() as u64;
+            } else {
+                check(entry, data_length)?;
+                tile_entries += 1;
+            }
+        }
+
+        if tile_entries != self.header.tile_entries {
+            bail!(
+                "header says {} tile entries, directories hold {}",
+                self.header.tile_entries,
+                tile_entries
+            );
+        }
+        Ok(())
+    }
+}
+
+fn ungzip(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    let mut out = Vec::new();
+    GzDecoder::new(data).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Reject an output path that is the input, or that already exists as the input
+/// under another spelling. Export reads every tile before it writes, so writing
+/// over the source destroys it and leaves an archive that verifies against
+/// itself perfectly.
+fn check_paths(input: &str, output: &str) -> Result<()> {
+    let input_path = std::path::Path::new(input);
+    let output_path = std::path::Path::new(output);
+
+    if input_path == output_path {
+        bail!("input and output are the same file: {}", input);
+    }
+
+    // Catches ./a.mbtiles vs a.mbtiles, symlinks, and case-insensitive filesystems
+    if let (Ok(a), Ok(b)) = (input_path.canonicalize(), output_path.canonicalize()) {
+        if a == b {
+            bail!("output {} is the same file as the input {}", output, input);
+        }
+    }
+    Ok(())
 }
 
 /// Convert an MBTiles file into a PMTiles archive.
+///
+/// Tile blobs are staged in a temporary file next to the output, because the
+/// directories that precede them can only be written once every offset is known.
+/// Memory stays proportional to the number of tiles, not to their size.
 pub fn export_mbtiles(input: &str, output: &str) -> Result<ExportStats> {
-    let store = MbtilesStore::open(input)?;
+    check_paths(input, output)?;
+
+    let store = MbtilesStore::open_read_only(input)?;
     let metadata: HashMap<String, String> = store.get_all_metadata()?.into_iter().collect();
 
-    let raw_coords = store.all_tile_coords()?;
-    if raw_coords.is_empty() {
+    let staging_path = format!("{}.tiles-staging", output);
+    let staging = std::fs::File::create(&staging_path)
+        .with_context(|| format!("Failed to create staging file {}", staging_path))?;
+    // Whatever happens next, don't leave the staging file behind
+    let _cleanup = StagingFile(staging_path.clone());
+    let mut staging = BufWriter::new(staging);
+
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut seen: HashMap<[u8; 32], (u64, u32)> = HashMap::new();
+    let mut addressed_tiles: u64 = 0;
+    let mut data_len: u64 = 0;
+    let mut min_zoom = u8::MAX;
+    let mut max_zoom = 0u8;
+    // Coordinates only. Tiles have to be written in Hilbert order, which means
+    // reordering them, and holding every tile's bytes to do that would put the
+    // whole archive in memory. 16 bytes per tile instead.
+    let mut ordered: Vec<(u64, u8, u32, u32)> = Vec::new();
+    store.for_each_tile_coord(|z, x, tms_y| {
+        let y = flip_y(z, x, tms_y)?;
+        min_zoom = min_zoom.min(z);
+        max_zoom = max_zoom.max(z);
+        ordered.push((tile_id(z, x, y), z, x, tms_y));
+        Ok(())
+    })?;
+
+    if ordered.is_empty() {
         bail!("{} contains no tiles", input);
     }
 
-    // MBTiles rows are TMS, PMTiles tile IDs are XYZ. Flipping y here and
-    // reading through `get_tile_raw_tms` keeps exactly one conversion in play.
-    let mut coords: Vec<(u64, u8, u32, u32)> = raw_coords
-        .into_iter()
-        .map(|(z, x, tms_y)| {
-            let y = (1u32 << z) - 1 - tms_y;
-            (tile_id(z, x, y), z, x, tms_y)
-        })
-        .collect();
+    // Hilbert order: what makes the archive clustered, and what lets a client
+    // panning the map reuse ranges it has already fetched.
+    ordered.sort_by_key(|(id, _, _, _)| *id);
 
-    // Hilbert order: what makes the archive clustered, and what lets nearby
-    // tiles share a range request.
-    coords.sort_by_key(|(id, _, _, _)| *id);
-
-    let min_zoom = coords.iter().map(|(_, z, _, _)| *z).min().unwrap_or(0);
-    let max_zoom = coords.iter().map(|(_, z, _, _)| *z).max().unwrap_or(0);
-
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut tile_data: Vec<u8> = Vec::new();
-    // Content hash -> (offset, length), so a repeated tile is stored once
-    let mut seen: HashMap<[u8; 32], (u64, u32)> = HashMap::new();
-    let mut addressed_tiles: u64 = 0;
-    let mut tile_compression: Option<Compressed> = None;
-
-    for (id, z, x, tms_y) in &coords {
+    for (id, z, x, tms_y) in &ordered {
         let data = match store.get_tile_raw_tms(*z, *x, *tms_y)? {
             Some(data) => data,
-            None => continue, // deleted between listing and reading
+            None => continue, // removed since the coordinates were listed
         };
-
-        if tile_compression.is_none() {
-            tile_compression = Some(if crate::mvt::is_gzipped(&data) {
-                Compressed::Gzip
-            } else {
-                Compressed::None
-            });
-        }
-
-        let id = *id;
         addressed_tiles += 1;
+
+        // Archives are uniformly gzipped. A tilefeed MBTiles can hold both raw
+        // and gzipped tiles — Tippecanoe with `no_tile_compression` writes raw,
+        // while incremental updates always gzip — and a single header field has
+        // to describe all of them.
+        let blob = if crate::mvt::is_gzipped(&data) {
+            data
+        } else {
+            gzip(&data)?
+        };
 
         let hash: [u8; 32] = {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
-            hasher.update(&data);
+            hasher.update(&blob);
             hasher.finalize().into()
         };
 
-        // A run: the tile right before this one, with identical content
+        // A run: the tile immediately before this one, with the same content
         if let Some(last) = entries.last_mut() {
-            if last.tile_id + last.run_length as u64 == id
+            if last.tile_id + last.run_length as u64 == *id
                 && seen.get(&hash) == Some(&(last.offset, last.length))
             {
                 last.run_length += 1;
@@ -494,21 +702,20 @@ pub fn export_mbtiles(input: &str, output: &str) -> Result<ExportStats> {
         }
 
         match seen.get(&hash) {
-            Some(&(offset, length)) => {
-                entries.push(Entry {
-                    tile_id: id,
-                    offset,
-                    length,
-                    run_length: 1,
-                });
-            }
+            Some(&(offset, length)) => entries.push(Entry {
+                tile_id: *id,
+                offset,
+                length,
+                run_length: 1,
+            }),
             None => {
-                let offset = tile_data.len() as u64;
-                let length = data.len() as u32;
-                tile_data.extend_from_slice(&data);
+                let offset = data_len;
+                let length = blob.len() as u32;
+                staging.write_all(&blob)?;
+                data_len += length as u64;
                 seen.insert(hash, (offset, length));
                 entries.push(Entry {
-                    tile_id: id,
+                    tile_id: *id,
                     offset,
                     length,
                     run_length: 1,
@@ -516,20 +723,19 @@ pub fn export_mbtiles(input: &str, output: &str) -> Result<ExportStats> {
             }
         }
     }
-
-    if entries.is_empty() {
-        bail!("{} contains no readable tiles", input);
-    }
+    drop(ordered);
+    staging.flush()?;
+    drop(staging);
 
     let (root, leaves, leaf_count) = build_directories(&entries)?;
-    let metadata_json = build_metadata(&metadata)?;
-    let metadata_bytes = gzip(metadata_json.as_bytes())?;
+    let metadata_bytes = gzip(build_metadata(&metadata)?.as_bytes())?;
 
     let root_offset = HEADER_LEN as u64;
     let metadata_offset = root_offset + root.len() as u64;
     let leaf_offset = metadata_offset + metadata_bytes.len() as u64;
     let data_offset = leaf_offset + leaves.len() as u64;
 
+    let bounds = parse_bounds(metadata.get("bounds"));
     let header = Header {
         root_offset,
         root_length: root.len() as u64,
@@ -538,42 +744,130 @@ pub fn export_mbtiles(input: &str, output: &str) -> Result<ExportStats> {
         leaf_offset,
         leaf_length: leaves.len() as u64,
         data_offset,
-        data_length: tile_data.len() as u64,
+        data_length: data_len,
         addressed_tiles,
         tile_entries: entries.len() as u64,
         tile_contents: seen.len() as u64,
         clustered: true,
         internal_compression: Compressed::Gzip,
-        tile_compression: tile_compression.unwrap_or(Compressed::None),
+        tile_compression: Compressed::Gzip,
         tile_type: TileType::Mvt,
         min_zoom,
         max_zoom,
-        bounds: parse_bounds(metadata.get("bounds")),
+        bounds,
         center_zoom: parse_center_zoom(metadata.get("center")).unwrap_or(min_zoom),
-        center: parse_center(metadata.get("center")),
+        // Null Island is a worse default than the middle of the data
+        center: parse_center(metadata.get("center"))
+            .unwrap_or(((bounds.0 + bounds.2) / 2.0, (bounds.1 + bounds.3) / 2.0)),
     };
 
-    let mut file = Vec::with_capacity(
-        HEADER_LEN + root.len() + metadata_bytes.len() + leaves.len() + tile_data.len(),
-    );
-    file.extend_from_slice(&header.to_bytes());
-    file.extend_from_slice(&root);
-    file.extend_from_slice(&metadata_bytes);
-    file.extend_from_slice(&leaves);
-    file.extend_from_slice(&tile_data);
+    {
+        let out = std::fs::File::create(output)
+            .with_context(|| format!("Failed to create {}", output))?;
+        let mut out = BufWriter::new(out);
+        out.write_all(&header.to_bytes())?;
+        out.write_all(&root)?;
+        out.write_all(&metadata_bytes)?;
+        out.write_all(&leaves)?;
 
-    std::fs::write(output, &file)
-        .with_context(|| format!("Failed to write PMTiles archive to {}", output))?;
+        let mut staged = std::fs::File::open(&staging_path)?;
+        std::io::copy(&mut staged, &mut out)?;
+        out.flush()?;
+    }
+
+    let bytes_written = data_offset + data_len;
+    let tiles_verified = verify_against_source(output, &store, &sample_tile_ids(&entries))?;
 
     Ok(ExportStats {
         addressed_tiles,
         tile_entries: entries.len() as u64,
         tile_contents: seen.len() as u64,
         leaf_directories: leaf_count,
-        bytes_written: file.len() as u64,
+        bytes_written,
         min_zoom,
         max_zoom,
+        tiles_verified,
     })
+}
+
+/// Removes the staging file on the way out, however we leave.
+struct StagingFile(String);
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// MBTiles rows are TMS, PMTiles tile IDs are XYZ. A row outside the zoom's
+/// range would wrap into a nonsense coordinate, so reject it by name.
+fn flip_y(z: u8, x: u32, tms_y: u32) -> Result<u32> {
+    if z > 30 {
+        bail!("zoom {} is out of range (0-30)", z);
+    }
+    let side = 1u32 << z;
+    if x >= side || tms_y >= side {
+        bail!(
+            "tile {}/{}/{} is outside the {}x{} grid of zoom {}",
+            z,
+            x,
+            tms_y,
+            side,
+            side,
+            z
+        );
+    }
+    Ok(side - 1 - tms_y)
+}
+
+/// Spread a sample across the archive rather than taking the first N, so a
+/// coordinate-mapping error anywhere shows up.
+fn sample_tile_ids(entries: &[Entry]) -> Vec<u64> {
+    const SAMPLE: usize = 64;
+    if entries.len() <= SAMPLE {
+        return entries.iter().map(|e| e.tile_id).collect();
+    }
+    let step = entries.len() / SAMPLE;
+    (0..SAMPLE).map(|i| entries[i * step].tile_id).collect()
+}
+
+/// Re-read sampled tiles from the finished archive and compare them with the
+/// source. A structural check cannot catch a tile written at the wrong
+/// coordinate — the archive would be perfectly self-consistent and wrong.
+fn verify_against_source(output: &str, store: &MbtilesStore, sample: &[u64]) -> Result<usize> {
+    let file = std::fs::File::open(output)?;
+    let mut reader = ArchiveReader::open(file)?;
+    reader.verify()?;
+
+    let mut verified = 0;
+    for id in sample {
+        let (z, x, y) = tile_id_to_zxy(*id)?;
+        let tms_y = (1u32 << z) - 1 - y;
+
+        let expected = store
+            .get_tile_raw_tms(z, x, tms_y)?
+            .with_context(|| format!("tile {}/{}/{} vanished from the source", z, x, y))?;
+        let expected = if crate::mvt::is_gzipped(&expected) {
+            expected
+        } else {
+            gzip(&expected)?
+        };
+
+        let actual = reader
+            .get_tile(z, x, y)?
+            .with_context(|| format!("tile {}/{}/{} is missing from the archive", z, x, y))?;
+
+        if actual != expected {
+            bail!(
+                "tile {}/{}/{} does not match the source: the archive is mis-addressed",
+                z,
+                x,
+                y
+            );
+        }
+        verified += 1;
+    }
+    Ok(verified)
 }
 
 /// PMTiles metadata is a JSON object. MBTiles keeps most of it as flat strings
@@ -614,15 +908,17 @@ fn parse_bounds(raw: Option<&String>) -> (f64, f64, f64, f64) {
     parsed.unwrap_or((-180.0, -MAX_LAT, 180.0, MAX_LAT))
 }
 
-fn parse_center(raw: Option<&String>) -> (f64, f64) {
-    let parsed = raw.and_then(|s| {
-        let parts: Vec<f64> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
-        match parts[..] {
-            [lon, lat] | [lon, lat, _] => Some((lon, lat)),
-            _ => None,
-        }
-    });
-    parsed.unwrap_or((0.0, 0.0))
+/// `None` when the MBTiles has no usable `center`, so the caller can fall back
+/// to the middle of the bounds rather than to Null Island.
+fn parse_center(raw: Option<&String>) -> Option<(f64, f64)> {
+    let parts: Vec<f64> = raw?
+        .split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
+    match parts[..] {
+        [lon, lat] | [lon, lat, _] => Some((lon, lat)),
+        _ => None,
+    }
 }
 
 fn parse_center_zoom(raw: Option<&String>) -> Option<u8> {
@@ -630,139 +926,31 @@ fn parse_center_zoom(raw: Option<&String>) -> Option<u8> {
     parts.get(2)?.trim().parse::<f64>().ok().map(|z| z as u8)
 }
 
-/// Read an archive back and check it describes itself consistently: the header
-/// parses, the directories parse, and every entry points inside the tile data.
-///
-/// Used by `export` to refuse to leave a corrupt archive behind, and by tests.
-pub fn verify_archive(bytes: &[u8]) -> Result<Header> {
-    let header = Header::from_bytes(bytes)?;
-
-    // Every section the header declares has to be inside the file. Checking the
-    // entries against `data_length` alone would pass on a truncated archive,
-    // since that length is itself just a claim in the header.
-    let declared_end = header.data_offset + header.data_length;
-    if declared_end > bytes.len() as u64 {
-        bail!(
-            "archive is {} bytes but the header describes {}",
-            bytes.len(),
-            declared_end
-        );
-    }
-
-    let root_end = (header.root_offset + header.root_length) as usize;
-    if root_end > bytes.len() {
-        bail!("root directory extends past the end of the archive");
-    }
-    let root = ungzip(&bytes[header.root_offset as usize..root_end])?;
-    let root_entries = deserialize_directory(&root)?;
-
-    let mut tile_entries = Vec::new();
-    for entry in &root_entries {
-        if entry.run_length == 0 {
-            let start = (header.leaf_offset + entry.offset) as usize;
-            let end = start + entry.length as usize;
-            if end > bytes.len() {
-                bail!("leaf directory extends past the end of the archive");
-            }
-            let leaf = ungzip(&bytes[start..end])?;
-            tile_entries.extend(deserialize_directory(&leaf)?);
-        } else {
-            tile_entries.push(entry.clone());
-        }
-    }
-
-    for entry in &tile_entries {
-        if entry.offset + entry.length as u64 > header.data_length {
-            bail!(
-                "tile {} points outside the tile data section",
-                entry.tile_id
-            );
-        }
-    }
-
-    if tile_entries.len() as u64 != header.tile_entries {
-        bail!(
-            "header says {} tile entries, directories hold {}",
-            header.tile_entries,
-            tile_entries.len()
-        );
-    }
-
-    Ok(header)
-}
-
-fn ungzip(data: &[u8]) -> Result<Vec<u8>> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    let mut out = Vec::new();
-    GzDecoder::new(data).read_to_end(&mut out)?;
-    Ok(out)
-}
-
-/// Read one tile out of an archive, resolving leaf directories.
-/// Used by the tests to prove tiles survive the round trip.
-pub fn read_tile(bytes: &[u8], z: u8, x: u32, y: u32) -> Result<Option<Vec<u8>>> {
-    let header = Header::from_bytes(bytes)?;
-    let wanted = tile_id(z, x, y);
-
-    let root_end = (header.root_offset + header.root_length) as usize;
-    let root = ungzip(&bytes[header.root_offset as usize..root_end])?;
-    let mut entries = deserialize_directory(&root)?;
-
-    // At most one level of leaf directories, as the spec recommends
-    for _ in 0..2 {
-        let found = entries.iter().rev().find(|e| e.tile_id <= wanted).cloned();
-
-        let entry = match found {
-            Some(entry) => entry,
-            None => return Ok(None),
-        };
-
-        if entry.run_length == 0 {
-            let start = (header.leaf_offset + entry.offset) as usize;
-            let end = start + entry.length as usize;
-            entries = deserialize_directory(&ungzip(&bytes[start..end])?)?;
-            continue;
-        }
-
-        if wanted >= entry.tile_id + entry.run_length as u64 {
-            return Ok(None);
-        }
-
-        let start = (header.data_offset + entry.offset) as usize;
-        let end = start + entry.length as usize;
-        return Ok(Some(bytes[start..end].to_vec()));
-    }
-
-    Ok(None)
-}
-
 /// CLI entry point for `tilefeed export`.
 pub fn export(input: &str, output: &str) -> Result<()> {
     let stats = export_mbtiles(input, output)?;
 
-    // Read it back before declaring success: a silently malformed archive would
-    // only show up in a browser, somewhere else, later.
-    let written = std::fs::read(output)?;
-    verify_archive(&written).with_context(|| format!("{} failed verification", output))?;
-
     info!("Wrote {} ({} bytes)", output, stats.bytes_written);
     println!("PMTiles archive: {}", output);
     println!();
-    println!("  Zoom levels:      {}-{}", stats.min_zoom, stats.max_zoom);
-    println!("  Tiles:            {}", stats.addressed_tiles);
+    println!("  Zoom levels:       {}-{}", stats.min_zoom, stats.max_zoom);
+    println!("  Tiles:             {}", stats.addressed_tiles);
     println!(
         "  Directory entries: {} ({} saved by runs)",
         stats.tile_entries,
         stats.addressed_tiles - stats.tile_entries
     );
     println!(
-        "  Distinct blobs:   {} ({} deduplicated)",
+        "  Distinct blobs:    {} ({} deduplicated)",
         stats.tile_contents,
         stats.tile_entries - stats.tile_contents
     );
-    println!("  Leaf directories: {}", stats.leaf_directories);
-    println!("  Size:             {} bytes", stats.bytes_written);
+    println!("  Leaf directories:  {}", stats.leaf_directories);
+    println!("  Size:              {} bytes", stats.bytes_written);
+    println!(
+        "  Verified:          {} tiles re-read and compared against the source",
+        stats.tiles_verified
+    );
 
     Ok(())
 }
@@ -827,12 +1015,23 @@ mod tests {
     }
 
     #[test]
-    fn test_zoom_bases_do_not_overlap() {
-        // The last id of one zoom must be one less than the first of the next
+    fn test_zoom_ranges_are_adjacent_with_no_gap_or_overlap() {
+        // Ask tile_id itself: the highest id at one zoom must be exactly one
+        // below the lowest at the next, or ids from different zooms collide.
         for z in 0u8..12 {
-            let first_of_next = (1u64 << (2 * (z as u64 + 1))) / 3 + 1;
-            let base_next = ((1u64 << (2 * (z as u64 + 1))) - 1) / 3;
-            assert_eq!(base_next + 1, first_of_next);
+            let side = 1u32 << z;
+            let highest = (0..side)
+                .flat_map(|x| (0..side).map(move |y| (x, y)))
+                .map(|(x, y)| tile_id(z, x, y))
+                .max()
+                .unwrap();
+            assert_eq!(
+                highest + 1,
+                tile_id(z + 1, 0, 0),
+                "zoom {} and {} are not adjacent",
+                z,
+                z + 1
+            );
         }
     }
 
@@ -1030,6 +1229,10 @@ mod tests {
             .to_string()
     }
 
+    fn open_archive(path: &str) -> ArchiveReader<std::fs::File> {
+        ArchiveReader::open(std::fs::File::open(path).unwrap()).unwrap()
+    }
+
     /// An MBTiles with a handful of tiles, two of them identical.
     fn fixture_mbtiles() -> String {
         let path = temp_path(".mbtiles");
@@ -1064,8 +1267,8 @@ mod tests {
         assert_eq!(stats.min_zoom, 0);
         assert_eq!(stats.max_zoom, 2);
 
-        let bytes = std::fs::read(&output).unwrap();
-        verify_archive(&bytes).unwrap();
+        let mut archive = open_archive(&output);
+        archive.verify().unwrap();
 
         for (z, x, y, expected) in [
             (0u8, 0u32, 0u32, &b"tile-zero"[..]),
@@ -1075,8 +1278,8 @@ mod tests {
             (2, 1, 1, &b"tile-c"[..]),
         ] {
             assert_eq!(
-                read_tile(&bytes, z, x, y).unwrap().as_deref(),
-                Some(expected),
+                archive.get_tile(z, x, y).unwrap().as_deref(),
+                Some(&gzip(expected).unwrap()[..]),
                 "tile {}/{}/{} did not survive the round trip",
                 z,
                 x,
@@ -1085,7 +1288,7 @@ mod tests {
         }
 
         // A tile that was never written
-        assert_eq!(read_tile(&bytes, 2, 0, 0).unwrap(), None);
+        assert_eq!(archive.get_tile(2, 0, 0).unwrap(), None);
 
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&output);
@@ -1114,12 +1317,13 @@ mod tests {
             "16 consecutive ids collapse to one run"
         );
 
-        let bytes = std::fs::read(&output).unwrap();
+        let mut archive = open_archive(&output);
+        let expected = gzip(b"identical").unwrap();
         for x in 0..4 {
             for y in 0..4 {
                 assert_eq!(
-                    read_tile(&bytes, 2, x, y).unwrap().as_deref(),
-                    Some(&b"identical"[..])
+                    archive.get_tile(2, x, y).unwrap().as_deref(),
+                    Some(&expected[..])
                 );
             }
         }
@@ -1142,8 +1346,8 @@ mod tests {
         assert_eq!(header.center_zoom, 3);
         assert!(header.clustered);
         assert_eq!(header.tile_type, TileType::Mvt);
-        // Plain bytes in the fixture, so no compression is claimed
-        assert_eq!(header.tile_compression, Compressed::None);
+        // Archives are uniformly gzipped, whatever the source held
+        assert_eq!(header.tile_compression, Compressed::Gzip);
 
         let meta_start = header.metadata_offset as usize;
         let meta_end = meta_start + header.metadata_length as usize;
@@ -1247,15 +1451,16 @@ mod tests {
         assert_eq!(stats.addressed_tiles, 16384);
         assert_eq!(stats.tile_contents, 16384, "every tile here is distinct");
 
-        let bytes = std::fs::read(&output).unwrap();
-        let header = verify_archive(&bytes).unwrap();
-        assert!(header.root_length as usize <= MAX_ROOT_DIR_LEN);
+        let mut archive = open_archive(&output);
+        archive.verify().unwrap();
+        assert!(archive.header().root_length as usize <= MAX_ROOT_DIR_LEN);
 
         // Corners and interior, through whatever directory layout was chosen
         for (x, y) in [(0u32, 0u32), (63, 100), (127, 127), (12, 3)] {
+            let expected = gzip(format!("tile-{}-{}", x, y).as_bytes()).unwrap();
             assert_eq!(
-                read_tile(&bytes, 7, x, y).unwrap().as_deref(),
-                Some(format!("tile-{}-{}", x, y).as_bytes()),
+                archive.get_tile(7, x, y).unwrap().as_deref(),
+                Some(&expected[..]),
                 "tile 7/{}/{} did not survive",
                 x,
                 y
@@ -1284,14 +1489,133 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_archive_catches_a_truncated_file() {
+    fn test_verify_catches_a_truncated_archive() {
         let input = fixture_mbtiles();
         let output = temp_path(".pmtiles");
         export_mbtiles(&input, &output).unwrap();
 
         let mut bytes = std::fs::read(&output).unwrap();
         bytes.truncate(bytes.len() / 2);
-        assert!(verify_archive(&bytes).is_err());
+
+        let mut archive = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+        assert!(archive.verify().is_err());
+
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn test_reader_errors_rather_than_panicking_on_a_bogus_header() {
+        // Header claims sections far beyond the end of the file
+        let mut bytes = sample_header().to_bytes().to_vec();
+        bytes[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut archive = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+        assert!(archive.verify().is_err());
+        assert!(archive.get_tile(0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn test_export_refuses_to_overwrite_its_input() {
+        // Tiles are read before anything is written, so writing over the source
+        // would destroy it and leave an archive that verifies against itself.
+        let input = fixture_mbtiles();
+        let err = match export_mbtiles(&input, &input) {
+            Err(e) => e,
+            Ok(_) => panic!("exporting onto the input must fail"),
+        };
+        assert!(err.to_string().contains("same file"), "got: {}", err);
+
+        // ...and the source is untouched
+        let store = MbtilesStore::open(&input).unwrap();
+        assert_eq!(store.tile_count().unwrap(), 5);
+
+        let _ = std::fs::remove_file(&input);
+    }
+
+    #[test]
+    fn test_export_normalizes_mixed_compression() {
+        // Tippecanoe with `no_tile_compression` writes raw tiles while the
+        // incremental updater always gzips, so one MBTiles can hold both. A
+        // single header field has to describe every tile.
+        let input = temp_path(".mbtiles");
+        let output = temp_path(".pmtiles");
+        {
+            let store = MbtilesStore::create(&input).unwrap();
+            store.put_tile(0, 0, 0, b"raw tile bytes").unwrap();
+            store
+                .put_tile(1, 0, 0, &gzip(b"gzipped tile bytes").unwrap())
+                .unwrap();
+        }
+
+        export_mbtiles(&input, &output).unwrap();
+        let mut archive = open_archive(&output);
+        assert_eq!(archive.header().tile_compression, Compressed::Gzip);
+
+        for (z, x, y, expected) in [
+            (0u8, 0u32, 0u32, &b"raw tile bytes"[..]),
+            (1, 0, 0, &b"gzipped tile bytes"[..]),
+        ] {
+            let stored = archive.get_tile(z, x, y).unwrap().unwrap();
+            assert!(
+                crate::mvt::is_gzipped(&stored),
+                "every tile must be gzipped"
+            );
+            assert_eq!(ungzip(&stored).unwrap(), expected);
+        }
+
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn test_export_rejects_a_tile_row_outside_its_zoom() {
+        // A foreign or corrupt MBTiles must produce an error, not a panic in
+        // debug or a silently mis-addressed archive in release.
+        let input = temp_path(".mbtiles");
+        let output = temp_path(".pmtiles");
+        {
+            let store = MbtilesStore::create(&input).unwrap();
+            store.put_tile(1, 0, 0, b"fine").unwrap();
+        }
+        {
+            // Row 9 does not exist at zoom 1. Written directly, because no
+            // production path can produce it — only a foreign or corrupt file.
+            let conn = rusqlite::Connection::open(&input).unwrap();
+            conn.execute(
+                "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data)
+                 VALUES (1, 0, 9, ?1)",
+                [&b"impossible"[..]],
+            )
+            .unwrap();
+        }
+
+        let err = match export_mbtiles(&input, &output) {
+            Err(e) => e,
+            Ok(_) => panic!("an out-of-range tile row must be rejected"),
+        };
+        assert!(err.to_string().contains("outside"), "got: {}", err);
+
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn test_center_falls_back_to_the_middle_of_the_bounds() {
+        let input = temp_path(".mbtiles");
+        let output = temp_path(".pmtiles");
+        {
+            let store = MbtilesStore::create(&input).unwrap();
+            store
+                .set_metadata("bounds", "-10.0,40.0,10.0,50.0")
+                .unwrap();
+            store.put_tile(0, 0, 0, b"tile").unwrap();
+        }
+
+        export_mbtiles(&input, &output).unwrap();
+        let header = open_archive(&output).header().clone();
+        // Not (0,0): Null Island would send a viewer to the Atlantic
+        assert!((header.center.0 - 0.0).abs() < 1e-7);
+        assert!((header.center.1 - 45.0).abs() < 1e-7);
 
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&output);
@@ -1332,7 +1656,7 @@ mod tests {
         );
         assert_eq!(
             parse_center(Some(&"-0.1,51.5,14".to_string())),
-            (-0.1, 51.5)
+            Some((-0.1, 51.5))
         );
         assert_eq!(
             parse_center_zoom(Some(&"-0.1,51.5,14".to_string())),
@@ -1345,5 +1669,8 @@ mod tests {
         assert_eq!(world.2, 180.0);
         assert_eq!(parse_bounds(Some(&"garbage".to_string())).0, -180.0);
         assert_eq!(parse_center_zoom(Some(&"-0.1,51.5".to_string())), None);
+        // No center at all: the caller supplies the bounds midpoint instead
+        assert_eq!(parse_center(None), None);
+        assert_eq!(parse_center(Some(&"garbage".to_string())), None);
     }
 }

@@ -3,6 +3,29 @@ use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
 use tracing::info;
 
+/// Build a `file:` URI with `immutable=1` for reading a database on read-only
+/// media. Only the characters SQLite's URI parser treats specially are escaped.
+fn immutable_uri(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/");
+    // file:///C:/... for a Windows absolute path
+    if !normalized.starts_with('/') && normalized.chars().nth(1) == Some(':') {
+        normalized.insert(0, '/');
+    }
+
+    let escaped: String = normalized
+        .chars()
+        .map(|c| match c {
+            '%' => "%25".to_string(),
+            '?' => "%3f".to_string(),
+            '#' => "%23".to_string(),
+            ' ' => "%20".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+
+    format!("file:{}?immutable=1", escaped)
+}
+
 pub struct MbtilesStore {
     conn: Connection,
 }
@@ -84,6 +107,83 @@ impl MbtilesStore {
         }
 
         Ok(Self { conn })
+    }
+
+    /// Open an MBTiles file without writing to it.
+    ///
+    /// [`open`](Self::open) flips the journal to WAL and materializes a
+    /// Tippecanoe `tiles` view into a table — both writes. A read-only command
+    /// pointed at a published or archived MBTiles, possibly on read-only media,
+    /// must not do either. Views read fine; only writing through one needs the
+    /// materialization.
+    pub fn open_read_only(path: &str) -> Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+
+        let opened = Connection::open_with_flags(path, flags).and_then(|conn| {
+            // Opening succeeds lazily; a WAL database only tries to create its
+            // -shm sidecar on the first read, so probe before deciding.
+            conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            Ok(conn)
+        });
+
+        let conn = match opened {
+            Ok(conn) => conn,
+            Err(first_error) => {
+                // A WAL database on read-only media cannot create its -shm file.
+                // `immutable=1` tells SQLite the file will not change while open,
+                // which is exactly true of the published artifacts this command
+                // exists to read; it is only a fallback, so a writable database
+                // still takes the normal path above.
+                Connection::open_with_flags(&immutable_uri(path), flags).map_err(|_| {
+                    if Path::new(path).exists() {
+                        anyhow!("Failed to open MBTiles at {}: {}", path, first_error)
+                    } else {
+                        anyhow!("MBTiles file not found: {}", path)
+                    }
+                })?
+            }
+        };
+
+        let has_tiles: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master
+                 WHERE name = 'tiles' AND type IN ('table', 'view')",
+                [],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("Failed to read the MBTiles schema of {}", path))?;
+
+        if !has_tiles {
+            bail!("{} is not a valid MBTiles file (no `tiles` table)", path);
+        }
+
+        Ok(Self { conn })
+    }
+
+    /// Stream every tile coordinate, as (zoom, column, TMS row).
+    ///
+    /// Coordinates only: a caller that has to reorder tiles — PMTiles export
+    /// sorts them onto a Hilbert curve — would otherwise have to hold every
+    /// tile's bytes in memory to do it.
+    pub fn for_each_tile_coord<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(u8, u32, u32) -> Result<()>,
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT zoom_level, tile_column, tile_row FROM tiles
+             WHERE tile_data IS NOT NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            f(
+                row.get::<_, u8>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u32>(2)?,
+            )?;
+        }
+        Ok(())
     }
 
     /// Create a new MBTiles file with the required schema
@@ -296,7 +396,9 @@ impl MbtilesStore {
 
     /// Get raw tile data by TMS coordinates (no y-flip)
     pub fn get_tile_raw_tms(&self, z: u8, x: u32, tms_y: u32) -> Result<Option<Vec<u8>>> {
-        let mut stmt = self.conn.prepare(
+        // Cached: an export calls this once per tile, and recompiling the SQL
+        // each time would dominate the lookup itself.
+        let mut stmt = self.conn.prepare_cached(
             "SELECT tile_data FROM tiles WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3",
         )?;
         let result = stmt.query_row(params![z as i32, x as i32, tms_y as i32], |row| {
@@ -547,6 +649,83 @@ mod tests {
         assert_eq!(store.get_tile(1, 0, 0).unwrap(), None);
         // The previously committed tile should still exist
         assert_eq!(store.get_tile(0, 0, 0).unwrap(), Some(b"existing".to_vec()));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_open_read_only_does_not_write_to_the_source() {
+        let path = temp_mbtiles_path();
+        {
+            let store = MbtilesStore::create(&path).unwrap();
+            store.put_tile(1, 0, 0, b"data").unwrap();
+        }
+
+        let before = std::fs::metadata(&path).unwrap().len();
+        {
+            let store = MbtilesStore::open_read_only(&path).unwrap();
+            assert_eq!(store.tile_count().unwrap(), 1);
+            assert_eq!(
+                store.get_tile(1, 0, 0).unwrap().as_deref(),
+                Some(&b"data"[..])
+            );
+            // A read-only handle must refuse writes rather than silently work
+            assert!(store.put_tile(2, 0, 0, b"nope").is_err());
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before,
+            "a read-only open must not change the file"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_open_read_only_rejects_a_missing_file() {
+        let path = temp_mbtiles_path();
+        let err = match MbtilesStore::open_read_only(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("opening a missing file read-only must fail"),
+        };
+        assert!(err.to_string().contains("not found"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_immutable_uri_escaping() {
+        assert_eq!(
+            immutable_uri("/tmp/a.mbtiles"),
+            "file:/tmp/a.mbtiles?immutable=1"
+        );
+        assert_eq!(
+            immutable_uri("/tmp/my tiles.mbtiles"),
+            "file:/tmp/my%20tiles.mbtiles?immutable=1"
+        );
+        // Windows paths become file:///C:/...
+        assert_eq!(
+            immutable_uri("C:\\data\\a.mbtiles"),
+            "file:/C:/data/a.mbtiles?immutable=1"
+        );
+    }
+
+    #[test]
+    fn test_for_each_tile_coord_streams_every_row() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.put_tile(1, 0, 0, b"a").unwrap();
+        store.put_tile(1, 1, 1, b"b").unwrap();
+
+        let mut seen = Vec::new();
+        store
+            .for_each_tile_coord(|z, x, tms_y| {
+                seen.push((z, x, tms_y));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(seen.len(), 2);
+        // Rows come back in TMS space, as stored: XYZ 1/0/0 is TMS row 1
+        assert!(seen.contains(&(1, 0, 1)));
 
         cleanup(&path);
     }
