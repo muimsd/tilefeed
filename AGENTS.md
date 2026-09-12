@@ -14,6 +14,17 @@ cargo check                  # fast type-check without codegen
 
 The build step compiles `proto/vector_tile.proto` via `prost-build` (see `build.rs`).
 
+## Verifying before you push
+
+CI runs these exact commands; a plain `cargo clippy` is weaker than the first one
+and will let warnings through that fail the build:
+
+```bash
+cargo clippy -- -D warnings -A dead_code   # what CI runs — warnings are errors
+cargo fmt -- --check
+cargo test
+```
+
 ## Running
 
 ```bash
@@ -23,6 +34,7 @@ cargo run -- run                   # generate then watch
 cargo run -- serve                 # generate, watch, and serve tiles over HTTP
 cargo run -- serve --skip-generate # serve the existing MBTiles without rebuilding
 cargo run -- inspect out.mbtiles   # dump MBTiles metadata and stats
+cargo run -- export out.mbtiles out.pmtiles  # convert to a PMTiles archive
 cargo run -- validate              # check config against database
 cargo run -- diff a.mbtiles b.mbtiles  # compare two MBTiles files
 cargo run -- -c other.toml watch   # use alternate config file
@@ -67,6 +79,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **`storage.rs`** — Publishing abstraction for MBTiles artifact sync to local filesystem, S3 (`aws s3 cp`), Mapbox Studio, or custom shell command.
 - **`tiles.rs`** — Tile math: XYZ coordinate ↔ lon/lat bounds conversion, tiles-for-bounds enumeration.
 - **`config.rs`** — Config deserialization from TOML + env vars (prefix `TILES_`).
+- **`pmtiles.rs`** — PMTiles v3 writer: Hilbert tile IDs, varint directories with leaf fallback, content dedup and run collapsing. Archives are verified by re-reading before `export` reports success.
 - **`inspect.rs`** — MBTiles inspection (metadata, tile counts per zoom, sizes).
 - **`validate.rs`** — Config validation against database (tables, columns, triggers).
 - **`diff.rs`** — MBTiles comparison (added/removed/changed tiles per zoom).
@@ -80,6 +93,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **Layer→source routing**: `AppConfig::find_source_for_layer()` maps a notification's layer name to the owning source. Each source maintains its own MBTiles store.
 - **Auto-reconnect**: The LISTEN/NOTIFY listener reconnects with exponential backoff if the PostgreSQL connection drops.
 - **One route parameter per path segment**: axum rejects patterns like `/{y}.pbf` or `/{source}.json` at startup (a panic, inside the spawned server task). File extensions are captured as part of the parameter and parsed in the handler.
+- **PMTiles tile IDs are XYZ, MBTiles rows are TMS**: `all_tile_coords()` returns TMS rows and pairs with `get_tile_raw_tms()`; `get_tile()` takes XYZ and flips internally. Mixing the two silently drops or mis-maps tiles.
 - **Server tests build the production router**: `build_router()` is what both `start_server` and the tests use. Tests must never declare their own route patterns — a test harness that did exactly that hid a startup panic through two releases.
 
 ### Config (`config.toml`)

@@ -216,7 +216,7 @@ async fn serve_tile(
             // Tiles are gzipped by the native encoder and by Tippecanoe's default,
             // but not when `no_tile_compression` is set, so advertise the encoding
             // the stored bytes actually have rather than assuming gzip.
-            if is_gzipped(&data) {
+            if crate::mvt::is_gzipped(&data) {
                 response_headers.insert(
                     header::CONTENT_ENCODING,
                     header::HeaderValue::from_static("gzip"),
@@ -226,11 +226,6 @@ async fn serve_tile(
             (response_headers, data).into_response()
         }
     }
-}
-
-/// Gzip magic number (RFC 1952): 0x1f 0x8b, followed by deflate method 0x08.
-fn is_gzipped(data: &[u8]) -> bool {
-    data.len() >= 3 && data[0] == 0x1f && data[1] == 0x8b && data[2] == 0x08
 }
 
 async fn serve_tilejson(
@@ -537,10 +532,10 @@ mod tests {
     #[test]
     fn test_is_gzipped() {
         // gzip magic + deflate method
-        assert!(is_gzipped(&[0x1f, 0x8b, 0x08, 0x00]));
-        assert!(!is_gzipped(b"raw protobuf bytes"));
-        assert!(!is_gzipped(&[0x1f, 0x8b]));
-        assert!(!is_gzipped(&[]));
+        assert!(crate::mvt::is_gzipped(&[0x1f, 0x8b, 0x08, 0x00]));
+        assert!(!crate::mvt::is_gzipped(b"raw protobuf bytes"));
+        assert!(!crate::mvt::is_gzipped(&[0x1f, 0x8b]));
+        assert!(!crate::mvt::is_gzipped(&[]));
     }
 
     #[tokio::test]

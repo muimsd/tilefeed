@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PMTiles export**: `tilefeed export <in.mbtiles> <out.pmtiles>` writes a [PMTiles v3](https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md) archive for static hosting on S3, R2, or any CDN — no tile server required. Deduplicates identical tiles, collapses consecutive runs, orders tiles along a Hilbert curve, and builds leaf directories when the root would exceed 16 KiB. Archives are opened read-only (so an immutable or read-only artifact exports fine), tile bytes are staged through a temporary file so memory scales with tile *count* rather than size, and every archive is read back before the command reports success — structurally, and by comparing up to 64 sampled tiles byte-for-byte against the source. See [docs/pmtiles.md](docs/pmtiles.md).
+
 ### Fixed
 
 - `tilefeed --version` / `-V` now report the version instead of failing with "unexpected argument"
