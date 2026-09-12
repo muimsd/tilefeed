@@ -25,6 +25,7 @@ use updater::start_listener;
 #[derive(Parser)]
 #[command(
     name = "tilefeed",
+    version,
     about = "PostGIS vector tile generator with incremental MBTiles updates"
 )]
 struct Cli {
@@ -454,6 +455,26 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn test_version_flag_reports_the_crate_version() {
+        // A release that cannot say which release it is makes bug reports guesswork
+        let err = match Cli::try_parse_from(["tilefeed", "--version"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--version should short-circuit parsing"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn test_short_version_flag() {
+        let err = match Cli::try_parse_from(["tilefeed", "-V"]) {
+            Err(e) => e,
+            Ok(_) => panic!("-V should short-circuit parsing"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 
     #[test]
