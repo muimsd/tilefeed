@@ -136,7 +136,7 @@ impl MbtilesStore {
                 // which is exactly true of the published artifacts this command
                 // exists to read; it is only a fallback, so a writable database
                 // still takes the normal path above.
-                Connection::open_with_flags(&immutable_uri(path), flags).map_err(|_| {
+                Connection::open_with_flags(immutable_uri(path), flags).map_err(|_| {
                     if Path::new(path).exists() {
                         anyhow!("Failed to open MBTiles at {}: {}", path, first_error)
                     } else {

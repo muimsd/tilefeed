@@ -14,6 +14,17 @@ cargo check                  # fast type-check without codegen
 
 The build step compiles `proto/vector_tile.proto` via `prost-build` (see `build.rs`).
 
+## Verifying before you push
+
+CI runs these exact commands; a plain `cargo clippy` is weaker than the first one
+and will let warnings through that fail the build:
+
+```bash
+cargo clippy -- -D warnings -A dead_code   # what CI runs — warnings are errors
+cargo fmt -- --check
+cargo test
+```
+
 ## Running
 
 ```bash
