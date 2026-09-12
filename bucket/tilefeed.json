@@ -5,8 +5,8 @@
     "license": "MIT",
     "architecture": {
         "64bit": {
-  "url": "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-x86_64-pc-windows-msvc.zip",
-  "hash": "ec838a07abbb58b5f5652788ee96a4dbf011592698f5711ef431003a304fd8a7"
+            "url": "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-x86_64-pc-windows-msvc.zip",
+            "hash": "ec838a07abbb58b5f5652788ee96a4dbf011592698f5711ef431003a304fd8a7"
         }
     },
     "bin": "tilefeed.exe",
@@ -15,9 +15,9 @@
     },
     "autoupdate": {
         "architecture": {
-  "64bit": {
-      "url": "https://github.com/muimsd/tilefeed/releases/download/v$version/tilefeed-x86_64-pc-windows-msvc.zip"
-  }
+            "64bit": {
+                "url": "https://github.com/muimsd/tilefeed/releases/download/v$version/tilefeed-x86_64-pc-windows-msvc.zip"
+            }
         }
     }
 }

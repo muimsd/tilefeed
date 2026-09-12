@@ -26,6 +26,19 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings -A dead_code
 
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # scripts/update-manifests.sh runs on the release path, where a mistake is
+      # only visible once a release is already published. Installed explicitly
+      # rather than relying on whatever the runner image happens to preinstall.
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

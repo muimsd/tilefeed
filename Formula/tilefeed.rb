@@ -16,8 +16,14 @@ class Tilefeed < Formula
   end
 
   on_linux do
-    url "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
-    sha256 "0f5a741998da40d0d13ad1c7db629862cc8a6be00a9fe5d3e9e7eb2915a3a90a"
+    on_arm do
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "ba8eb0b59648e8ca8a4897dcbb804152573a8d0af4f61d40d631cc2b123fede2"
+    end
+    on_intel do
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "0f5a741998da40d0d13ad1c7db629862cc8a6be00a9fe5d3e9e7eb2915a3a90a"
+    end
   end
 
   def install
@@ -25,6 +31,6 @@ class Tilefeed < Formula
   end
 
   test do
-    assert_match "tilefeed", shell_output("\#{bin}/tilefeed --help")
+    assert_match "tilefeed", shell_output("#{bin}/tilefeed --help")
   end
 end
