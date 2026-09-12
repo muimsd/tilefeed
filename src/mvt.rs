@@ -21,6 +21,14 @@ use vector_tile::Tile;
 const EXTENT: u32 = 4096;
 
 /// Encode a set of features into a gzipped MVT tile
+/// Gzip magic number (RFC 1952): 0x1f 0x8b, followed by deflate method 0x08.
+///
+/// Tiles are gzipped by this encoder and by Tippecanoe's default, but not when
+/// `no_tile_compression` is set, so anything reading a stored tile has to ask.
+pub fn is_gzipped(data: &[u8]) -> bool {
+    data.len() >= 3 && data[0] == 0x1f && data[1] == 0x8b && data[2] == 0x08
+}
+
 pub fn encode_tile(
     tile_coord: &TileCoord,
     features_by_layer: &HashMap<String, Vec<FeatureData>>,

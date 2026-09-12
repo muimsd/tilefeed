@@ -15,7 +15,8 @@ PostGIS ──┬── Tippecanoe ──┐
 LISTEN/NOTIFY ── Debounce ── MVT encode ─├── Mapbox Studio
                                          ├── Custom command
                                          ├── Webhooks (HTTP POST)
-                                         └── SSE (Server-Sent Events)
+                                         ├── SSE (Server-Sent Events)
+                                         └── PMTiles export (static hosting)
 
 Every stage ─────────────────────────────────── Prometheus /metrics
 ```
@@ -45,6 +46,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - [Webhook notifications](docs/serving.md#webhooks) with HMAC-SHA256 signing and configurable cooldown
 - [Server-Sent Events](docs/serving.md#server-sent-events-sse) (`GET /events`) for live tile refresh in frontends
 - [Prometheus metrics](docs/metrics.md) (`GET /metrics`) for tile serving, generation, updates, webhooks, and publishing
+- [PMTiles export](docs/pmtiles.md) for static hosting on S3/R2/any CDN — no tile server needed
 - CLI tools: `inspect`, `validate`, `diff` for MBTiles diagnostics
 - Docker support with multi-stage build
 - `--skip-generate` for fast restarts: serve an existing MBTiles without rebuilding, PostGIS, or Tippecanoe
@@ -140,6 +142,7 @@ tilefeed run                 # generate then watch
 tilefeed serve               # generate, start HTTP server, and watch
 tilefeed serve --skip-generate  # serve the existing MBTiles immediately (no rebuild)
 tilefeed inspect <file>      # inspect MBTiles metadata and statistics
+tilefeed export <in> <out>   # export MBTiles to a PMTiles archive
 tilefeed validate            # validate config against the database
 tilefeed diff <a> <b>        # compare two MBTiles files
 tilefeed -c other.toml serve # use alternate config file
@@ -237,6 +240,7 @@ tilefeed serve --skip-generate
 | [Tippecanoe Settings](docs/tippecanoe.md) | Fine-tuning Tippecanoe tile generation |
 | [Tile Serving](docs/serving.md) | Built-in HTTP server, SSE, webhooks, and external alternatives |
 | [Metrics](docs/metrics.md) | Prometheus metrics, scrape setup, and example queries |
+| [PMTiles Export](docs/pmtiles.md) | Single-file archives for static hosting |
 | [Derived Layers](docs/derived-layers.md) | Auto-generated label points and boundary lines |
 | [OGR_FDW Integration](docs/ogr-fdw.md) | Using external data sources via PostgreSQL FDW |
 

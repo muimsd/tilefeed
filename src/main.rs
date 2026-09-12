@@ -6,6 +6,7 @@ mod inspect;
 mod mbtiles;
 mod metrics;
 mod mvt;
+mod pmtiles;
 mod postgis;
 mod server;
 mod storage;
@@ -70,6 +71,14 @@ enum Commands {
     /// Validate config against the actual database
     Validate,
 
+    /// Export an MBTiles file to a PMTiles archive for static hosting
+    Export {
+        /// Path to the MBTiles file to read
+        input: String,
+        /// Path of the PMTiles archive to write
+        output: String,
+    },
+
     /// Compare two MBTiles files and show differences
     Diff {
         /// Path to the first MBTiles file
@@ -88,6 +97,7 @@ impl Commands {
             Commands::Run { .. } => "run",
             Commands::Serve { .. } => "serve",
             Commands::Inspect { .. } => "inspect",
+            Commands::Export { .. } => "export",
             Commands::Validate => "validate",
             Commands::Diff { .. } => "diff",
         }
@@ -103,6 +113,7 @@ impl Commands {
             Commands::Watch
             | Commands::Validate
             | Commands::Inspect { .. }
+            | Commands::Export { .. }
             | Commands::Diff { .. } => false,
         }
     }
@@ -138,6 +149,9 @@ async fn main() -> Result<()> {
         }
         Commands::Diff { path_a, path_b } => {
             diff::diff_mbtiles(&path_a, &path_b)?;
+        }
+        Commands::Export { input, output } => {
+            pmtiles::export(&input, &output)?;
         }
         _ => {
             // Commands that need the full config
@@ -207,7 +221,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 // Already handled above
-                Commands::Inspect { .. } | Commands::Diff { .. } => unreachable!(),
+                Commands::Inspect { .. } | Commands::Diff { .. } | Commands::Export { .. } => {
+                    unreachable!()
+                }
             }
         }
     }
