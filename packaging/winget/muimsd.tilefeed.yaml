@@ -1,5 +1,5 @@
 PackageIdentifier: muimsd.tilefeed
-PackageVersion: 0.8.1
+PackageVersion: 0.9.0
 PackageName: tilefeed
 Publisher: muimsd
 License: MIT
@@ -15,8 +15,8 @@ Tags:
 Installers:
   - Architecture: x64
     InstallerType: zip
-    InstallerUrl: https://github.com/muimsd/tilefeed/releases/download/v0.8.1/tilefeed-x86_64-pc-windows-msvc.zip
-    InstallerSha256: ec838a07abbb58b5f5652788ee96a4dbf011592698f5711ef431003a304fd8a7
+    InstallerUrl: https://github.com/muimsd/tilefeed/releases/download/v0.9.0/tilefeed-x86_64-pc-windows-msvc.zip
+    InstallerSha256: e1520b9faf47c76143c60f98860ab6eeb00b138949ebbd6645604e6c520e8207
     NestedInstallerType: portable
     NestedInstallerFiles:
       - RelativeFilePath: tilefeed.exe

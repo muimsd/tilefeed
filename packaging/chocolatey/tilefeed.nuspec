@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>tilefeed</id>
-    <version>0.8.1</version>
+    <version>0.9.0</version>
     <title>tilefeed</title>
     <authors>muimsd</authors>
     <owners>muimsd</owners>
