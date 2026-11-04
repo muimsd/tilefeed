@@ -95,6 +95,34 @@ pub enum GenerationBackend {
     Native,
 }
 
+/// How a polygon's label point is derived.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelPointMethod {
+    /// ST_PointOnSurface: always inside the polygon, the right choice for labels (default).
+    #[default]
+    PointOnSurface,
+    /// ST_Centroid: the true center of mass. Can fall outside concave or multi-part polygons.
+    Centroid,
+}
+
+impl LayerConfig {
+    /// SQL expression for this layer's label point, in EPSG:4326.
+    pub fn label_point_sql(&self, geom_col: &str) -> String {
+        if let Some(col) = &self.label_point_column {
+            return format!("ST_Transform(\"{col}\", 4326)");
+        }
+        match self.label_point_method {
+            LabelPointMethod::PointOnSurface => {
+                format!("ST_PointOnSurface(ST_Transform(\"{geom_col}\", 4326))")
+            }
+            LabelPointMethod::Centroid => {
+                format!("ST_Centroid(ST_Transform(\"{geom_col}\", 4326))")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceConfig {
     pub name: String,
@@ -177,11 +205,18 @@ pub struct LayerConfig {
     /// Properties to exclude at zoom levels below this threshold
     /// e.g. `{ below_zoom = 10, exclude = ["description", "metadata"] }`
     pub property_rules: Option<Vec<PropertyRule>>,
-    /// Automatically generate a centroid point layer for labels.
-    /// Creates a companion layer named `{name}_labels` with Point geometry
-    /// derived from ST_PointOnSurface of the polygon.
+    /// Automatically generate a point layer for labels.
+    /// Creates a companion layer named `{name}_labels` with one Point per feature,
+    /// computed with `label_point_method` or read from `label_point_column`.
     #[serde(default)]
     pub generate_label_points: bool,
+    /// How label points are computed (default `point_on_surface`).
+    #[serde(default)]
+    pub label_point_method: LabelPointMethod,
+    /// Use this existing point column of the table as the label point instead of computing one
+    /// (e.g. a hand-placed `label_geom`). Overrides `label_point_method`.
+    #[serde(default)]
+    pub label_point_column: Option<String>,
     /// Automatically generate a boundary polyline layer.
     /// Creates a companion layer named `{name}_boundary` with LineString geometry
     /// derived from ST_Boundary of the polygon.
@@ -506,7 +541,28 @@ pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
         .build()?;
 
     let cfg: AppConfig = settings.try_deserialize()?;
+    check_label_point_columns(&cfg)?;
     Ok(cfg)
+}
+
+/// `label_point_column` is spliced into SQL as a quoted identifier, so only plain identifiers are allowed.
+fn check_label_point_columns(cfg: &AppConfig) -> anyhow::Result<()> {
+    for source in &cfg.sources {
+        for layer in &source.layers {
+            if let Some(col) = &layer.label_point_column {
+                let ok =
+                    !col.is_empty() && col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ok {
+                    anyhow::bail!(
+                        "layer \"{}\": label_point_column \"{}\" must be a plain column name (letters, digits, underscore)",
+                        layer.name,
+                        col
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -528,6 +584,8 @@ mod tests {
             property_rules: None,
             generate_label_points: false,
             generate_boundary_lines: false,
+            label_point_method: Default::default(),
+            label_point_column: None,
         }
     }
 
@@ -729,6 +787,72 @@ mod tests {
         assert!(conn_str.contains("port=5432"));
         assert!(conn_str.contains("user=postgres"));
         assert!(conn_str.contains("dbname=tiles"));
+    }
+
+    // --- label point method / column ---
+
+    fn parse_layer(extra: &str) -> LayerConfig {
+        let toml = format!(
+            "name = \"parcels\"\ntable = \"parcels\"\ngenerate_label_points = true\n{}",
+            extra
+        );
+        config::Config::builder()
+            .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_label_point_method_defaults_to_point_on_surface() {
+        let l = parse_layer("");
+        assert_eq!(l.label_point_method, LabelPointMethod::PointOnSurface);
+        assert_eq!(
+            l.label_point_sql("geom"),
+            "ST_PointOnSurface(ST_Transform(\"geom\", 4326))"
+        );
+    }
+
+    #[test]
+    fn test_label_point_method_centroid() {
+        let l = parse_layer("label_point_method = \"centroid\"");
+        assert_eq!(
+            l.label_point_sql("geom"),
+            "ST_Centroid(ST_Transform(\"geom\", 4326))"
+        );
+    }
+
+    #[test]
+    fn test_label_point_column_overrides_method() {
+        let l =
+            parse_layer("label_point_method = \"centroid\"\nlabel_point_column = \"label_geom\"");
+        assert_eq!(
+            l.label_point_sql("geom"),
+            "ST_Transform(\"label_geom\", 4326)"
+        );
+    }
+
+    #[test]
+    fn test_label_point_method_rejects_unknown_values() {
+        let toml = "name = \"p\"\ntable = \"p\"\nlabel_point_method = \"middle\"";
+        let r: Result<LayerConfig, _> = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_label_point_column_must_be_a_plain_identifier() {
+        let mut source = sample_source("s", &["parcels"]);
+        source.layers[0].label_point_column = Some("geom\"; DROP TABLE x; --".to_string());
+        let cfg = sample_config(vec![source]);
+        assert!(check_label_point_columns(&cfg).is_err());
+        let mut ok = sample_source("s", &["parcels"]);
+        ok.layers[0].label_point_column = Some("label_geom".to_string());
+        assert!(check_label_point_columns(&sample_config(vec![ok])).is_ok());
     }
 
     // --- [database] sslmode / sslrootcert parsing ---

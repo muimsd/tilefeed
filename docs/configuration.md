@@ -192,7 +192,9 @@ See [Metrics](metrics.md) for the full metric reference.
 | `properties` | string[] | no | Properties to include in tiles |
 | `filter` | string | no | SQL WHERE clause to filter features |
 | `simplify_tolerance` | float | no | Douglas-Peucker tolerance in degrees (scaled per zoom) |
-| `generate_label_points` | bool | no | Generate `{name}_labels` centroid layer |
+| `generate_label_points` | bool | no | Generate `{name}_labels` point layer (see derived-layers.md) |
+| `label_point_method` | string | no | `point_on_surface` (default) or `centroid` |
+| `label_point_column` | string | no | Use this existing point column as the label point; overrides `label_point_method` |
 | `generate_boundary_lines` | bool | no | Generate `{name}_boundary` polyline layer |
 
 ### `[[sources.layers.property_rules]]`

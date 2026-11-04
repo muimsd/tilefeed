@@ -318,9 +318,7 @@ impl PostgisReader {
         };
 
         let geom_transform = match derived_type {
-            DerivedGeomType::LabelPoint => {
-                format!("ST_PointOnSurface(ST_Transform(\"{geom_col}\", 4326))")
-            }
+            DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
             DerivedGeomType::BoundaryLine => {
                 format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
             }
@@ -411,9 +409,7 @@ impl PostgisReader {
         };
 
         let geom_transform = match derived_type {
-            DerivedGeomType::LabelPoint => {
-                format!("ST_PointOnSurface(ST_Transform(\"{geom_col}\", 4326))")
-            }
+            DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
             DerivedGeomType::BoundaryLine => {
                 format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
             }

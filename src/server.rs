@@ -465,6 +465,8 @@ mod tests {
                     property_rules: None,
                     generate_label_points: true,
                     generate_boundary_lines: false,
+                    label_point_method: Default::default(),
+                    label_point_column: None,
                 }],
                 tippecanoe: TippecanoeConfig::default(),
             }],
