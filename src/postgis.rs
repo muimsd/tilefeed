@@ -179,6 +179,52 @@ impl PostgisReader {
         }
     }
 
+    /// Maximum number of pooled connections (upper bound for useful query concurrency).
+    pub fn max_connections(&self) -> usize {
+        self.pool.status().max_size
+    }
+
+    /// Extent of a layer's (filtered) geometries in EPSG:4326, or `None` if the
+    /// layer has no rows. Geometries are transformed before aggregating so the
+    /// box is exact rather than a reprojected source-SRID box.
+    pub async fn get_layer_extent(&self, layer: &LayerConfig) -> Result<Option<Bounds>> {
+        let client = self.pool.get().await?;
+        let schema = layer.schema.as_deref().unwrap_or("public");
+        let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
+
+        let mut inner = format!(
+            r#"SELECT ST_Extent(ST_Transform("{geom_col}", 4326)) AS e
+            FROM "{schema}"."{table}"
+            WHERE "{geom_col}" IS NOT NULL"#,
+            table = layer.table,
+        );
+        if let Some(ref filter) = layer.filter {
+            inner.push_str(&format!(" AND ({})", filter));
+        }
+        let query = format!(
+            "SELECT ST_XMin(e), ST_YMin(e), ST_XMax(e), ST_YMax(e) FROM ({}) s",
+            inner
+        );
+
+        let row = client
+            .query_one(&query, &[])
+            .await
+            .with_context(|| format!("Failed to compute extent of layer '{}'", layer.name))?;
+        let min_lon: Option<f64> = row.get(0);
+        let min_lat: Option<f64> = row.get(1);
+        let max_lon: Option<f64> = row.get(2);
+        let max_lat: Option<f64> = row.get(3);
+        Ok(match (min_lon, min_lat, max_lon, max_lat) {
+            (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) => Some(Bounds {
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat,
+            }),
+            _ => None,
+        })
+    }
+
     /// Get all features intersecting a given tile bounding box
     pub async fn get_features_in_bounds(
         &self,

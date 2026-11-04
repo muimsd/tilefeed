@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The native generator no longer walks the whole world.** `generation_backend = "native"` iterated every `x,y` at every zoom and issued a query per tile per layer, so even a 900-row table at z10–15 never finished. It now restricts tiles to the data extent and descends the quadtree only below non-empty tiles, running tile queries concurrently. Output for tiles with data is unchanged.
 - Listener reconnect logs now include the underlying cause (e.g. `server does not support TLS`) instead of only the outermost error context.
 - Database connections are configured field by field rather than through a `key=value` string, so passwords containing spaces or quotes work for the LISTEN connection.
 

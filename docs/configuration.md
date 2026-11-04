@@ -245,6 +245,8 @@ Requires `ogr2ogr` from [GDAL](https://gdal.org/). Exports via OGR and converts 
 
 No external dependencies. Uses tilefeed's built-in Rust MVT encoder to generate tiles directly from PostGIS queries. Supports geometry simplification and derived layers. Best for development or environments where installing external tools is impractical.
 
+Generation only visits tiles that can hold data: it computes the data extent (`ST_Extent` of every layer, in EPSG:4326), queries every tile inside it at `min_zoom`, and then descends only into the children of tiles that had features. Tile queries run concurrently, up to `pool_size`.
+
 ```toml
 [[sources]]
 name = "parks"
