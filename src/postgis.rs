@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde_json::Value as JsonValue;
-use tokio_postgres::NoTls;
 use tracing::info;
 
 use crate::config::{DatabaseConfig, DerivedGeomType, LayerConfig};
@@ -13,25 +12,34 @@ pub struct PostgisReader {
 
 impl PostgisReader {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
-        let mut pool_cfg = PoolConfig::new();
-        pool_cfg.host = Some(config.host.clone());
-        pool_cfg.port = Some(config.port);
-        pool_cfg.user = Some(config.user.clone());
-        pool_cfg.password = Some(config.password.clone());
-        pool_cfg.dbname = Some(config.dbname.clone());
+        let tls = crate::pgtls::make_tls_connector(config)?;
+        let manager = Manager::from_config(
+            config.pg_config(),
+            tls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
 
         let pool_size = config.pool_size.unwrap_or(4);
-        let pool = pool_cfg
-            .builder(NoTls)
-            .context("Failed to create pool builder")?
+        let pool = Pool::builder(manager)
             .max_size(pool_size)
             .runtime(Runtime::Tokio1)
             .build()
             .context("Failed to build connection pool")?;
 
         // Verify connectivity
-        let _client = pool.get().await.context("Failed to connect to PostGIS")?;
-        info!("Connected to PostGIS (pool_size={})", pool_size);
+        let _client = pool.get().await.with_context(|| {
+            format!(
+                "Failed to connect to PostGIS (sslmode={})",
+                config.sslmode.as_str()
+            )
+        })?;
+        info!(
+            "Connected to PostGIS (pool_size={}, sslmode={})",
+            pool_size,
+            config.sslmode.as_str()
+        );
 
         Ok(Self { pool })
     }

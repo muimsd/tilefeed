@@ -442,6 +442,8 @@ mod tests {
                 password: "secret".to_string(),
                 dbname: "test".to_string(),
                 pool_size: None,
+                sslmode: SslMode::default(),
+                sslrootcert: None,
             },
             sources: vec![SourceConfig {
                 name: "test_source".to_string(),

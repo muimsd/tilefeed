@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-use tokio_postgres::{AsyncMessage, NoTls};
+use tokio_postgres::AsyncMessage;
 use tracing::{error, info, warn};
 
 use crate::config::{AppConfig, DerivedGeomType};
@@ -40,7 +40,7 @@ pub async fn start_listener(
         let reason =
             match run_listener(&config, &stores, publisher.as_ref(), event_tx.as_ref()).await {
                 Ok(()) => "listener stopped without an error".to_string(),
-                Err(e) => e.to_string(),
+                Err(e) => format!("{:#}", e),
             };
 
         retry_count += 1;
@@ -92,10 +92,18 @@ async fn run_listener(
     publisher: Option<&Arc<StoragePublisher>>,
     event_tx: Option<&EventSender>,
 ) -> Result<()> {
-    let (client, mut connection) =
-        tokio_postgres::connect(&config.database.connection_string(), NoTls)
-            .await
-            .context("Failed to connect for LISTEN/NOTIFY")?;
+    let tls = crate::pgtls::make_tls_connector(&config.database)?;
+    let (client, mut connection) = config
+        .database
+        .pg_config()
+        .connect(tls)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect for LISTEN/NOTIFY (sslmode={})",
+                config.database.sslmode.as_str()
+            )
+        })?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio_postgres::Notification>();
 

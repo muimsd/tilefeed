@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **TLS to PostgreSQL.** New `[database]` keys `sslmode` (`disable` | `prefer` | `require` | `verify-ca` | `verify-full`, libpq semantics, default `prefer`) and `sslrootcert`. Uses rustls (ring) for both the connection pool and the LISTEN/NOTIFY connection, so managed databases that enforce TLS (Supabase, Neon, RDS, Cloud SQL, Crunchy Bridge) can now be reached. `verify-*` modes verify against `sslrootcert` or the bundled webpki roots.
+
+### Fixed
+
+- Listener reconnect logs now include the underlying cause (e.g. `server does not support TLS`) instead of only the outermost error context.
+- Database connections are configured field by field rather than through a `key=value` string, so passwords containing spaces or quotes work for the LISTEN connection.
+
 ## [0.9.0] - 2026-09-12
 
 ### Added

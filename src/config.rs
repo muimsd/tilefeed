@@ -28,6 +28,59 @@ pub struct DatabaseConfig {
     pub password: String,
     pub dbname: String,
     pub pool_size: Option<usize>,
+    /// TLS mode for PostgreSQL connections, with libpq semantics:
+    /// "disable" | "prefer" (default) | "require" | "verify-ca" | "verify-full".
+    #[serde(default)]
+    pub sslmode: SslMode,
+    /// PEM file with the CA certificate(s) used to verify the server in
+    /// "verify-ca"/"verify-full" mode (and, as in libpq, in "require" mode
+    /// when set). When unset, the bundled Mozilla (webpki) roots are used.
+    #[serde(default)]
+    pub sslrootcert: Option<String>,
+}
+
+/// PostgreSQL TLS mode. Mirrors libpq's `sslmode` values (except "allow").
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SslMode {
+    /// Never use TLS.
+    Disable,
+    /// Use TLS if the server supports it, otherwise fall back to plaintext.
+    /// The certificate is not verified. This is libpq's default and keeps
+    /// configs written before `sslmode` existed working against non-TLS servers.
+    #[default]
+    Prefer,
+    /// Always use TLS; fail if the server refuses it. The certificate is not
+    /// verified unless `sslrootcert` is set (then behaves like "verify-ca").
+    Require,
+    /// Always use TLS and verify the certificate chain, but not the hostname.
+    VerifyCa,
+    /// Always use TLS, verify the certificate chain and that the hostname matches.
+    VerifyFull,
+}
+
+impl SslMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
+        }
+    }
+
+    /// The handshake mode tokio-postgres should use. Verification is handled
+    /// separately by the rustls connector.
+    pub fn to_postgres(self) -> tokio_postgres::config::SslMode {
+        match self {
+            SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+            SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+                tokio_postgres::config::SslMode::Require
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -324,6 +377,19 @@ impl AppConfig {
 }
 
 impl DatabaseConfig {
+    /// Build a tokio-postgres config. Values are set field by field, so
+    /// passwords containing spaces or quotes need no escaping.
+    pub fn pg_config(&self) -> tokio_postgres::Config {
+        let mut cfg = tokio_postgres::Config::new();
+        cfg.host(&self.host)
+            .port(self.port)
+            .user(&self.user)
+            .password(&self.password)
+            .dbname(&self.dbname)
+            .ssl_mode(self.sslmode.to_postgres());
+        cfg
+    }
+
     pub fn connection_string(&self) -> String {
         format!(
             "host={} port={} user={} password={} dbname={}",
@@ -486,6 +552,8 @@ mod tests {
                 password: "secret".to_string(),
                 dbname: "testdb".to_string(),
                 pool_size: None,
+                sslmode: SslMode::default(),
+                sslrootcert: None,
             },
             sources,
             updates: UpdateConfig::default(),
@@ -632,6 +700,8 @@ mod tests {
             password: "p@ss".to_string(),
             dbname: "mydb".to_string(),
             pool_size: Some(10),
+            sslmode: SslMode::default(),
+            sslrootcert: None,
         };
 
         let conn_str = db.connection_string();
@@ -650,6 +720,8 @@ mod tests {
             password: "".to_string(),
             dbname: "tiles".to_string(),
             pool_size: None,
+            sslmode: SslMode::default(),
+            sslrootcert: None,
         };
 
         let conn_str = db.connection_string();
@@ -657,6 +729,84 @@ mod tests {
         assert!(conn_str.contains("port=5432"));
         assert!(conn_str.contains("user=postgres"));
         assert!(conn_str.contains("dbname=tiles"));
+    }
+
+    // --- [database] sslmode / sslrootcert parsing ---
+
+    fn parse_database(extra: &str) -> anyhow::Result<DatabaseConfig> {
+        let toml = format!(
+            "host = \"db\"\nport = 5432\nuser = \"u\"\npassword = \"p\"\ndbname = \"d\"\n{}",
+            extra
+        );
+        let settings = config::Config::builder()
+            .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+            .build()?;
+        Ok(settings.try_deserialize()?)
+    }
+
+    #[test]
+    fn test_sslmode_defaults_to_prefer_for_existing_configs() {
+        let db = parse_database("").unwrap();
+        assert_eq!(db.sslmode, SslMode::Prefer);
+        assert_eq!(db.sslrootcert, None);
+    }
+
+    #[test]
+    fn test_sslmode_parses_all_libpq_values() {
+        for (raw, expected) in [
+            ("disable", SslMode::Disable),
+            ("prefer", SslMode::Prefer),
+            ("require", SslMode::Require),
+            ("verify-ca", SslMode::VerifyCa),
+            ("verify-full", SslMode::VerifyFull),
+        ] {
+            let db = parse_database(&format!("sslmode = \"{}\"", raw)).unwrap();
+            assert_eq!(db.sslmode, expected, "sslmode = {}", raw);
+            assert_eq!(db.sslmode.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn test_sslmode_rejects_unknown_value() {
+        assert!(parse_database("sslmode = \"verify_full\"").is_err());
+        assert!(parse_database("sslmode = \"on\"").is_err());
+    }
+
+    #[test]
+    fn test_sslrootcert_parses() {
+        let db = parse_database("sslmode = \"verify-full\"\nsslrootcert = \"/etc/ssl/pg-ca.pem\"")
+            .unwrap();
+        assert_eq!(db.sslmode, SslMode::VerifyFull);
+        assert_eq!(db.sslrootcert.as_deref(), Some("/etc/ssl/pg-ca.pem"));
+    }
+
+    #[test]
+    fn test_sslmode_maps_to_tokio_postgres_handshake_mode() {
+        use tokio_postgres::config::SslMode as Pg;
+        assert_eq!(SslMode::Disable.to_postgres(), Pg::Disable);
+        assert_eq!(SslMode::Prefer.to_postgres(), Pg::Prefer);
+        assert_eq!(SslMode::Require.to_postgres(), Pg::Require);
+        assert_eq!(SslMode::VerifyCa.to_postgres(), Pg::Require);
+        assert_eq!(SslMode::VerifyFull.to_postgres(), Pg::Require);
+    }
+
+    #[test]
+    fn test_pg_config_carries_sslmode_and_unescaped_password() {
+        let db = DatabaseConfig {
+            host: "db".to_string(),
+            port: 6543,
+            user: "u".to_string(),
+            password: "has space'quote".to_string(),
+            dbname: "d".to_string(),
+            pool_size: None,
+            sslmode: SslMode::Require,
+            sslrootcert: None,
+        };
+        let cfg = db.pg_config();
+        assert_eq!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Require);
+        assert_eq!(cfg.get_password(), Some(&b"has space'quote"[..]));
+        assert_eq!(cfg.get_ports(), &[6543]);
+        assert_eq!(cfg.get_dbname(), Some("d"));
     }
 
     // --- ServeConfig defaults ---

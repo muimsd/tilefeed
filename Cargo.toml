@@ -19,6 +19,12 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-geo-t
 deadpool-postgres = { version = "0.14", features = ["serde"] }
 postgres-types = { version = "0.2", features = ["derive"] }
 
+# TLS to PostgreSQL (rustls 0.23 + ring, same stack reqwest already pulls in)
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "1"
+
 # SQLite for MBTiles
 rusqlite = { version = "0.31", features = ["bundled"] }
 

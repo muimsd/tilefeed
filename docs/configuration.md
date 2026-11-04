@@ -106,6 +106,29 @@ simplify_tolerance = 0.00001
 | `password` | string | yes | Database password |
 | `dbname` | string | yes | Database name |
 | `pool_size` | int | no | Connection pool size |
+| `sslmode` | string | no | TLS mode, libpq semantics: `"disable"`, `"prefer"` (default), `"require"`, `"verify-ca"`, `"verify-full"` |
+| `sslrootcert` | string | no | PEM file with the CA certificate(s) for `verify-ca` / `verify-full`. Defaults to the bundled Mozilla (webpki) roots |
+
+`sslmode` applies to both the connection pool and the LISTEN/NOTIFY connection:
+
+- `disable` — never use TLS.
+- `prefer` — use TLS when the server offers it, otherwise fall back to plaintext. The certificate is not verified. This is the default, so configs written before `sslmode` existed keep working.
+- `require` — TLS is mandatory; the certificate is not verified (as in libpq, setting `sslrootcert` upgrades this to `verify-ca`).
+- `verify-ca` — TLS is mandatory and the certificate chain must validate against `sslrootcert`; the hostname is not checked.
+- `verify-full` — as `verify-ca`, and the certificate must also match `host`.
+
+Managed providers (Supabase, Neon, RDS with `rds.force_ssl`, Cloud SQL, Crunchy Bridge) need at least `require`; prefer `verify-full` with the provider's CA bundle in `sslrootcert`.
+
+```toml
+[database]
+host = "db.example.com"
+port = 5432
+user = "tiles"
+password = "secret"
+dbname = "geodata"
+sslmode = "verify-full"
+sslrootcert = "/etc/ssl/certs/provider-ca.pem"
+```
 
 ### `[updates]`
 
