@@ -72,6 +72,10 @@ scrape_configs:
 | `tilefeed_tilejson_requests_total` | counter | `source`, `result` | TileJSON requests. `result`: `ok`, `not_found`, `bad_request` |
 | `tilefeed_sse_clients` | gauge | — | SSE clients currently connected to `/events` |
 | `tilefeed_sse_connections_total` | counter | — | SSE connections opened since start |
+| `tilefeed_tile_cache_requests_total` | counter | `source`, `result` | Tile cache lookups. `result`: `hit`, `miss`, `expired` |
+| `tilefeed_tile_cache_bytes` | gauge | — | Bytes held by the in-memory tile cache |
+| `tilefeed_tile_cache_evictions_total` | counter | — | Tiles evicted to stay within `max_size_mb` |
+| `tilefeed_tile_cache_invalidations_total` | counter | `source` | Cached tiles cleared because they changed (update or generation) |
 
 `empty` is a 204: the tile is genuinely absent from the MBTiles (no features there),
 which is normal and not an error.

@@ -66,7 +66,8 @@ flag rather than changing its command.
 
 - **ETags** — SHA-256 based content hashing with `If-None-Match` / 304 Not Modified support
 - **CORS** — Configurable origins or wildcard (default)
-- **Cache-Control** — `public, max-age=300` on tile responses
+- **Tile cache** — tiles are kept in memory with their ETag, so repeat requests skip SQLite entirely. Tiles are cleared from the cache as soon as an update rewrites them (see [Tile cache](#tile-cache))
+- **Cache-Control** — `public, max-age=300` on tile responses by default; set `max_age_secs` (`0` sends `no-cache`)
 - **TileJSON 3.0.0** — Auto-generated from source config, includes derived layers (`_labels`, `_boundary`)
 - **Content-Encoding** — `gzip` is advertised only when the stored tile bytes are actually gzipped
 - **[Prometheus metrics](metrics.md)** — Request counts, bytes served, and read latency per source
@@ -78,12 +79,34 @@ flag rather than changing its command.
 host = "0.0.0.0"     # bind address (default: 127.0.0.1)
 port = 3000           # port (default: 3000)
 cors_origins = ["http://localhost:8080"]  # omit for wildcard
+max_age_secs = 300    # Cache-Control max-age for tiles; 0 sends no-cache (default: 300)
+
+[serve.cache]
+enabled = true        # in-memory tile cache (default: true)
+max_size_mb = 64      # size budget; least recently used tiles are evicted (default: 64)
+# ttl_secs = 3600     # expire entries even if unchanged (default: unset)
 
 [metrics]
 enabled = true        # expose /metrics (default: true)
 path = "/metrics"     # metrics path (default: /metrics)
 # port = 9090         # serve metrics on their own listener instead of the tile port
 ```
+
+### Tile cache
+
+`serve` keeps recently requested tiles in memory, including empty (204) tiles, together with their ETag. A cache hit costs neither a SQLite read nor a hash.
+
+Old tiles are cleared from the cache as the data changes:
+
+- **Incremental updates.** After the updater commits a batch to MBTiles, it clears exactly the tiles it rewrote or deleted, so the next request reads the new tile. A request that read the store just before the commit is not allowed to put the old tile back in the cache.
+- **Writes by other processes.** If something else commits to a source's MBTiles file (a cron `generate`, a separate `watch`, a manual edit), the server notices within about 2 seconds and clears that source's cached tiles. It checks SQLite's `data_version`, which changes only when another connection commits. This does not cover a file that is *replaced* (renamed over) rather than written to: the server keeps reading the file it opened, with or without the cache, so restart `serve` after swapping files.
+- **TTL.** `ttl_secs` expires entries even when nothing changed, as an extra safety net.
+
+Only tiles at zooms the source has (`min_zoom`..`max_zoom`) are cached, so requests outside that range can't push real tiles out. Coordinates that don't exist at their zoom (`x` or `y` ≥ 2^z) get a 404.
+
+The cache only clears tiles held by this server. Browsers and CDNs keep their own copies for `max_age_secs`. For live-updating maps, set `max_age_secs = 0` (`Cache-Control: no-cache`): clients revalidate each tile with its ETag, unchanged tiles cost a 304 served from memory, and changed tiles show up immediately.
+
+Metrics: `tilefeed_tile_cache_requests_total{result="hit|miss|expired"}`, `tilefeed_tile_cache_bytes`, `tilefeed_tile_cache_evictions_total`, `tilefeed_tile_cache_invalidations_total`.
 
 ## Server-Sent Events (SSE)
 

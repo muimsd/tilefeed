@@ -336,6 +336,11 @@ pub struct Metrics {
     pub tilejson_requests: Family<Counter>,
     pub sse_clients: Family<Gauge>,
     pub sse_connections: Family<Counter>,
+    /// `result` is one of: hit, miss, expired.
+    pub tile_cache_requests: Family<Counter>,
+    pub tile_cache_bytes: Family<Gauge>,
+    pub tile_cache_evictions: Family<Counter>,
+    pub tile_cache_invalidations: Family<Counter>,
 
     // --- Full generation ---
     /// `result` is `success` or `failure`.
@@ -425,6 +430,30 @@ impl Metrics {
                 "tilefeed_sse_connections_total",
                 "SSE connections opened since start.",
                 &[],
+                Counter::default,
+            ),
+            tile_cache_requests: Family::new(
+                "tilefeed_tile_cache_requests_total",
+                "Tile cache lookups, by source and result (hit, miss, expired).",
+                &["source", "result"],
+                Counter::default,
+            ),
+            tile_cache_bytes: Family::new(
+                "tilefeed_tile_cache_bytes",
+                "Bytes currently held by the in-memory tile cache.",
+                &[],
+                Gauge::default,
+            ),
+            tile_cache_evictions: Family::new(
+                "tilefeed_tile_cache_evictions_total",
+                "Tiles evicted from the cache to stay within its size budget.",
+                &[],
+                Counter::default,
+            ),
+            tile_cache_invalidations: Family::new(
+                "tilefeed_tile_cache_invalidations_total",
+                "Cached tiles cleared because the tile changed (update or generation), by source.",
+                &["source"],
                 Counter::default,
             ),
 
@@ -540,6 +569,8 @@ impl Metrics {
         self.listener_reconnects.get().add(0);
         self.webhook_retries.get().add(0);
         self.webhook_failures.get().add(0);
+        self.tile_cache_bytes.get().set(0);
+        self.tile_cache_evictions.get().add(0);
 
         for result in ["routed", "unknown_layer", "invalid_payload"] {
             self.notifications.with(&[result]).add(0);
@@ -583,6 +614,10 @@ impl Metrics {
         self.tilejson_requests.encode(&mut out);
         self.sse_clients.encode(&mut out);
         self.sse_connections.encode(&mut out);
+        self.tile_cache_requests.encode(&mut out);
+        self.tile_cache_bytes.encode(&mut out);
+        self.tile_cache_evictions.encode(&mut out);
+        self.tile_cache_invalidations.encode(&mut out);
 
         self.generate_total.encode(&mut out);
         self.generate_duration.encode(&mut out);
@@ -962,6 +997,19 @@ mod tests {
         let out = metrics().render();
         assert!(out.contains("tilefeed_build_info{version=\""));
         assert!(out.contains("# TYPE tilefeed_uptime_seconds gauge"));
+    }
+
+    #[test]
+    fn test_registry_renders_tile_cache_metrics() {
+        let m = Metrics::new();
+        m.register_known_series();
+        m.tile_cache_requests.with(&["s", "hit"]).inc();
+        m.tile_cache_invalidations.with(&["s"]).add(2);
+        let out = m.render();
+        assert!(out.contains("tilefeed_tile_cache_requests_total{source=\"s\",result=\"hit\"} 1"));
+        assert!(out.contains("tilefeed_tile_cache_invalidations_total{source=\"s\"} 2"));
+        assert!(out.contains("tilefeed_tile_cache_bytes 0"));
+        assert!(out.contains("tilefeed_tile_cache_evictions_total 0"));
     }
 
     #[test]

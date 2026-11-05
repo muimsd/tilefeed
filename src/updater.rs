@@ -7,6 +7,7 @@ use tokio::time::{Duration, Instant};
 use tokio_postgres::AsyncMessage;
 use tracing::{error, info, warn};
 
+use crate::cache::TileCache;
 use crate::config::{AppConfig, DerivedGeomType};
 use crate::events::EventSender;
 use crate::mbtiles::MbtilesStore;
@@ -23,12 +24,19 @@ struct UpdateEvent {
     old_bounds: Option<Bounds>,
 }
 
+/// Where an applied update is reported: publishing, webhooks/SSE, tile cache.
+#[derive(Clone, Default)]
+pub struct UpdateOutputs {
+    pub publisher: Option<Arc<StoragePublisher>>,
+    pub event_tx: Option<EventSender>,
+    pub cache: Option<Arc<TileCache>>,
+}
+
 /// Start the LISTEN/NOTIFY listener for incremental tile updates with auto-reconnect
 pub async fn start_listener(
     config: Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
-    publisher: Option<Arc<StoragePublisher>>,
-    event_tx: Option<EventSender>,
+    outputs: UpdateOutputs,
 ) -> Result<()> {
     let mut retry_count: u32 = 0;
     let max_retry_delay_secs: u64 = 60;
@@ -37,11 +45,10 @@ pub async fn start_listener(
         // The listener only stops when the connection is gone. A real shutdown
         // aborts this task instead, so neither outcome here means "we are done":
         // returning would end the process, taking the HTTP tile server with it.
-        let reason =
-            match run_listener(&config, &stores, publisher.as_ref(), event_tx.as_ref()).await {
-                Ok(()) => "listener stopped without an error".to_string(),
-                Err(e) => format!("{:#}", e),
-            };
+        let reason = match run_listener(&config, &stores, &outputs).await {
+            Ok(()) => "listener stopped without an error".to_string(),
+            Err(e) => format!("{:#}", e),
+        };
 
         retry_count += 1;
         metrics().listener_reconnects.get().inc();
@@ -89,8 +96,7 @@ async fn next_batch<T>(
 async fn run_listener(
     config: &AppConfig,
     stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
-    publisher: Option<&Arc<StoragePublisher>>,
-    event_tx: Option<&EventSender>,
+    outputs: &UpdateOutputs,
 ) -> Result<()> {
     let tls = crate::pgtls::make_tls_connector(&config.database)?;
     let (client, mut connection) = config
@@ -159,8 +165,7 @@ async fn run_listener(
 
         if !parsed_events.is_empty() {
             if let Err(e) =
-                handle_batch_update(config, &reader, stores, publisher, event_tx, &parsed_events)
-                    .await
+                handle_batch_update(config, &reader, stores, outputs, &parsed_events).await
             {
                 error!("Failed to handle update batch: {}", e);
             }
@@ -343,8 +348,7 @@ async fn handle_batch_update(
     config: &AppConfig,
     reader: &PostgisReader,
     stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
-    publisher: Option<&Arc<StoragePublisher>>,
-    event_tx: Option<&EventSender>,
+    outputs: &UpdateOutputs,
     events: &[UpdateEvent],
 ) -> Result<()> {
     // Group events by source name
@@ -383,16 +387,7 @@ async fn handle_batch_update(
         };
 
         let started = std::time::Instant::now();
-        let result = update_source(
-            config,
-            reader,
-            source,
-            store,
-            publisher,
-            event_tx,
-            source_events,
-        )
-        .await;
+        let result = update_source(config, reader, source, store, outputs, source_events).await;
 
         metrics()
             .update_duration
@@ -414,10 +409,12 @@ async fn update_source(
     reader: &PostgisReader,
     source: &crate::config::SourceConfig,
     mbtiles: &Arc<Mutex<MbtilesStore>>,
-    publisher: Option<&Arc<StoragePublisher>>,
-    event_tx: Option<&EventSender>,
+    outputs: &UpdateOutputs,
     events: &[&UpdateEvent],
 ) -> Result<()> {
+    let publisher = outputs.publisher.as_ref();
+    let event_tx = outputs.event_tx.as_ref();
+    let cache = outputs.cache.as_ref();
     let mut all_affected: Vec<TileCoord> = Vec::new();
 
     for event in events {
@@ -515,6 +512,19 @@ async fn update_source(
 
     store.commit_transaction()?;
     drop(store);
+
+    // Clear the old versions of exactly these tiles from the server's cache.
+    // After the commit, so a request that misses reads the new tile; the
+    // cache's generation check drops any read that started before it.
+    if let Some(cache) = cache {
+        let cleared = cache.invalidate(&source.name, encoded.iter().map(|(c, _)| (c.z, c.x, c.y)));
+        if cleared > 0 {
+            info!(
+                "Cleared {} cached tile(s) for source '{}'",
+                cleared, source.name
+            );
+        }
+    }
 
     metrics()
         .tiles_written
