@@ -69,7 +69,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 
 - **`main.rs`** — CLI (clap), wires up all components, graceful shutdown (SIGTERM/Ctrl+C)
 - **`postgis.rs`** — PostGIS reader using `deadpool-postgres` connection pool. Exports GeoJSON, queries features by bounds or ID. Supports filter expressions, multiple geometry columns, connection retry, and layer validation.
-- **`pgtls.rs`** — rustls connector for PostgreSQL (`sslmode`/`sslrootcert`, libpq semantics). Shared by the pool and the LISTEN connection; both are built from `DatabaseConfig::pg_config()`, never from a connection string.
+- **`pgtls.rs`** — rustls connector for PostgreSQL (`sslmode`/`sslrootcert`, libpq semantics). Shared by the pool and the LISTEN connection; both are built from `DatabaseConfig::pg_config()`, never from a connection string. tokio-postgres calls `make_tls_connect` for every connection (hostname `""` for Unix sockets, even with TLS disabled), so the connector must never fail on construction — `PgTls` substitutes a placeholder name and `pg_config()` disables TLS for socket hosts.
 - **`mbtiles.rs`** — SQLite MBTiles store with WAL mode. Auto-materializes Tippecanoe's `tiles` view into a writable table on open. Includes inspect/diff query methods.
 - **`mvt.rs`** — Native MVT/protobuf encoder with geometry simplification (Douglas-Peucker via `geo` crate) and per-zoom property filtering. Uses `prost` with generated code from `vector_tile.proto`.
 - **`updater.rs`** — LISTEN/NOTIFY consumer with debounced batching and auto-reconnect with exponential backoff. Groups events by source, deduplicates affected tiles, regenerates concurrently (semaphore-bounded).
