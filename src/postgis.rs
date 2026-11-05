@@ -54,7 +54,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}" as feature_id,
+                "{id_col}"::bigint as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
@@ -130,7 +130,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}" as feature_id,
+                "{id_col}"::bigint as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties,
                 ST_XMin(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmin,
@@ -138,7 +138,7 @@ impl PostgisReader {
                 ST_XMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmax,
                 ST_YMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as ymax
             FROM "{schema}"."{table}"
-            WHERE "{id_col}" = $1 AND "{geom_col}" IS NOT NULL"#,
+            WHERE "{id_col}" = $1::bigint AND "{geom_col}" IS NOT NULL"#,
             table = layer.table,
         );
 
@@ -193,7 +193,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}" as feature_id,
+                "{id_col}"::bigint as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
@@ -274,7 +274,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}" as feature_id,
+                "{id_col}"::bigint as feature_id,
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
@@ -367,7 +367,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}" as feature_id,
+                "{id_col}"::bigint as feature_id,
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
