@@ -106,6 +106,31 @@ simplify_tolerance = 0.00001
 | `password` | string | yes | Database password |
 | `dbname` | string | yes | Database name |
 | `pool_size` | int | no | Connection pool size |
+| `sslmode` | string | no | TLS mode, libpq semantics: `"disable"`, `"prefer"` (default), `"require"`, `"verify-ca"`, `"verify-full"` |
+| `sslrootcert` | string | no | PEM file with the CA certificate(s) to verify the server against. Required for `verify-ca`; for `verify-full` defaults to the bundled Mozilla (webpki) roots |
+
+`sslmode` applies to both the connection pool and the LISTEN/NOTIFY connection:
+
+- `disable` — never use TLS.
+- `prefer` — use TLS when the server offers it, otherwise fall back to plaintext. The certificate is not verified. This is the default, so configs written before `sslmode` existed keep working. Unlike libpq, a TLS handshake that *fails* (for example a server that only speaks TLS 1.0/1.1) is an error, not a plaintext retry; set `disable` for such servers.
+- `require` — TLS is mandatory; the certificate is not verified (as in libpq, setting `sslrootcert` upgrades this to `verify-ca`).
+- `verify-ca` — TLS is mandatory and the certificate chain must validate against `sslrootcert`; the hostname is not checked. `sslrootcert` is required: against the public roots, a chain-only check would accept any publicly trusted certificate.
+- `verify-full` — the certificate chain must validate (against `sslrootcert`, or the bundled public roots when unset) and match `host`.
+
+A `host` starting with `/` is a Unix-socket directory. PostgreSQL has no TLS over Unix sockets, so `sslmode` is ignored there, as in libpq.
+
+Managed providers (Supabase, Neon, RDS with `rds.force_ssl`, Cloud SQL, Crunchy Bridge) need at least `require`; prefer `verify-full` with the provider's CA bundle in `sslrootcert`.
+
+```toml
+[database]
+host = "db.example.com"
+port = 5432
+user = "tiles"
+password = "secret"
+dbname = "geodata"
+sslmode = "verify-full"
+sslrootcert = "/etc/ssl/certs/provider-ca.pem"
+```
 
 ### `[updates]`
 
@@ -169,7 +194,9 @@ See [Metrics](metrics.md) for the full metric reference.
 | `properties` | string[] | no | Properties to include in tiles |
 | `filter` | string | no | SQL WHERE clause to filter features |
 | `simplify_tolerance` | float | no | Douglas-Peucker tolerance in degrees (scaled per zoom) |
-| `generate_label_points` | bool | no | Generate `{name}_labels` centroid layer |
+| `generate_label_points` | bool | no | Generate `{name}_labels` point layer (see derived-layers.md) |
+| `label_point_method` | string | no | `point_on_surface` (default) or `centroid` |
+| `label_point_column` | string | no | Use this existing point column as the label point; overrides `label_point_method` |
 | `generate_boundary_lines` | bool | no | Generate `{name}_boundary` polyline layer |
 
 ### `[[sources.layers.property_rules]]`
@@ -221,6 +248,8 @@ Requires `ogr2ogr` from [GDAL](https://gdal.org/). Exports via OGR and converts 
 ### Native
 
 No external dependencies. Uses tilefeed's built-in Rust MVT encoder to generate tiles directly from PostGIS queries. Supports geometry simplification and derived layers. Best for development or environments where installing external tools is impractical.
+
+Generation only visits tiles that can hold data: it computes the data extent (`ST_Extent` of every layer, in EPSG:4326), queries every tile inside it at `min_zoom`, and then descends only into the children of tiles that had features. Tile queries run concurrently, up to `pool_size`.
 
 ```toml
 [[sources]]

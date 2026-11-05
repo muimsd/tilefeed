@@ -28,6 +28,61 @@ pub struct DatabaseConfig {
     pub password: String,
     pub dbname: String,
     pub pool_size: Option<usize>,
+    /// TLS mode for PostgreSQL connections, with libpq semantics:
+    /// "disable" | "prefer" (default) | "require" | "verify-ca" | "verify-full".
+    #[serde(default)]
+    pub sslmode: SslMode,
+    /// PEM file with the CA certificate(s) used to verify the server in
+    /// "verify-ca"/"verify-full" mode (and, as in libpq, in "require" mode
+    /// when set). Required for "verify-ca"; for "verify-full" the bundled
+    /// Mozilla (webpki) roots are used when unset.
+    #[serde(default)]
+    pub sslrootcert: Option<String>,
+}
+
+/// PostgreSQL TLS mode. Mirrors libpq's `sslmode` values (except "allow").
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SslMode {
+    /// Never use TLS.
+    Disable,
+    /// Use TLS if the server supports it, otherwise fall back to plaintext.
+    /// The certificate is not verified. This is libpq's default and keeps
+    /// configs written before `sslmode` existed working against non-TLS servers.
+    /// Unlike libpq, a failed TLS handshake is an error, not a plaintext retry.
+    #[default]
+    Prefer,
+    /// Always use TLS; fail if the server refuses it. The certificate is not
+    /// verified unless `sslrootcert` is set (then behaves like "verify-ca").
+    Require,
+    /// Always use TLS and verify the certificate chain, but not the hostname.
+    VerifyCa,
+    /// Always use TLS, verify the certificate chain and that the hostname matches.
+    VerifyFull,
+}
+
+impl SslMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
+        }
+    }
+
+    /// The handshake mode tokio-postgres should use. Verification is handled
+    /// separately by the rustls connector.
+    pub fn to_postgres(self) -> tokio_postgres::config::SslMode {
+        match self {
+            SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+            SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+                tokio_postgres::config::SslMode::Require
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -40,6 +95,58 @@ pub enum GenerationBackend {
     Gdal,
     /// Use the built-in native Rust MVT encoder (no external dependencies)
     Native,
+}
+
+/// How a polygon's label point is derived.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelPointMethod {
+    /// ST_PointOnSurface: always inside the polygon, the right choice for labels (default).
+    #[default]
+    PointOnSurface,
+    /// ST_Centroid: the true center of mass. Can fall outside concave or multi-part polygons.
+    Centroid,
+}
+
+impl LayerConfig {
+    /// SQL expression for this layer's label point, in EPSG:4326.
+    /// The column a derived layer's rows are drawn from: `label_point_column`
+    /// for label points when set, the geometry column otherwise. Derived
+    /// queries filter on this column (non-null, intersecting the tile), so a
+    /// hand-placed label point lands in the tile that contains it.
+    pub fn derived_source_column<'a>(
+        &'a self,
+        derived_type: DerivedGeomType,
+        geom_col: &'a str,
+    ) -> &'a str {
+        match (derived_type, &self.label_point_column) {
+            (DerivedGeomType::LabelPoint, Some(col)) if self.generate_label_points => col,
+            _ => geom_col,
+        }
+    }
+
+    /// The label point column, when label points are generated from one.
+    pub fn active_label_column(&self) -> Option<&str> {
+        if self.generate_label_points {
+            self.label_point_column.as_deref()
+        } else {
+            None
+        }
+    }
+
+    pub fn label_point_sql(&self, geom_col: &str) -> String {
+        if let Some(col) = &self.label_point_column {
+            return format!("ST_Transform(\"{col}\", 4326)");
+        }
+        match self.label_point_method {
+            LabelPointMethod::PointOnSurface => {
+                format!("ST_PointOnSurface(ST_Transform(\"{geom_col}\", 4326))")
+            }
+            LabelPointMethod::Centroid => {
+                format!("ST_Centroid(ST_Transform(\"{geom_col}\", 4326))")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,11 +231,18 @@ pub struct LayerConfig {
     /// Properties to exclude at zoom levels below this threshold
     /// e.g. `{ below_zoom = 10, exclude = ["description", "metadata"] }`
     pub property_rules: Option<Vec<PropertyRule>>,
-    /// Automatically generate a centroid point layer for labels.
-    /// Creates a companion layer named `{name}_labels` with Point geometry
-    /// derived from ST_PointOnSurface of the polygon.
+    /// Automatically generate a point layer for labels.
+    /// Creates a companion layer named `{name}_labels` with one Point per feature,
+    /// computed with `label_point_method` or read from `label_point_column`.
     #[serde(default)]
     pub generate_label_points: bool,
+    /// How label points are computed (default `point_on_surface`).
+    #[serde(default)]
+    pub label_point_method: LabelPointMethod,
+    /// Use this existing point column of the table as the label point instead of computing one
+    /// (e.g. a hand-placed `label_geom`). Overrides `label_point_method`.
+    #[serde(default)]
+    pub label_point_column: Option<String>,
     /// Automatically generate a boundary polyline layer.
     /// Creates a companion layer named `{name}_boundary` with LineString geometry
     /// derived from ST_Boundary of the polygon.
@@ -324,11 +438,32 @@ impl AppConfig {
 }
 
 impl DatabaseConfig {
-    pub fn connection_string(&self) -> String {
-        format!(
-            "host={} port={} user={} password={} dbname={}",
-            self.host, self.port, self.user, self.password, self.dbname
-        )
+    /// Build a tokio-postgres config. Values are set field by field, so
+    /// passwords containing spaces or quotes need no escaping.
+    pub fn pg_config(&self) -> tokio_postgres::Config {
+        let mut cfg = tokio_postgres::Config::new();
+        cfg.host(&self.host)
+            .port(self.port)
+            .user(&self.user)
+            .password(&self.password)
+            .dbname(&self.dbname)
+            .ssl_mode(self.effective_ssl_mode());
+        cfg
+    }
+
+    /// A host starting with `/` is a Unix-socket directory. PostgreSQL does
+    /// not offer TLS over Unix sockets and libpq ignores `sslmode` for them,
+    /// so TLS is disabled there whatever `sslmode` says.
+    pub fn is_unix_socket(&self) -> bool {
+        self.host.starts_with('/')
+    }
+
+    fn effective_ssl_mode(&self) -> tokio_postgres::config::SslMode {
+        if self.is_unix_socket() {
+            tokio_postgres::config::SslMode::Disable
+        } else {
+            self.sslmode.to_postgres()
+        }
     }
 }
 
@@ -440,7 +575,28 @@ pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
         .build()?;
 
     let cfg: AppConfig = settings.try_deserialize()?;
+    check_label_point_columns(&cfg)?;
     Ok(cfg)
+}
+
+/// `label_point_column` is spliced into SQL as a quoted identifier, so only plain identifiers are allowed.
+fn check_label_point_columns(cfg: &AppConfig) -> anyhow::Result<()> {
+    for source in &cfg.sources {
+        for layer in &source.layers {
+            if let Some(col) = &layer.label_point_column {
+                let ok =
+                    !col.is_empty() && col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ok {
+                    anyhow::bail!(
+                        "layer \"{}\": label_point_column \"{}\" must be a plain column name (letters, digits, underscore)",
+                        layer.name,
+                        col
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -462,6 +618,8 @@ mod tests {
             property_rules: None,
             generate_label_points: false,
             generate_boundary_lines: false,
+            label_point_method: Default::default(),
+            label_point_column: None,
         }
     }
 
@@ -486,6 +644,8 @@ mod tests {
                 password: "secret".to_string(),
                 dbname: "testdb".to_string(),
                 pool_size: None,
+                sslmode: SslMode::default(),
+                sslrootcert: None,
             },
             sources,
             updates: UpdateConfig::default(),
@@ -621,42 +781,167 @@ mod tests {
         assert_eq!(config.worker_concurrency, Some(8));
     }
 
-    // --- DatabaseConfig::connection_string tests ---
+    // --- DatabaseConfig::pg_config ---
 
     #[test]
-    fn test_connection_string_format() {
-        let db = DatabaseConfig {
-            host: "db.example.com".to_string(),
-            port: 5433,
-            user: "admin".to_string(),
-            password: "p@ss".to_string(),
-            dbname: "mydb".to_string(),
-            pool_size: Some(10),
-        };
-
-        let conn_str = db.connection_string();
+    fn test_unix_socket_host_disables_tls() {
+        let mut db = parse_database("sslmode = \"require\"").unwrap();
+        db.host = "/var/run/postgresql".to_string();
+        assert!(db.is_unix_socket());
         assert_eq!(
-            conn_str,
-            "host=db.example.com port=5433 user=admin password=p@ss dbname=mydb"
+            db.pg_config().get_ssl_mode(),
+            tokio_postgres::config::SslMode::Disable
+        );
+        db.host = "db.example.com".to_string();
+        assert!(!db.is_unix_socket());
+        assert_eq!(
+            db.pg_config().get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require
+        );
+    }
+
+    // --- label point method / column ---
+
+    fn parse_layer(extra: &str) -> LayerConfig {
+        let toml = format!(
+            "name = \"parcels\"\ntable = \"parcels\"\ngenerate_label_points = true\n{}",
+            extra
+        );
+        config::Config::builder()
+            .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_label_point_method_defaults_to_point_on_surface() {
+        let l = parse_layer("");
+        assert_eq!(l.label_point_method, LabelPointMethod::PointOnSurface);
+        assert_eq!(
+            l.label_point_sql("geom"),
+            "ST_PointOnSurface(ST_Transform(\"geom\", 4326))"
         );
     }
 
     #[test]
-    fn test_connection_string_default_port() {
-        let db = DatabaseConfig {
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "postgres".to_string(),
-            password: "".to_string(),
-            dbname: "tiles".to_string(),
-            pool_size: None,
-        };
+    fn test_label_point_method_centroid() {
+        let l = parse_layer("label_point_method = \"centroid\"");
+        assert_eq!(
+            l.label_point_sql("geom"),
+            "ST_Centroid(ST_Transform(\"geom\", 4326))"
+        );
+    }
 
-        let conn_str = db.connection_string();
-        assert!(conn_str.contains("host=localhost"));
-        assert!(conn_str.contains("port=5432"));
-        assert!(conn_str.contains("user=postgres"));
-        assert!(conn_str.contains("dbname=tiles"));
+    #[test]
+    fn test_label_point_column_overrides_method() {
+        let l =
+            parse_layer("label_point_method = \"centroid\"\nlabel_point_column = \"label_geom\"");
+        assert_eq!(
+            l.label_point_sql("geom"),
+            "ST_Transform(\"label_geom\", 4326)"
+        );
+    }
+
+    #[test]
+    fn test_label_point_method_rejects_unknown_values() {
+        let toml = "name = \"p\"\ntable = \"p\"\nlabel_point_method = \"middle\"";
+        let r: Result<LayerConfig, _> = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_label_point_column_must_be_a_plain_identifier() {
+        let mut source = sample_source("s", &["parcels"]);
+        source.layers[0].label_point_column = Some("geom\"; DROP TABLE x; --".to_string());
+        let cfg = sample_config(vec![source]);
+        assert!(check_label_point_columns(&cfg).is_err());
+        let mut ok = sample_source("s", &["parcels"]);
+        ok.layers[0].label_point_column = Some("label_geom".to_string());
+        assert!(check_label_point_columns(&sample_config(vec![ok])).is_ok());
+    }
+
+    // --- [database] sslmode / sslrootcert parsing ---
+
+    fn parse_database(extra: &str) -> anyhow::Result<DatabaseConfig> {
+        let toml = format!(
+            "host = \"db\"\nport = 5432\nuser = \"u\"\npassword = \"p\"\ndbname = \"d\"\n{}",
+            extra
+        );
+        let settings = config::Config::builder()
+            .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+            .build()?;
+        Ok(settings.try_deserialize()?)
+    }
+
+    #[test]
+    fn test_sslmode_defaults_to_prefer_for_existing_configs() {
+        let db = parse_database("").unwrap();
+        assert_eq!(db.sslmode, SslMode::Prefer);
+        assert_eq!(db.sslrootcert, None);
+    }
+
+    #[test]
+    fn test_sslmode_parses_all_libpq_values() {
+        for (raw, expected) in [
+            ("disable", SslMode::Disable),
+            ("prefer", SslMode::Prefer),
+            ("require", SslMode::Require),
+            ("verify-ca", SslMode::VerifyCa),
+            ("verify-full", SslMode::VerifyFull),
+        ] {
+            let db = parse_database(&format!("sslmode = \"{}\"", raw)).unwrap();
+            assert_eq!(db.sslmode, expected, "sslmode = {}", raw);
+            assert_eq!(db.sslmode.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn test_sslmode_rejects_unknown_value() {
+        assert!(parse_database("sslmode = \"verify_full\"").is_err());
+        assert!(parse_database("sslmode = \"on\"").is_err());
+    }
+
+    #[test]
+    fn test_sslrootcert_parses() {
+        let db = parse_database("sslmode = \"verify-full\"\nsslrootcert = \"/etc/ssl/pg-ca.pem\"")
+            .unwrap();
+        assert_eq!(db.sslmode, SslMode::VerifyFull);
+        assert_eq!(db.sslrootcert.as_deref(), Some("/etc/ssl/pg-ca.pem"));
+    }
+
+    #[test]
+    fn test_sslmode_maps_to_tokio_postgres_handshake_mode() {
+        use tokio_postgres::config::SslMode as Pg;
+        assert_eq!(SslMode::Disable.to_postgres(), Pg::Disable);
+        assert_eq!(SslMode::Prefer.to_postgres(), Pg::Prefer);
+        assert_eq!(SslMode::Require.to_postgres(), Pg::Require);
+        assert_eq!(SslMode::VerifyCa.to_postgres(), Pg::Require);
+        assert_eq!(SslMode::VerifyFull.to_postgres(), Pg::Require);
+    }
+
+    #[test]
+    fn test_pg_config_carries_sslmode_and_unescaped_password() {
+        let db = DatabaseConfig {
+            host: "db".to_string(),
+            port: 6543,
+            user: "u".to_string(),
+            password: "has space'quote".to_string(),
+            dbname: "d".to_string(),
+            pool_size: None,
+            sslmode: SslMode::Require,
+            sslrootcert: None,
+        };
+        let cfg = db.pg_config();
+        assert_eq!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Require);
+        assert_eq!(cfg.get_password(), Some(&b"has space'quote"[..]));
+        assert_eq!(cfg.get_ports(), &[6543]);
+        assert_eq!(cfg.get_dbname(), Some("d"));
     }
 
     // --- ServeConfig defaults ---

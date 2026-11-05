@@ -69,6 +69,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 
 - **`main.rs`** — CLI (clap), wires up all components, graceful shutdown (SIGTERM/Ctrl+C)
 - **`postgis.rs`** — PostGIS reader using `deadpool-postgres` connection pool. Exports GeoJSON, queries features by bounds or ID. Supports filter expressions, multiple geometry columns, connection retry, and layer validation.
+- **`pgtls.rs`** — rustls connector for PostgreSQL (`sslmode`/`sslrootcert`, libpq semantics). Shared by the pool and the LISTEN connection; both are built from `DatabaseConfig::pg_config()`, never from a connection string. tokio-postgres calls `make_tls_connect` for every connection (hostname `""` for Unix sockets, even with TLS disabled), so the connector must never fail on construction — `PgTls` substitutes a placeholder name and `pg_config()` disables TLS for socket hosts.
 - **`mbtiles.rs`** — SQLite MBTiles store with WAL mode. Auto-materializes Tippecanoe's `tiles` view into a writable table on open. Includes inspect/diff query methods.
 - **`mvt.rs`** — Native MVT/protobuf encoder with geometry simplification (Douglas-Peucker via `geo` crate) and per-zoom property filtering. Uses `prost` with generated code from `vector_tile.proto`.
 - **`updater.rs`** — LISTEN/NOTIFY consumer with debounced batching and auto-reconnect with exponential backoff. Groups events by source, deduplicates affected tiles, regenerates concurrently (semaphore-bounded).
@@ -77,7 +78,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **`webhook.rs`** — Webhook notifier with HMAC-SHA256 signing, retry with exponential backoff, and optional trailing-edge cooldown/throttle per source.
 - **`metrics.rs`** — Prometheus registry (counters, gauges, histograms) and text exposition format, plus a dedicated listener for commands with no tile server. Process-wide singleton via `metrics()`. Labels must stay low-cardinality and must never carry request-supplied values.
 - **`storage.rs`** — Publishing abstraction for MBTiles artifact sync to local filesystem, S3 (`aws s3 cp`), Mapbox Studio, or custom shell command.
-- **`tiles.rs`** — Tile math: XYZ coordinate ↔ lon/lat bounds conversion, tiles-for-bounds enumeration.
+- **`tiles.rs`** — Tile math: XYZ coordinate ↔ lon/lat bounds conversion, tiles-for-bounds enumeration, quadtree child expansion (`children_within`).
 - **`config.rs`** — Config deserialization from TOML + env vars (prefix `TILES_`).
 - **`pmtiles.rs`** — PMTiles v3 writer: Hilbert tile IDs, varint directories with leaf fallback, content dedup and run collapsing. Archives are verified by re-reading before `export` reports success.
 - **`inspect.rs`** — MBTiles inspection (metadata, tile counts per zoom, sizes).
@@ -94,12 +95,14 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **Auto-reconnect**: The LISTEN/NOTIFY listener reconnects with exponential backoff if the PostgreSQL connection drops.
 - **One route parameter per path segment**: axum rejects patterns like `/{y}.pbf` or `/{source}.json` at startup (a panic, inside the spawned server task). File extensions are captured as part of the parameter and parsed in the handler.
 - **PMTiles tile IDs are XYZ, MBTiles rows are TMS**: `all_tile_coords()` returns TMS rows and pairs with `get_tile_raw_tms()`; `get_tile()` takes XYZ and flips internally. Mixing the two silently drops or mis-maps tiles.
+- **Native generation walks the quadtree, never the world**: `generate_with_native` starts from the data extent (`get_layer_extent`, union over layers) at `min_zoom` and only expands children of non-empty tiles. Any new per-tile query must keep "child non-empty ⇒ parent non-empty" true (same predicate at every zoom), or pruning will drop tiles.
 - **Server tests build the production router**: `build_router()` is what both `start_server` and the tests use. Tests must never declare their own route patterns — a test harness that did exactly that hid a startup panic through two releases.
 
 ### Config (`config.toml`)
 
 Sources are defined under `[[sources]]` with: `name`, `mbtiles_path`, `min_zoom`, `max_zoom`.
 Layers within each source are defined under `[[sources.layers]]` with: `name`, `table`, `schema`, `geometry_column`, `geometry_columns`, `id_column`, `srid`, `properties`, `filter`, `simplify_tolerance`, `property_rules`. The `name` field must match the trigger argument in `sql/setup_notify.sql`.
+Database settings live under `[database]` (`host`, `port`, `user`, `password`, `dbname`, `pool_size`, `sslmode`, `sslrootcert`).
 Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
 Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
 HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`).

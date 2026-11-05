@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use futures_util::stream::{self, StreamExt};
 use std::collections::HashMap;
 use tracing::info;
 
@@ -6,7 +7,7 @@ use crate::config::{DerivedGeomType, GenerationBackend, SourceConfig};
 use crate::mbtiles::MbtilesStore;
 use crate::mvt;
 use crate::postgis::PostgisReader;
-use crate::tiles::{tiles_for_bounds, TileCoord};
+use crate::tiles::{children_within, expand_bounds, tiles_for_bounds, union_bounds, TileCoord};
 
 /// Generate MBTiles for a single source using the configured backend
 pub async fn generate_source(
@@ -322,89 +323,84 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
     let layer_configs: HashMap<String, &crate::config::LayerConfig> =
         source.layers.iter().map(|l| (l.name.clone(), l)).collect();
 
-    // Compute the global bounds by querying all features across all layers
-    // Use world bounds as a conservative starting point
-    let world_bounds = crate::postgis::Bounds {
-        min_lon: -180.0,
-        min_lat: -85.051129,
-        max_lon: 180.0,
-        max_lat: 85.051129,
+    // Only tiles intersecting the data extent (union over layers, EPSG:4326)
+    // can hold features. Derived geometries lie within their source geometry,
+    // except points from a label_point_column, which get_layer_extent also
+    // covers.
+    let mut extent: Option<crate::postgis::Bounds> = None;
+    for layer in &source.layers {
+        if let Some(b) = reader.get_layer_extent(layer).await? {
+            extent = Some(match extent {
+                Some(e) => union_bounds(&e, &b),
+                None => b,
+            });
+        }
+    }
+    let Some(extent) = extent else {
+        info!(
+            "Native generation complete for source '{}': no features, 0 tiles at {}",
+            source.name, source.mbtiles_path
+        );
+        return Ok(());
     };
+    // A small margin so features touching the extent edge still reach the
+    // neighbouring tile whose border they touch, as a full scan would.
+    let extent = expand_bounds(&extent, EXTENT_MARGIN_DEG);
+    info!(
+        "Data extent for source '{}': [{:.6}, {:.6}, {:.6}, {:.6}]",
+        source.name, extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat
+    );
 
-    let _all_tiles = tiles_for_bounds(&world_bounds, source.min_zoom, source.min_zoom);
-
-    // Process zoom by zoom to manage memory
+    let concurrency = reader.max_connections().max(1);
     let mut total_tiles = 0u64;
 
+    // Walk the quadtree top-down: every tile in the extent at min_zoom, then
+    // only children of tiles that had data. A child's envelope lies inside its
+    // parent's, so an empty parent implies empty children.
+    let mut level = tiles_for_bounds(&extent, source.min_zoom, source.min_zoom);
     for z in source.min_zoom..=source.max_zoom {
-        let max_tile = (1u32 << z) - 1;
-        let mut zoom_tiles = 0u64;
+        if level.is_empty() {
+            break;
+        }
+        let candidates = level.len();
+        let layer_configs = &layer_configs;
+        let mut results = stream::iter(level.into_iter().map(|tile| async move {
+            let features = fetch_tile_features(source, reader, &tile).await?;
+            let encoded = if features.is_empty() {
+                None
+            } else {
+                Some(mvt::encode_tile_with_config(
+                    &tile,
+                    &features,
+                    layer_configs,
+                )?)
+            };
+            Ok::<_, anyhow::Error>((tile, encoded))
+        }))
+        .buffer_unordered(concurrency);
 
-        // For each tile at this zoom, check if any features intersect
-        for x in 0..=max_tile {
-            for y in 0..=max_tile {
-                let tile_coord = TileCoord { z, x, y };
-                let bounds = tile_coord.bounds();
-
-                let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> =
-                    HashMap::new();
-
-                for layer in &source.layers {
-                    let features = reader.get_features_in_bounds(layer, &bounds).await?;
-                    if !features.is_empty() {
-                        features_by_layer.insert(layer.name.clone(), features);
-                    }
-
-                    // Derived label points
-                    if layer.generate_label_points {
-                        let label_features = reader
-                            .get_derived_features_in_bounds(
-                                layer,
-                                DerivedGeomType::LabelPoint,
-                                &bounds,
-                            )
-                            .await?;
-                        if !label_features.is_empty() {
-                            features_by_layer
-                                .insert(format!("{}_labels", layer.name), label_features);
-                        }
-                    }
-
-                    // Derived boundary lines
-                    if layer.generate_boundary_lines {
-                        let boundary_features = reader
-                            .get_derived_features_in_bounds(
-                                layer,
-                                DerivedGeomType::BoundaryLine,
-                                &bounds,
-                            )
-                            .await?;
-                        if !boundary_features.is_empty() {
-                            features_by_layer
-                                .insert(format!("{}_boundary", layer.name), boundary_features);
-                        }
-                    }
-                }
-
-                if !features_by_layer.is_empty() {
-                    let tile_data = mvt::encode_tile_with_config(
-                        &tile_coord,
-                        &features_by_layer,
-                        &layer_configs,
-                    )?;
-                    store.put_tile(z, x, y, &tile_data)?;
-                    zoom_tiles += 1;
-                }
+        let mut non_empty = Vec::new();
+        while let Some(result) = results.next().await {
+            let (tile, encoded) = result?;
+            if let Some(tile_data) = encoded {
+                store.put_tile(tile.z, tile.x, tile.y, &tile_data)?;
+                non_empty.push(tile);
             }
         }
+        drop(results);
 
-        if zoom_tiles > 0 {
-            info!(
-                "Zoom {}: generated {} tiles for source '{}'",
-                z, zoom_tiles, source.name
-            );
-        }
+        let zoom_tiles = non_empty.len() as u64;
+        info!(
+            "Zoom {}: generated {} tiles ({} candidates) for source '{}'",
+            z, zoom_tiles, candidates, source.name
+        );
         total_tiles += zoom_tiles;
+
+        level = if z < source.max_zoom {
+            children_within(&non_empty, &extent)
+        } else {
+            Vec::new()
+        };
     }
 
     info!(
@@ -413,6 +409,48 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
     );
 
     Ok(())
+}
+
+/// Margin (degrees, ~10 cm) added around the data extent before tiling.
+const EXTENT_MARGIN_DEG: f64 = 1e-6;
+
+/// Query every layer (and derived layer) of `source` for one tile.
+async fn fetch_tile_features(
+    source: &SourceConfig,
+    reader: &PostgisReader,
+    tile: &TileCoord,
+) -> Result<HashMap<String, Vec<crate::postgis::FeatureData>>> {
+    let bounds = tile.bounds();
+    let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
+
+    for layer in &source.layers {
+        let features = reader.get_features_in_bounds(layer, &bounds).await?;
+        if !features.is_empty() {
+            features_by_layer.insert(layer.name.clone(), features);
+        }
+
+        // Derived label points
+        if layer.generate_label_points {
+            let label_features = reader
+                .get_derived_features_in_bounds(layer, DerivedGeomType::LabelPoint, &bounds)
+                .await?;
+            if !label_features.is_empty() {
+                features_by_layer.insert(format!("{}_labels", layer.name), label_features);
+            }
+        }
+
+        // Derived boundary lines
+        if layer.generate_boundary_lines {
+            let boundary_features = reader
+                .get_derived_features_in_bounds(layer, DerivedGeomType::BoundaryLine, &bounds)
+                .await?;
+            if !boundary_features.is_empty() {
+                features_by_layer.insert(format!("{}_boundary", layer.name), boundary_features);
+            }
+        }
+    }
+
+    Ok(features_by_layer)
 }
 
 #[cfg(test)]

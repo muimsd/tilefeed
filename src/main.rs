@@ -6,6 +6,7 @@ mod inspect;
 mod mbtiles;
 mod metrics;
 mod mvt;
+mod pgtls;
 mod pmtiles;
 mod postgis;
 mod server;

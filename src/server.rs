@@ -442,6 +442,8 @@ mod tests {
                 password: "secret".to_string(),
                 dbname: "test".to_string(),
                 pool_size: None,
+                sslmode: SslMode::default(),
+                sslrootcert: None,
             },
             sources: vec![SourceConfig {
                 name: "test_source".to_string(),
@@ -463,6 +465,8 @@ mod tests {
                     property_rules: None,
                     generate_label_points: true,
                     generate_boundary_lines: false,
+                    label_point_method: Default::default(),
+                    label_point_column: None,
                 }],
                 tippecanoe: TippecanoeConfig::default(),
             }],

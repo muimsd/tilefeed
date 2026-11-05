@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Label point method.** Layers with `generate_label_points = true` accept `label_point_method` (`point_on_surface`, the default and previous behaviour, or `centroid` for the center of mass) and `label_point_column` (use an existing point column instead of computing one).
+
+- **TLS to PostgreSQL.** New `[database]` keys `sslmode` (`disable` | `prefer` | `require` | `verify-ca` | `verify-full`, libpq semantics, default `prefer`) and `sslrootcert`. Uses rustls (ring) for both the connection pool and the LISTEN/NOTIFY connection, so managed databases that enforce TLS (Supabase, Neon, RDS, Cloud SQL, Crunchy Bridge) can now be reached. `verify-ca` requires `sslrootcert`; `verify-full` verifies against `sslrootcert` or the bundled webpki roots. Unix-socket hosts never use TLS, as in libpq.
+
+### Fixed
+
+- **The native generator no longer walks the whole world.** `generation_backend = "native"` iterated every `x,y` at every zoom and issued a query per tile per layer, so even a 900-row table at z10–15 never finished. It now restricts tiles to the data extent and descends the quadtree only below non-empty tiles, running tile queries concurrently. Output for tiles with data is unchanged.
+- Listener reconnect logs now include the underlying cause (e.g. `server does not support TLS`) instead of only the outermost error context.
+- Database connections are configured field by field rather than through a `key=value` string, so passwords containing spaces or quotes work for the LISTEN connection.
+
 ## [0.9.0] - 2026-09-12
 
 ### Added

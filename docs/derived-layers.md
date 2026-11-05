@@ -4,7 +4,15 @@ tilefeed can automatically generate companion layers from polygon geometries, us
 
 ## Label Points
 
-Set `generate_label_points = true` on a polygon layer to create a companion point layer named `{name}_labels`. Each point is computed using PostGIS `ST_PointOnSurface`, which guarantees the point lies within the polygon (unlike centroids which can fall outside concave shapes).
+Set `generate_label_points = true` on a polygon layer to create a companion point layer named `{name}_labels`, one point per feature with the same id and properties. Choose how the point is made:
+
+| Setting | Point | Use it when |
+|---|---|---|
+| `label_point_method = "point_on_surface"` (default) | PostGIS `ST_PointOnSurface` | Labels and icons. Always inside the polygon, even for C-shapes, rings and multi-part features. |
+| `label_point_method = "centroid"` | PostGIS `ST_Centroid` (center of mass) | Analysis or symbols that should sit at the geometric center. Can fall outside concave or multi-part polygons. |
+| `label_point_column = "label_geom"` | An existing point column of the table | You place label points yourself (or maintain them with a trigger). Overrides `label_point_method`. Must be a plain column name. |
+
+Label points are regenerated with the polygons, including incremental updates from LISTEN/NOTIFY. With `label_point_column`, rows are placed by that column (a row whose label column is NULL gets no label), and a point outside its polygon still lands in the tile that contains it. On an update, tiles at the point's new position are refreshed; the trigger's `old_bounds` only covers `geometry_column`, so if you move a label point far outside its polygon, the tile at its old position keeps the stale label until the next full `generate`.
 
 ```toml
 [[sources.layers]]
