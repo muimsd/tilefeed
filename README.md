@@ -8,23 +8,17 @@ Dynamic vector tiles from PostGIS and GDAL files: **MBTiles generation + increme
 ## Architecture
 
 ```
-GDAL sources (Shapefile, GeoPackage, Esri FeatureServer, WFS, SQL Server, …)
-   │
-   ▼
-OGR_FDW foreign tables
-   │
-   ▼
-PostGIS ──┬── Tippecanoe ──┐
-          ├── GDAL ────────┤── MBTiles ──┬── Built-in HTTP server
-          └── Native Rust ─┘             ├── Local copy
-                                         ├── S3 upload
-LISTEN/NOTIFY ── Debounce ── MVT encode ─├── Mapbox Studio
-                                         ├── Custom command
-                                         ├── Webhooks (HTTP POST)
-                                         ├── SSE (Server-Sent Events)
-                                         └── PMTiles export (static hosting)
+PostGIS ───┬──┬── Tippecanoe ──┐
+OGR_FDW ───┘  ├── GDAL ────────┤── MBTiles ──┬── Built-in HTTP server
+              └── Native Rust ─┘             ├── Local copy
+                                             ├── S3 upload
+LISTEN/NOTIFY ── Debounce ── MVT encode ─────├── Mapbox Studio
+                                             ├── Custom command
+                                             ├── Webhooks (HTTP POST)
+                                             ├── SSE (Server-Sent Events)
+                                             └── PMTiles export (static hosting)
 
-Every stage ─────────────────────────────────── Prometheus /metrics
+Every stage ─────────────────────────────────────── Prometheus /metrics
 ```
 
 Full generation exports PostGIS layers through one of three backends (Tippecanoe, GDAL, or native Rust) to produce MBTiles. Incremental updates listen for PostgreSQL notifications, debounce and deduplicate affected tiles, re-encode them as MVT protobuf, and write them into the existing MBTiles file. The built-in HTTP server serves tiles directly from MBTiles with ETag caching and TileJSON metadata.
