@@ -332,6 +332,15 @@ impl MbtilesStore {
         Ok(result)
     }
 
+    /// SQLite's `data_version`: changes whenever *another* connection commits
+    /// to this database file, never for this connection's own writes. The tile
+    /// server polls it to notice MBTiles rewritten by a different process.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
     /// Count total tiles
     pub fn tile_count(&self) -> Result<u64> {
         let count: i64 = self

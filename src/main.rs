@@ -374,9 +374,11 @@ async fn watch_updates(
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
         stores,
-        publisher.clone(),
-        Some(event_tx),
-        None,
+        updater::UpdateOutputs {
+            publisher: publisher.clone(),
+            event_tx: Some(event_tx),
+            cache: None,
+        },
     ));
 
     tokio::select! {
@@ -428,9 +430,11 @@ async fn serve_and_watch(
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
         stores.clone(),
-        publisher.clone(),
-        Some(event_tx.clone()),
-        tile_cache.clone(),
+        updater::UpdateOutputs {
+            publisher: publisher.clone(),
+            event_tx: Some(event_tx.clone()),
+            cache: tile_cache.clone(),
+        },
     ));
     // Built before spawning: a routing or `[metrics] path` problem must stop
     // startup here, not from inside a background task.

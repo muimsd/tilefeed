@@ -8,29 +8,33 @@
 //! Old tiles are cleared as the data changes:
 //! - the incremental updater calls [`TileCache::invalidate`] with exactly the
 //!   tiles it rewrote or deleted, right after its MBTiles commit;
-//! - a full generation clears the whole source ([`TileCache::clear_source`]);
-//! - an optional TTL expires entries regardless, as a backstop for writes made
-//!   outside this process.
+//! - the server watches each MBTiles file for commits made by *other*
+//!   processes (a cron `generate`, a separate `watch`) and calls
+//!   [`TileCache::clear_source`] when one lands;
+//! - an optional TTL expires entries regardless.
 //!
 //! Every invalidation bumps a per-source generation counter. A request that read
 //! the store before an invalidation carries the old generation and its insert is
 //! dropped, so a tile read just before an update cannot be cached after it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 
 use crate::metrics::metrics;
 
-/// Rough per-entry overhead (key, maps, ETag) counted toward the byte budget,
-/// so a cache full of empty tiles is still bounded.
-const ENTRY_OVERHEAD: usize = 96;
+/// Per-entry memory beyond the tile bytes and ETag: the key in both maps, the
+/// entry itself, and map/tree node overhead. Counted toward the byte budget so
+/// a cache full of empty tiles is still bounded.
+const ENTRY_OVERHEAD: usize = 160;
 
+/// Source names are interned: keys share one `Arc<str>` per source, so neither
+/// a lookup nor an entry allocates a string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key {
-    source: String,
+    source: Arc<str>,
     z: u8,
     x: u32,
     y: u32,
@@ -53,6 +57,14 @@ impl CachedTile {
     }
 }
 
+/// Result of a cache lookup. A miss carries the source's generation, to be
+/// passed back to [`TileCache::insert`] after reading the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    Hit(CachedTile),
+    Miss { generation: u64 },
+}
+
 struct Entry {
     tile: CachedTile,
     size: usize,
@@ -67,18 +79,42 @@ struct Inner {
     order: BTreeMap<u64, Key>,
     next_tick: u64,
     bytes: usize,
-    generations: HashMap<String, u64>,
+    /// Interned source name → generation.
+    sources: HashMap<Arc<str>, u64>,
 }
 
 impl Inner {
-    fn touch(&mut self, key: &Key) {
+    fn intern(&mut self, source: &str) -> Arc<str> {
+        if let Some((name, _)) = self.sources.get_key_value(source) {
+            return name.clone();
+        }
+        let name: Arc<str> = Arc::from(source);
+        self.sources.insert(name.clone(), 0);
+        name
+    }
+
+    fn key(&mut self, source: &str, z: u8, x: u32, y: u32) -> Key {
+        Key {
+            source: self.intern(source),
+            z,
+            x,
+            y,
+        }
+    }
+
+    fn generation(&self, source: &str) -> u64 {
+        self.sources.get(source).copied().unwrap_or(0)
+    }
+
+    fn bump_generation(&mut self, source: &str) {
+        let name = self.intern(source);
+        *self.sources.entry(name).or_insert(0) += 1;
+    }
+
+    fn next_tick(&mut self) -> u64 {
         let tick = self.next_tick;
         self.next_tick += 1;
-        if let Some(entry) = self.entries.get_mut(key) {
-            self.order.remove(&entry.tick);
-            entry.tick = tick;
-            self.order.insert(tick, key.clone());
-        }
+        tick
     }
 
     fn remove(&mut self, key: &Key) -> bool {
@@ -90,10 +126,6 @@ impl Inner {
             }
             None => false,
         }
-    }
-
-    fn bump_generation(&mut self, source: &str) {
-        *self.generations.entry(source.to_string()).or_insert(0) += 1;
     }
 }
 
@@ -118,48 +150,51 @@ impl TileCache {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The source's current generation. Read it *before* reading the store and
-    /// pass it to [`TileCache::insert`].
-    pub fn generation(&self, source: &str) -> u64 {
-        self.lock().generations.get(source).copied().unwrap_or(0)
-    }
-
-    pub fn get(&self, source: &str, z: u8, x: u32, y: u32) -> Option<CachedTile> {
-        let key = Key {
-            source: source.to_string(),
-            z,
-            x,
-            y,
-        };
+    /// Look a tile up. On a miss, read the store and pass the returned
+    /// generation to [`TileCache::insert`]; it is taken under the same lock,
+    /// before the store read, which is what makes the race check sound.
+    pub fn lookup(&self, source: &str, z: u8, x: u32, y: u32) -> Lookup {
         let mut inner = self.lock();
-        let expired = match inner.entries.get(&key) {
-            None => {
-                drop(inner);
-                metrics().tile_cache_requests.with(&[source, "miss"]).inc();
-                return None;
+        let key = inner.key(source, z, x, y);
+        let (result, expired) = match inner.entries.get(&key) {
+            None => ("miss", false),
+            Some(entry) if self.ttl.is_some_and(|ttl| entry.inserted.elapsed() >= ttl) => {
+                ("expired", true)
             }
-            Some(entry) => self.ttl.is_some_and(|ttl| entry.inserted.elapsed() >= ttl),
+            Some(_) => ("hit", false),
         };
-        if expired {
-            inner.remove(&key);
-            metrics().tile_cache_bytes.get().set(inner.bytes as i64);
-            drop(inner);
-            metrics()
-                .tile_cache_requests
-                .with(&[source, "expired"])
-                .inc();
-            return None;
-        }
-        inner.touch(&key);
-        let tile = inner.entries.get(&key).map(|e| e.tile.clone());
+
+        let lookup = if result == "hit" {
+            let tick = inner.next_tick();
+            let entry = inner.entries.get_mut(&key).expect("entry checked above");
+            let old_tick = std::mem::replace(&mut entry.tick, tick);
+            let tile = entry.tile.clone();
+            inner.order.remove(&old_tick);
+            inner.order.insert(tick, key);
+            Lookup::Hit(tile)
+        } else {
+            if expired {
+                inner.remove(&key);
+            }
+            Lookup::Miss {
+                generation: inner.generation(source),
+            }
+        };
+        let bytes = inner.bytes;
         drop(inner);
-        metrics().tile_cache_requests.with(&[source, "hit"]).inc();
-        tile
+
+        let m = metrics();
+        m.tile_cache_requests.with(&[source, result]).inc();
+        if expired {
+            m.tile_cache_bytes.get().set(bytes as i64);
+        }
+        lookup
     }
 
-    /// Cache a tile read from the store at `generation`. Dropped if the source
-    /// was invalidated since (the read may predate the write), or if the tile
-    /// alone exceeds the budget. Returns whether it was stored.
+    /// Cache a tile read from the store after a [`Lookup::Miss`] at
+    /// `generation`. Dropped if the source was invalidated since (the read may
+    /// predate the write), or if the tile alone exceeds the budget. Returns
+    /// whether it was stored.
     pub fn insert(
         &self,
         source: &str,
@@ -173,16 +208,11 @@ impl TileCache {
         if size > self.max_bytes {
             return false;
         }
-        let key = Key {
-            source: source.to_string(),
-            z,
-            x,
-            y,
-        };
         let mut inner = self.lock();
-        if inner.generations.get(source).copied().unwrap_or(0) != generation {
+        if inner.generation(source) != generation {
             return false;
         }
+        let key = inner.key(source, z, x, y);
         inner.remove(&key);
 
         let mut evicted = 0u64;
@@ -196,8 +226,7 @@ impl TileCache {
             }
         }
 
-        let tick = inner.next_tick;
-        inner.next_tick += 1;
+        let tick = inner.next_tick();
         inner.order.insert(tick, key.clone());
         inner.entries.insert(
             key,
@@ -230,12 +259,7 @@ impl TileCache {
         inner.bump_generation(source);
         let mut removed = 0;
         for (z, x, y) in coords {
-            let key = Key {
-                source: source.to_string(),
-                z,
-                x,
-                y,
-            };
+            let key = inner.key(source, z, x, y);
             if inner.remove(&key) {
                 removed += 1;
             }
@@ -250,14 +274,15 @@ impl TileCache {
         removed
     }
 
-    /// Drop every cached tile of a source, e.g. after a full generation.
+    /// Drop every cached tile of a source, e.g. after another process rewrote
+    /// its MBTiles. Returns how many were cached.
     pub fn clear_source(&self, source: &str) -> usize {
         let mut inner = self.lock();
         inner.bump_generation(source);
         let keys: Vec<Key> = inner
             .entries
             .keys()
-            .filter(|k| k.source == source)
+            .filter(|k| &*k.source == source)
             .cloned()
             .collect();
         for key in &keys {
@@ -273,13 +298,10 @@ impl TileCache {
         keys.len()
     }
 
-    /// Sources that currently have cached tiles.
-    pub fn sources(&self) -> Vec<String> {
-        let inner = self.lock();
-        let mut sources: Vec<String> = inner.entries.keys().map(|k| k.source.clone()).collect();
-        sources.sort();
-        sources.dedup();
-        sources
+    /// Number of cached entries (for tests outside this module).
+    #[cfg(test)]
+    pub fn sources_cached(&self) -> usize {
+        self.lock().entries.len()
     }
 
     #[cfg(test)]
@@ -290,6 +312,19 @@ impl TileCache {
     #[cfg(test)]
     fn bytes(&self) -> usize {
         self.lock().bytes
+    }
+
+    #[cfg(test)]
+    fn get(&self, source: &str, z: u8, x: u32, y: u32) -> Option<CachedTile> {
+        match self.lookup(source, z, x, y) {
+            Lookup::Hit(tile) => Some(tile),
+            Lookup::Miss { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn generation(&self, source: &str) -> u64 {
+        self.lock().generation(source)
     }
 }
 
@@ -307,9 +342,11 @@ mod tests {
     #[test]
     fn test_get_returns_inserted_tile() {
         let cache = TileCache::new(1 << 20, None);
-        assert_eq!(cache.get("s", 1, 0, 0), None);
-        assert!(cache.insert("s", 1, 0, 0, tile(10), cache.generation("s")));
-        assert_eq!(cache.get("s", 1, 0, 0), Some(tile(10)));
+        let Lookup::Miss { generation } = cache.lookup("s", 1, 0, 0) else {
+            panic!("expected a miss");
+        };
+        assert!(cache.insert("s", 1, 0, 0, tile(10), generation));
+        assert_eq!(cache.lookup("s", 1, 0, 0), Lookup::Hit(tile(10)));
         assert_eq!(cache.get("other", 1, 0, 0), None);
         assert_eq!(cache.get("s", 1, 0, 1), None);
     }
@@ -367,15 +404,29 @@ mod tests {
 
     #[test]
     fn test_read_before_invalidation_is_not_cached() {
-        // A request reads the old tile, the updater commits and invalidates,
-        // then the request tries to cache what it read: that must be refused.
+        // A request misses, reads the old tile, the updater commits and
+        // invalidates, then the request tries to cache what it read: refused.
         let cache = TileCache::new(1 << 20, None);
-        let gen_before_read = cache.generation("s");
+        let Lookup::Miss { generation } = cache.lookup("s", 4, 2, 2) else {
+            panic!("expected a miss");
+        };
         cache.invalidate("s", [(4, 2, 2)]);
-        assert!(!cache.insert("s", 4, 2, 2, tile(10), gen_before_read));
+        assert!(!cache.insert("s", 4, 2, 2, tile(10), generation));
         assert_eq!(cache.get("s", 4, 2, 2), None);
         // A fresh read after the invalidation caches normally.
         assert!(cache.insert("s", 4, 2, 2, tile(10), cache.generation("s")));
+    }
+
+    #[test]
+    fn test_clear_of_uncached_source_still_blocks_inflight_reads() {
+        // The source has nothing cached when it is cleared; a read already in
+        // flight must still be refused.
+        let cache = TileCache::new(1 << 20, None);
+        let Lookup::Miss { generation } = cache.lookup("s", 0, 0, 0) else {
+            panic!("expected a miss");
+        };
+        assert_eq!(cache.clear_source("s"), 0);
+        assert!(!cache.insert("s", 0, 0, 0, tile(10), generation));
     }
 
     #[test]

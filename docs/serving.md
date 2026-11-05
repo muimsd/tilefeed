@@ -99,8 +99,10 @@ path = "/metrics"     # metrics path (default: /metrics)
 Old tiles are cleared from the cache as the data changes:
 
 - **Incremental updates.** After the updater commits a batch to MBTiles, it clears exactly the tiles it rewrote or deleted, so the next request reads the new tile. A request that read the store just before the commit is not allowed to put the old tile back in the cache.
-- **Full generation.** Clears every cached tile of the source.
-- **TTL.** `ttl_secs` expires entries even when nothing changed. Use it only if another process writes the MBTiles file, because this server never sees those writes.
+- **Writes by other processes.** If something else commits to a source's MBTiles file (a cron `generate`, a separate `watch`, a manual edit), the server notices within about 2 seconds and clears that source's cached tiles. It checks SQLite's `data_version`, which changes only when another connection commits. This does not cover a file that is *replaced* (renamed over) rather than written to: the server keeps reading the file it opened, with or without the cache, so restart `serve` after swapping files.
+- **TTL.** `ttl_secs` expires entries even when nothing changed, as an extra safety net.
+
+Only tiles at zooms the source has (`min_zoom`..`max_zoom`) are cached, so requests outside that range can't push real tiles out. Coordinates that don't exist at their zoom (`x` or `y` ≥ 2^z) get a 404.
 
 The cache only clears tiles held by this server. Browsers and CDNs keep their own copies for `max_age_secs`. For live-updating maps, set `max_age_secs = 0` (`Cache-Control: no-cache`): clients revalidate each tile with its ETag, unchanged tiles cost a 304 served from memory, and changed tiles show up immediately.
 

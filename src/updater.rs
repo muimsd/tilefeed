@@ -24,13 +24,19 @@ struct UpdateEvent {
     old_bounds: Option<Bounds>,
 }
 
+/// Where an applied update is reported: publishing, webhooks/SSE, tile cache.
+#[derive(Clone, Default)]
+pub struct UpdateOutputs {
+    pub publisher: Option<Arc<StoragePublisher>>,
+    pub event_tx: Option<EventSender>,
+    pub cache: Option<Arc<TileCache>>,
+}
+
 /// Start the LISTEN/NOTIFY listener for incremental tile updates with auto-reconnect
 pub async fn start_listener(
     config: Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
-    publisher: Option<Arc<StoragePublisher>>,
-    event_tx: Option<EventSender>,
-    cache: Option<Arc<TileCache>>,
+    outputs: UpdateOutputs,
 ) -> Result<()> {
     let mut retry_count: u32 = 0;
     let max_retry_delay_secs: u64 = 60;
@@ -39,15 +45,7 @@ pub async fn start_listener(
         // The listener only stops when the connection is gone. A real shutdown
         // aborts this task instead, so neither outcome here means "we are done":
         // returning would end the process, taking the HTTP tile server with it.
-        let reason = match run_listener(
-            &config,
-            &stores,
-            publisher.as_ref(),
-            event_tx.as_ref(),
-            cache.as_ref(),
-        )
-        .await
-        {
+        let reason = match run_listener(&config, &stores, &outputs).await {
             Ok(()) => "listener stopped without an error".to_string(),
             Err(e) => format!("{:#}", e),
         };
@@ -98,9 +96,7 @@ async fn next_batch<T>(
 async fn run_listener(
     config: &AppConfig,
     stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
-    publisher: Option<&Arc<StoragePublisher>>,
-    event_tx: Option<&EventSender>,
-    cache: Option<&Arc<TileCache>>,
+    outputs: &UpdateOutputs,
 ) -> Result<()> {
     let tls = crate::pgtls::make_tls_connector(&config.database)?;
     let (client, mut connection) = config
@@ -168,16 +164,8 @@ async fn run_listener(
         }
 
         if !parsed_events.is_empty() {
-            if let Err(e) = handle_batch_update(
-                config,
-                &reader,
-                stores,
-                publisher,
-                event_tx,
-                cache,
-                &parsed_events,
-            )
-            .await
+            if let Err(e) =
+                handle_batch_update(config, &reader, stores, outputs, &parsed_events).await
             {
                 error!("Failed to handle update batch: {}", e);
             }
@@ -356,28 +344,13 @@ mod tests {
 }
 
 /// Handle a batch of update events: group by source, deduplicate affected tiles, regenerate
-/// Where an applied update is reported: publishing, webhooks/SSE, tile cache.
-#[derive(Clone, Copy)]
-struct UpdateOutputs<'a> {
-    publisher: Option<&'a Arc<StoragePublisher>>,
-    event_tx: Option<&'a EventSender>,
-    cache: Option<&'a Arc<TileCache>>,
-}
-
 async fn handle_batch_update(
     config: &AppConfig,
     reader: &PostgisReader,
     stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
-    publisher: Option<&Arc<StoragePublisher>>,
-    event_tx: Option<&EventSender>,
-    cache: Option<&Arc<TileCache>>,
+    outputs: &UpdateOutputs,
     events: &[UpdateEvent],
 ) -> Result<()> {
-    let outputs = UpdateOutputs {
-        publisher,
-        event_tx,
-        cache,
-    };
     // Group events by source name
     let mut events_by_source: HashMap<String, Vec<&UpdateEvent>> = HashMap::new();
 
@@ -414,7 +387,7 @@ async fn handle_batch_update(
         };
 
         let started = std::time::Instant::now();
-        let result = update_source(config, reader, source, store, &outputs, source_events).await;
+        let result = update_source(config, reader, source, store, outputs, source_events).await;
 
         metrics()
             .update_duration
@@ -436,14 +409,12 @@ async fn update_source(
     reader: &PostgisReader,
     source: &crate::config::SourceConfig,
     mbtiles: &Arc<Mutex<MbtilesStore>>,
-    outputs: &UpdateOutputs<'_>,
+    outputs: &UpdateOutputs,
     events: &[&UpdateEvent],
 ) -> Result<()> {
-    let UpdateOutputs {
-        publisher,
-        event_tx,
-        cache,
-    } = *outputs;
+    let publisher = outputs.publisher.as_ref();
+    let event_tx = outputs.event_tx.as_ref();
+    let cache = outputs.cache.as_ref();
     let mut all_affected: Vec<TileCoord> = Vec::new();
 
     for event in events {
