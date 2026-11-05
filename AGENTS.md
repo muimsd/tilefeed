@@ -99,7 +99,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 ### Config (`config.toml`)
 
 Sources are defined under `[[sources]]` with: `name`, `mbtiles_path`, `min_zoom`, `max_zoom`.
-Layers within each source are defined under `[[sources.layers]]` with: `name`, `table`, `schema`, `geometry_column`, `geometry_columns`, `id_column`, `srid`, `properties`, `filter`, `simplify_tolerance`, `property_rules`. The `name` field must match the trigger argument in `sql/setup_notify.sql`.
+Layers within each source are defined under `[[sources.layers]]` with: `name`, `table`, `schema`, `geometry_column`, `geometry_columns`, `id_column`, `srid`, `properties`, `filter`, `simplify_tolerance`, `property_rules`, `generate_label_points`, `generate_boundary_lines`, `min_zoom`, `max_zoom` (per-layer zoom range inside the source's; derived layers inherit it; validated by `AppConfig::validate()` in `load_config`). The `name` field must match the trigger argument in `sql/setup_notify.sql`.
 Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
 Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
 HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`).

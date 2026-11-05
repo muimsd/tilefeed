@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-layer zoom range**: `min_zoom` / `max_zoom` on `[[sources.layers]]` restrict a layer to part of its source's zoom range (e.g. buildings only from zoom 13). Either may be set alone; derived `_labels` / `_boundary` layers follow their parent. All three backends honour it — Tippecanoe through per-feature `"tippecanoe": {"minzoom", "maxzoom"}` objects, GDAL through the `MINZOOM`/`MAXZOOM` layer creation options, and the native encoder by skipping the layer outside its range. Incremental updates only re-encode tiles inside the changed layer's range and never write a layer into a tile outside it, and TileJSON reports each layer's `minzoom`/`maxzoom`. See [docs/configuration.md](docs/configuration.md#per-layer-zoom-range).
+
+### Fixed
+
+- Per-layer `min_zoom` / `max_zoom` keys were accepted and silently ignored, so a layer meant for "zoom 10–14" appeared at every zoom of its source. Config loading now also rejects a range with `min_zoom > max_zoom` or one outside the source's range, naming the layer.
+
 ## [0.9.0] - 2026-09-12
 
 ### Added

@@ -37,6 +37,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - Cross-platform: Linux, macOS, and Windows
 - Three generation backends: [Tippecanoe](docs/tippecanoe.md), GDAL (ogr2ogr), and native Rust MVT encoder
 - Multiple sources: separate MBTiles outputs with independent layers and zoom ranges
+- [Per-layer zoom ranges](docs/configuration.md#per-layer-zoom-range) (`min_zoom`/`max_zoom`) within a source, honoured by every backend and by incremental updates
 - Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY with debounced batching
 - Built-in HTTP tile server with ETag caching, CORS, and [TileJSON 3.0.0](docs/serving.md)
 - [Derived geometry layers](docs/derived-layers.md): auto-generated label points and boundary lines from polygons
