@@ -123,7 +123,7 @@ SHA_SOURCE=$(fetch "https://github.com/${REPO}/archive/v${VERSION}.tar.gz" "sour
 # --- Homebrew -------------------------------------------------------------
 cat > "$ROOT/Formula/tilefeed.rb" <<EOF
 class Tilefeed < Formula
-  desc "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
+  desc "Dynamic vector tiles from PostGIS and GDAL files"
   homepage "https://github.com/${REPO}"
   version "${VERSION}"
   license "MIT"
@@ -164,7 +164,7 @@ EOF
 cat > "$ROOT/bucket/tilefeed.json" <<EOF
 {
     "version": "${VERSION}",
-    "description": "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY",
+    "description": "Dynamic vector tiles from PostGIS and GDAL files",
     "homepage": "https://github.com/${REPO}",
     "license": "MIT",
     "architecture": {
@@ -197,7 +197,7 @@ PackageName: tilefeed
 Publisher: muimsd
 License: MIT
 LicenseUrl: https://github.com/${REPO}/blob/main/LICENSE
-ShortDescription: PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY
+ShortDescription: Dynamic vector tiles from PostGIS and GDAL files
 PackageUrl: https://github.com/${REPO}
 Tags:
   - postgis

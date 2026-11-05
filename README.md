@@ -3,7 +3,7 @@
 ![CI](https://github.com/muimsd/tilefeed/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
-A PostGIS vector tile pipeline for **MBTiles generation + incremental updates + HTTP serving + storage publish**.
+Dynamic vector tiles from PostGIS and GDAL files: **MBTiles generation + incremental updates + HTTP serving + storage publish**.
 
 ## Architecture
 
