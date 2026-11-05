@@ -34,7 +34,8 @@ pub struct DatabaseConfig {
     pub sslmode: SslMode,
     /// PEM file with the CA certificate(s) used to verify the server in
     /// "verify-ca"/"verify-full" mode (and, as in libpq, in "require" mode
-    /// when set). When unset, the bundled Mozilla (webpki) roots are used.
+    /// when set). Required for "verify-ca"; for "verify-full" the bundled
+    /// Mozilla (webpki) roots are used when unset.
     #[serde(default)]
     pub sslrootcert: Option<String>,
 }
@@ -48,6 +49,7 @@ pub enum SslMode {
     /// Use TLS if the server supports it, otherwise fall back to plaintext.
     /// The certificate is not verified. This is libpq's default and keeps
     /// configs written before `sslmode` existed working against non-TLS servers.
+    /// Unlike libpq, a failed TLS handshake is an error, not a plaintext retry.
     #[default]
     Prefer,
     /// Always use TLS; fail if the server refuses it. The certificate is not
@@ -108,6 +110,30 @@ pub enum LabelPointMethod {
 
 impl LayerConfig {
     /// SQL expression for this layer's label point, in EPSG:4326.
+    /// The column a derived layer's rows are drawn from: `label_point_column`
+    /// for label points when set, the geometry column otherwise. Derived
+    /// queries filter on this column (non-null, intersecting the tile), so a
+    /// hand-placed label point lands in the tile that contains it.
+    pub fn derived_source_column<'a>(
+        &'a self,
+        derived_type: DerivedGeomType,
+        geom_col: &'a str,
+    ) -> &'a str {
+        match (derived_type, &self.label_point_column) {
+            (DerivedGeomType::LabelPoint, Some(col)) if self.generate_label_points => col,
+            _ => geom_col,
+        }
+    }
+
+    /// The label point column, when label points are generated from one.
+    pub fn active_label_column(&self) -> Option<&str> {
+        if self.generate_label_points {
+            self.label_point_column.as_deref()
+        } else {
+            None
+        }
+    }
+
     pub fn label_point_sql(&self, geom_col: &str) -> String {
         if let Some(col) = &self.label_point_column {
             return format!("ST_Transform(\"{col}\", 4326)");
@@ -421,15 +447,23 @@ impl DatabaseConfig {
             .user(&self.user)
             .password(&self.password)
             .dbname(&self.dbname)
-            .ssl_mode(self.sslmode.to_postgres());
+            .ssl_mode(self.effective_ssl_mode());
         cfg
     }
 
-    pub fn connection_string(&self) -> String {
-        format!(
-            "host={} port={} user={} password={} dbname={}",
-            self.host, self.port, self.user, self.password, self.dbname
-        )
+    /// A host starting with `/` is a Unix-socket directory. PostgreSQL does
+    /// not offer TLS over Unix sockets and libpq ignores `sslmode` for them,
+    /// so TLS is disabled there whatever `sslmode` says.
+    pub fn is_unix_socket(&self) -> bool {
+        self.host.starts_with('/')
+    }
+
+    fn effective_ssl_mode(&self) -> tokio_postgres::config::SslMode {
+        if self.is_unix_socket() {
+            tokio_postgres::config::SslMode::Disable
+        } else {
+            self.sslmode.to_postgres()
+        }
     }
 }
 
@@ -747,46 +781,23 @@ mod tests {
         assert_eq!(config.worker_concurrency, Some(8));
     }
 
-    // --- DatabaseConfig::connection_string tests ---
+    // --- DatabaseConfig::pg_config ---
 
     #[test]
-    fn test_connection_string_format() {
-        let db = DatabaseConfig {
-            host: "db.example.com".to_string(),
-            port: 5433,
-            user: "admin".to_string(),
-            password: "p@ss".to_string(),
-            dbname: "mydb".to_string(),
-            pool_size: Some(10),
-            sslmode: SslMode::default(),
-            sslrootcert: None,
-        };
-
-        let conn_str = db.connection_string();
+    fn test_unix_socket_host_disables_tls() {
+        let mut db = parse_database("sslmode = \"require\"").unwrap();
+        db.host = "/var/run/postgresql".to_string();
+        assert!(db.is_unix_socket());
         assert_eq!(
-            conn_str,
-            "host=db.example.com port=5433 user=admin password=p@ss dbname=mydb"
+            db.pg_config().get_ssl_mode(),
+            tokio_postgres::config::SslMode::Disable
         );
-    }
-
-    #[test]
-    fn test_connection_string_default_port() {
-        let db = DatabaseConfig {
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "postgres".to_string(),
-            password: "".to_string(),
-            dbname: "tiles".to_string(),
-            pool_size: None,
-            sslmode: SslMode::default(),
-            sslrootcert: None,
-        };
-
-        let conn_str = db.connection_string();
-        assert!(conn_str.contains("host=localhost"));
-        assert!(conn_str.contains("port=5432"));
-        assert!(conn_str.contains("user=postgres"));
-        assert!(conn_str.contains("dbname=tiles"));
+        db.host = "db.example.com".to_string();
+        assert!(!db.is_unix_socket());
+        assert_eq!(
+            db.pg_config().get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require
+        );
     }
 
     // --- label point method / column ---

@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Label point method.** Layers with `generate_label_points = true` accept `label_point_method` (`point_on_surface`, the default and previous behaviour, or `centroid` for the center of mass) and `label_point_column` (use an existing point column instead of computing one).
 
-- **TLS to PostgreSQL.** New `[database]` keys `sslmode` (`disable` | `prefer` | `require` | `verify-ca` | `verify-full`, libpq semantics, default `prefer`) and `sslrootcert`. Uses rustls (ring) for both the connection pool and the LISTEN/NOTIFY connection, so managed databases that enforce TLS (Supabase, Neon, RDS, Cloud SQL, Crunchy Bridge) can now be reached. `verify-*` modes verify against `sslrootcert` or the bundled webpki roots.
+- **TLS to PostgreSQL.** New `[database]` keys `sslmode` (`disable` | `prefer` | `require` | `verify-ca` | `verify-full`, libpq semantics, default `prefer`) and `sslrootcert`. Uses rustls (ring) for both the connection pool and the LISTEN/NOTIFY connection, so managed databases that enforce TLS (Supabase, Neon, RDS, Cloud SQL, Crunchy Bridge) can now be reached. `verify-ca` requires `sslrootcert`; `verify-full` verifies against `sslrootcert` or the bundled webpki roots. Unix-socket hosts never use TLS, as in libpq.
 
 ### Fixed
 

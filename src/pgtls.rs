@@ -3,12 +3,19 @@
 //! `sslmode` follows libpq semantics:
 //! - `disable`: plaintext only.
 //! - `prefer`: try TLS, fall back to plaintext if the server refuses it
-//!   (handled by tokio-postgres); certificate not verified.
+//!   (handled by tokio-postgres); certificate not verified. Unlike libpq, a
+//!   TLS handshake that *fails* (e.g. a server limited to TLS 1.0/1.1) is an
+//!   error rather than a plaintext retry; use `disable` for such servers.
 //! - `require`: TLS mandatory, certificate not verified — unless `sslrootcert`
 //!   is set, in which case it behaves like `verify-ca` (as libpq does).
-//! - `verify-ca`: TLS mandatory, chain verified against `sslrootcert` (or the
-//!   bundled webpki roots), hostname not checked.
-//! - `verify-full`: as `verify-ca`, plus the hostname must match the certificate.
+//! - `verify-ca`: TLS mandatory, chain verified against `sslrootcert`
+//!   (required: a public root set with no hostname check would accept any
+//!   publicly trusted certificate), hostname not checked.
+//! - `verify-full`: chain verified against `sslrootcert`, or the bundled webpki
+//!   roots when unset, and the hostname must match the certificate.
+//!
+//! Unix-socket hosts (a path starting with `/`) never use TLS, as in libpq;
+//! `DatabaseConfig::pg_config` disables it for them.
 
 use std::sync::Arc;
 
@@ -21,6 +28,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
+use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::config::{DatabaseConfig, SslMode};
@@ -43,10 +51,49 @@ fn verification_for(mode: SslMode, has_rootcert: bool) -> Verification {
     }
 }
 
+/// The PostgreSQL TLS connector: rustls, plus a placeholder server name for
+/// Unix-socket connections.
+///
+/// tokio-postgres calls `make_tls_connect` for every connection, passing `""`
+/// for Unix sockets, and rustls rejects an empty server name, so without this
+/// socket hosts could not connect at all, even with `sslmode = "disable"`. TLS
+/// is disabled for socket hosts (see `DatabaseConfig::pg_config`), so the
+/// placeholder never reaches a handshake.
+#[derive(Clone)]
+pub struct PgTls(MakeRustlsConnect);
+
+const SOCKET_PLACEHOLDER_NAME: &str = "localhost";
+
+impl<S> MakeTlsConnect<S> for PgTls
+where
+    MakeRustlsConnect: MakeTlsConnect<S>,
+{
+    type Stream = <MakeRustlsConnect as MakeTlsConnect<S>>::Stream;
+    type TlsConnect = <MakeRustlsConnect as MakeTlsConnect<S>>::TlsConnect;
+    type Error = <MakeRustlsConnect as MakeTlsConnect<S>>::Error;
+
+    fn make_tls_connect(&mut self, hostname: &str) -> Result<Self::TlsConnect, Self::Error> {
+        let name = if hostname.is_empty() {
+            SOCKET_PLACEHOLDER_NAME
+        } else {
+            hostname
+        };
+        self.0.make_tls_connect(name)
+    }
+}
+
 /// Build the TLS connector for a database config. Used for both the
-/// deadpool pool and the dedicated LISTEN connection. With `sslmode = "disable"`
-/// tokio-postgres never invokes it.
-pub fn make_tls_connector(db: &DatabaseConfig) -> Result<MakeRustlsConnect> {
+/// deadpool pool and the dedicated LISTEN connection.
+pub fn make_tls_connector(db: &DatabaseConfig) -> Result<PgTls> {
+    if db.sslmode == SslMode::VerifyCa && db.sslrootcert.is_none() {
+        bail!(
+            "sslmode = \"verify-ca\" requires sslrootcert: without a pinned CA it would \
+             accept any publicly trusted certificate for any hostname. Set sslrootcert, \
+             or use sslmode = \"verify-full\" to verify against public roots with a \
+             hostname check"
+        );
+    }
+
     let provider = Arc::new(crypto::ring::default_provider());
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -74,7 +121,7 @@ pub fn make_tls_connector(db: &DatabaseConfig) -> Result<MakeRustlsConnect> {
         }
     };
 
-    Ok(MakeRustlsConnect::new(config))
+    Ok(PgTls(MakeRustlsConnect::new(config)))
 }
 
 fn load_roots(sslrootcert: Option<&str>) -> Result<RootCertStore> {
@@ -254,12 +301,31 @@ mod tests {
             SslMode::Disable,
             SslMode::Prefer,
             SslMode::Require,
-            SslMode::VerifyCa,
             SslMode::VerifyFull,
         ] {
             make_tls_connector(&db(mode, None))
                 .unwrap_or_else(|e| panic!("mode {:?}: {:#}", mode, e));
         }
+    }
+
+    #[test]
+    fn test_verify_ca_requires_rootcert() {
+        let err = make_tls_connector(&db(SslMode::VerifyCa, None))
+            .err()
+            .expect("verify-ca without sslrootcert must fail");
+        assert!(format!("{:#}", err).contains("requires sslrootcert"));
+    }
+
+    #[test]
+    fn test_unix_socket_hostname_is_accepted() {
+        // tokio-postgres passes "" for Unix sockets; plain rustls rejects it.
+        let mut tls = make_tls_connector(&db(SslMode::Prefer, None)).unwrap();
+        assert!(MakeTlsConnect::<tokio_postgres::Socket>::make_tls_connect(&mut tls, "").is_ok());
+        assert!(MakeTlsConnect::<tokio_postgres::Socket>::make_tls_connect(
+            &mut tls,
+            "db.example.com"
+        )
+        .is_ok());
     }
 
     #[test]

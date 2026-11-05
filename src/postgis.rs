@@ -137,15 +137,23 @@ impl PostgisReader {
             None => "*".to_string(),
         };
 
+        // Affected tiles must cover the label point too, which a
+        // label_point_column may place outside the geometry.
+        let bounds_geom = match layer.active_label_column() {
+            Some(label_col) => format!(
+                r#"ST_Envelope(ST_Collect(ST_Transform("{geom_col}", 4326), ST_Transform(COALESCE("{label_col}", "{geom_col}"), 4326)))"#
+            ),
+            None => format!(r#"ST_Transform(ST_Envelope("{geom_col}"), 4326)"#),
+        };
         let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties,
-                ST_XMin(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmin,
-                ST_YMin(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as ymin,
-                ST_XMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmax,
-                ST_YMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as ymax
+                ST_XMin({bounds_geom}) as xmin,
+                ST_YMin({bounds_geom}) as ymin,
+                ST_XMax({bounds_geom}) as xmax,
+                ST_YMax({bounds_geom}) as ymax
             FROM "{schema}"."{table}"
             WHERE "{id_col}" = $1::bigint AND "{geom_col}" IS NOT NULL"#,
             table = layer.table,
@@ -193,8 +201,16 @@ impl PostgisReader {
         let schema = layer.schema.as_deref().unwrap_or("public");
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
 
+        // A label_point_column may place points outside the polygons'
+        // extent, so it widens the extent too.
+        let extent_geom = match layer.active_label_column() {
+            Some(label_col) => format!(
+                r#"ST_Collect(ST_Transform("{geom_col}", 4326), ST_Transform(COALESCE("{label_col}", "{geom_col}"), 4326))"#
+            ),
+            None => format!(r#"ST_Transform("{geom_col}", 4326)"#),
+        };
         let mut inner = format!(
-            r#"SELECT ST_Extent(ST_Transform("{geom_col}", 4326)) AS e
+            r#"SELECT ST_Extent({extent_geom}) AS e
             FROM "{schema}"."{table}"
             WHERE "{geom_col}" IS NOT NULL"#,
             table = layer.table,
@@ -325,6 +341,7 @@ impl PostgisReader {
                 format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
             }
         };
+        let src_col = layer.derived_source_column(derived_type, geom_col);
 
         let mut query = format!(
             r#"SELECT
@@ -332,7 +349,7 @@ impl PostgisReader {
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
-            WHERE "{geom_col}" IS NOT NULL"#,
+            WHERE "{src_col}" IS NOT NULL"#,
             table = layer.table,
         );
 
@@ -417,6 +434,7 @@ impl PostgisReader {
                 format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
             }
         };
+        let src_col = layer.derived_source_column(derived_type, geom_col);
 
         let mut query = format!(
             r#"SELECT
@@ -424,9 +442,9 @@ impl PostgisReader {
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
-            WHERE "{geom_col}" IS NOT NULL
+            WHERE "{src_col}" IS NOT NULL
               AND ST_Intersects(
-                  ST_Transform("{geom_col}", 4326),
+                  ST_Transform("{src_col}", 4326),
                   ST_MakeEnvelope($1, $2, $3, $4, 4326)
               )"#,
             table = layer.table,

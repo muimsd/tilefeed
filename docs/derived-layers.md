@@ -12,7 +12,7 @@ Set `generate_label_points = true` on a polygon layer to create a companion poin
 | `label_point_method = "centroid"` | PostGIS `ST_Centroid` (center of mass) | Analysis or symbols that should sit at the geometric center. Can fall outside concave or multi-part polygons. |
 | `label_point_column = "label_geom"` | An existing point column of the table | You place label points yourself (or maintain them with a trigger). Overrides `label_point_method`. Must be a plain column name. |
 
-Label points are regenerated with the polygons, including incremental updates from LISTEN/NOTIFY.
+Label points are regenerated with the polygons, including incremental updates from LISTEN/NOTIFY. With `label_point_column`, rows are placed by that column (a row whose label column is NULL gets no label), and a point outside its polygon still lands in the tile that contains it. On an update, tiles at the point's new position are refreshed; the trigger's `old_bounds` only covers `geometry_column`, so if you move a label point far outside its polygon, the tile at its old position keeps the stale label until the next full `generate`.
 
 ```toml
 [[sources.layers]]

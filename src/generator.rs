@@ -324,8 +324,9 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
         source.layers.iter().map(|l| (l.name.clone(), l)).collect();
 
     // Only tiles intersecting the data extent (union over layers, EPSG:4326)
-    // can hold features. Derived label/boundary geometries lie within their
-    // source geometry, so the layer extent covers them too.
+    // can hold features. Derived geometries lie within their source geometry,
+    // except points from a label_point_column, which get_layer_extent also
+    // covers.
     let mut extent: Option<crate::postgis::Bounds> = None;
     for layer in &source.layers {
         if let Some(b) = reader.get_layer_extent(layer).await? {
