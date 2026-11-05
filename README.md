@@ -8,6 +8,12 @@ Dynamic vector tiles from PostGIS and GDAL files: **MBTiles generation + increme
 ## Architecture
 
 ```
+GDAL sources (Shapefile, GeoPackage, Esri FeatureServer, WFS, SQL Server, …)
+   │
+   ▼
+OGR_FDW foreign tables
+   │
+   ▼
 PostGIS ──┬── Tippecanoe ──┐
           ├── GDAL ────────┤── MBTiles ──┬── Built-in HTTP server
           └── Native Rust ─┘             ├── Local copy
