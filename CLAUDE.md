@@ -74,6 +74,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **`mvt.rs`** — Native MVT/protobuf encoder with geometry simplification (Douglas-Peucker via `geo` crate) and per-zoom property filtering. Uses `prost` with generated code from `vector_tile.proto`.
 - **`updater.rs`** — LISTEN/NOTIFY consumer with debounced batching and auto-reconnect with exponential backoff. Groups events by source, deduplicates affected tiles, regenerates concurrently (semaphore-bounded).
 - **`server.rs`** — HTTP tile server (axum) with ETag support, TileJSON endpoints, CORS, health check, and SSE (`GET /events`) for live tile refresh.
+- **`cache.rs`** — In-memory LRU tile cache for `serve` (byte-bounded, optional TTL, caches empty tiles). The updater invalidates the exact tiles it wrote; a `GenerateComplete` event clears the source.
 - **`events.rs`** — Shared event types (`TileEvent` enum) and broadcast channel for fan-out to webhook and SSE consumers. Supports event merging during cooldown windows.
 - **`webhook.rs`** — Webhook notifier with HMAC-SHA256 signing, retry with exponential backoff, and optional trailing-edge cooldown/throttle per source.
 - **`metrics.rs`** — Prometheus registry (counters, gauges, histograms) and text exposition format, plus a dedicated listener for commands with no tile server. Process-wide singleton via `metrics()`. Labels must stay low-cardinality and must never carry request-supplied values.
@@ -96,6 +97,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **One route parameter per path segment**: axum rejects patterns like `/{y}.pbf` or `/{source}.json` at startup (a panic, inside the spawned server task). File extensions are captured as part of the parameter and parsed in the handler.
 - **PMTiles tile IDs are XYZ, MBTiles rows are TMS**: `all_tile_coords()` returns TMS rows and pairs with `get_tile_raw_tms()`; `get_tile()` takes XYZ and flips internally. Mixing the two silently drops or mis-maps tiles.
 - **Native generation walks the quadtree, never the world**: `generate_with_native` starts from the data extent (`get_layer_extent`, union over layers) at `min_zoom` and only expands children of non-empty tiles. Any new per-tile query must keep "child non-empty ⇒ parent non-empty" true (same predicate at every zoom), or pruning will drop tiles.
+- **Tile cache invalidation follows every MBTiles write**: any new code path that writes tiles while `serve` runs must call `TileCache::invalidate` (exact tiles) or `clear_source` *after* committing. Readers take `cache.generation()` before reading the store so a read that straddles the commit can't re-cache the old tile.
 - **Server tests build the production router**: `build_router()` is what both `start_server` and the tests use. Tests must never declare their own route patterns — a test harness that did exactly that hid a startup panic through two releases.
 
 ### Config (`config.toml`)
@@ -105,7 +107,7 @@ Layers within each source are defined under `[[sources.layers]]` with: `name`, `
 Database settings live under `[database]` (`host`, `port`, `user`, `password`, `dbname`, `pool_size`, `sslmode`, `sslrootcert`).
 Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
 Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
-HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`).
+HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`, `max_age_secs`), the tile cache under `[serve.cache]` (`enabled`, `max_size_mb`, `ttl_secs`).
 Metrics settings live under `[metrics]` (`enabled`, `path`, `host`, `port`).
 Webhook settings live under `[webhook]` (`urls`, `secret`, `cooldown_secs`, `timeout_ms`, `retry_count`, `on_generate`, `on_update`).
 

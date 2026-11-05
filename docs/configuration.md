@@ -146,6 +146,17 @@ sslrootcert = "/etc/ssl/certs/provider-ca.pem"
 | `host` | string | `"127.0.0.1"` | HTTP server bind address |
 | `port` | int | 3000 | HTTP server port |
 | `cors_origins` | string[] | `["*"]` | Allowed CORS origins. Omit or empty for wildcard. |
+| `max_age_secs` | int | 300 | `Cache-Control: max-age` for tiles. `0` sends `no-cache` (clients revalidate with the ETag). |
+
+### `[serve.cache]`
+
+In-memory tile cache for `serve`. Tiles are cleared from it as incremental updates and full generations rewrite them. See [Tile cache](serving.md#tile-cache).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | true | Cache tiles in memory |
+| `max_size_mb` | int | 64 | Size budget; least recently used tiles are evicted beyond it. `0` disables the cache. |
+| `ttl_secs` | int | unset | Expire cached tiles after this many seconds even if unchanged (for MBTiles written by another process) |
 
 ### `[metrics]`
 

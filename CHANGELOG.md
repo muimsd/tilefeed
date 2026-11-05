@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tile cache.** `serve` keeps tiles in memory with their ETag, in an LRU bounded by `[serve.cache] max_size_mb` (default 64) with an optional `ttl_secs`. Incremental updates clear exactly the tiles they rewrite, right after the MBTiles commit, and a full generation clears the source, so old tiles are never served. New metrics: `tilefeed_tile_cache_*`.
+- **Configurable `Cache-Control`.** `[serve] max_age_secs` (default 300, the previous fixed value). `0` sends `no-cache`, so browsers revalidate with the ETag and see updates immediately.
 - **Label point method.** Layers with `generate_label_points = true` accept `label_point_method` (`point_on_surface`, the default and previous behaviour, or `centroid` for the center of mass) and `label_point_column` (use an existing point column instead of computing one).
 
 - **TLS to PostgreSQL.** New `[database]` keys `sslmode` (`disable` | `prefer` | `require` | `verify-ca` | `verify-full`, libpq semantics, default `prefer`) and `sslrootcert`. Uses rustls (ring) for both the connection pool and the LISTEN/NOTIFY connection, so managed databases that enforce TLS (Supabase, Neon, RDS, Cloud SQL, Crunchy Bridge) can now be reached. `verify-ca` requires `sslrootcert`; `verify-full` verifies against `sslrootcert` or the bundled webpki roots. Unix-socket hosts never use TLS, as in libpq.

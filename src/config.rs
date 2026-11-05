@@ -342,6 +342,13 @@ pub struct ServeConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub cors_origins: Option<Vec<String>>,
+    /// `Cache-Control: max-age` sent with tiles, in seconds (default: 300).
+    /// `0` sends `no-cache`: browsers revalidate every tile with its ETag, so
+    /// updated tiles show up immediately and unchanged ones cost a 304.
+    pub max_age_secs: Option<u64>,
+    /// In-memory tile cache (`[serve.cache]`).
+    #[serde(default)]
+    pub cache: TileCacheConfig,
 }
 
 impl Default for ServeConfig {
@@ -350,6 +357,40 @@ impl Default for ServeConfig {
             host: Some("127.0.0.1".to_string()),
             port: Some(3000),
             cors_origins: None,
+            max_age_secs: None,
+            cache: TileCacheConfig::default(),
+        }
+    }
+}
+
+/// In-memory tile cache for the HTTP server. Tiles changed by incremental
+/// updates or a full generation are cleared from it as they are written.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TileCacheConfig {
+    /// Cache tiles in memory (default: true)
+    pub enabled: Option<bool>,
+    /// Size budget in megabytes; least recently used tiles are evicted beyond it
+    /// (default: 64)
+    pub max_size_mb: Option<u64>,
+    /// Expire cached tiles after this many seconds even if unchanged, for MBTiles
+    /// written by another process (default: unset, entries live until changed
+    /// or evicted)
+    pub ttl_secs: Option<u64>,
+}
+
+impl TileCacheConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true) && self.max_bytes() > 0
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        (self.max_size_mb.unwrap_or(64) as usize).saturating_mul(1024 * 1024)
+    }
+
+    pub fn ttl(&self) -> Option<std::time::Duration> {
+        match self.ttl_secs {
+            Some(0) | None => None,
+            Some(s) => Some(std::time::Duration::from_secs(s)),
         }
     }
 }
@@ -361,6 +402,13 @@ impl ServeConfig {
 
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(3000)
+    }
+
+    pub fn cache_control(&self) -> String {
+        match self.max_age_secs.unwrap_or(300) {
+            0 => "no-cache".to_string(),
+            secs => format!("public, max-age={}", secs),
+        }
     }
 }
 
@@ -779,6 +827,36 @@ mod tests {
         let config = UpdateConfig::default();
         assert_eq!(config.debounce_ms, Some(200));
         assert_eq!(config.worker_concurrency, Some(8));
+    }
+
+    // --- [serve.cache] ---
+
+    #[test]
+    fn test_tile_cache_config_defaults_and_parse() {
+        let defaults = TileCacheConfig::default();
+        assert!(defaults.enabled());
+        assert_eq!(defaults.max_bytes(), 64 * 1024 * 1024);
+        assert_eq!(defaults.ttl(), None);
+
+        let serve: ServeConfig =
+            toml_value("max_age_secs = 0\n[cache]\nmax_size_mb = 8\nttl_secs = 30");
+        assert_eq!(serve.cache_control(), "no-cache");
+        assert_eq!(serve.cache.max_bytes(), 8 * 1024 * 1024);
+        assert_eq!(serve.cache.ttl(), Some(std::time::Duration::from_secs(30)));
+
+        let off: ServeConfig = toml_value("[cache]\nenabled = false");
+        assert!(!off.cache.enabled());
+        let zero: ServeConfig = toml_value("[cache]\nmax_size_mb = 0");
+        assert!(!zero.cache.enabled());
+    }
+
+    fn toml_value<T: serde::de::DeserializeOwned>(toml: &str) -> T {
+        config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap()
     }
 
     // --- DatabaseConfig::pg_config ---
@@ -1387,6 +1465,7 @@ mod tests {
             host: None,
             port: None,
             cors_origins: None,
+            ..Default::default()
         };
         assert_eq!(cfg.host(), "127.0.0.1");
         assert_eq!(cfg.port(), 3000);

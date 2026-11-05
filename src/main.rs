@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod diff;
 mod events;
@@ -375,6 +376,7 @@ async fn watch_updates(
         stores,
         publisher.clone(),
         Some(event_tx),
+        None,
     ));
 
     tokio::select! {
@@ -407,15 +409,32 @@ async fn serve_and_watch(
 
     let metrics_task = spawn_metrics_exporter(&config, true);
 
+    let cache_config = &config.serve.cache;
+    let tile_cache = cache_config.enabled().then(|| {
+        info!(
+            "Tile cache enabled ({} MB{})",
+            cache_config.max_bytes() / (1024 * 1024),
+            cache_config
+                .ttl()
+                .map(|t| format!(", ttl {}s", t.as_secs()))
+                .unwrap_or_default()
+        );
+        Arc::new(cache::TileCache::new(
+            cache_config.max_bytes(),
+            cache_config.ttl(),
+        ))
+    });
+
     let mut listener_task = tokio::spawn(start_listener(
         config.clone(),
         stores.clone(),
         publisher.clone(),
         Some(event_tx.clone()),
+        tile_cache.clone(),
     ));
     // Built before spawning: a routing or `[metrics] path` problem must stop
     // startup here, not from inside a background task.
-    let server = server::build_server(&config, stores, Some(event_tx))?;
+    let server = server::build_server(&config, stores, Some(event_tx), tile_cache)?;
     let mut server_task = tokio::spawn(server.run());
 
     tokio::select! {
