@@ -6,6 +6,27 @@ use tracing::info;
 
 use crate::config::{DatabaseConfig, DerivedGeomType, LayerConfig};
 
+/// Build one GeoJSON feature for export. With `tippecanoe_zoom`, the feature
+/// carries Tippecanoe's per-feature zoom object (`"tippecanoe": {"minzoom",
+/// "maxzoom"}`), which Tippecanoe honours and other GeoJSON readers ignore.
+fn geojson_feature(
+    id: i64,
+    geometry: JsonValue,
+    properties: JsonValue,
+    tippecanoe_zoom: Option<(u8, u8)>,
+) -> JsonValue {
+    let mut feature = serde_json::json!({
+        "type": "Feature",
+        "id": id,
+        "geometry": geometry,
+        "properties": properties,
+    });
+    if let Some((minzoom, maxzoom)) = tippecanoe_zoom {
+        feature["tippecanoe"] = serde_json::json!({ "minzoom": minzoom, "maxzoom": maxzoom });
+    }
+    feature
+}
+
 #[derive(Clone)]
 pub struct PostgisReader {
     pool: Pool,
@@ -36,8 +57,16 @@ impl PostgisReader {
         Ok(Self { pool })
     }
 
-    /// Export an entire layer as GeoJSON FeatureCollection to a file
-    pub async fn export_layer_geojson(&self, layer: &LayerConfig, output_path: &str) -> Result<()> {
+    /// Export an entire layer as GeoJSON FeatureCollection to a file.
+    ///
+    /// `tippecanoe_zoom` stamps every feature with a Tippecanoe
+    /// `{"minzoom", "maxzoom"}` object, restricting the layer to that range.
+    pub async fn export_layer_geojson(
+        &self,
+        layer: &LayerConfig,
+        output_path: &str,
+        tippecanoe_zoom: Option<(u8, u8)>,
+    ) -> Result<()> {
         let client = self.pool.get().await?;
         let schema = layer.schema.as_deref().unwrap_or("public");
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
@@ -80,12 +109,12 @@ impl PostgisReader {
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
 
-            features.push(serde_json::json!({
-                "type": "Feature",
-                "id": feature_id,
-                "geometry": geometry,
-                "properties": properties,
-            }));
+            features.push(geojson_feature(
+                feature_id,
+                geometry,
+                properties,
+                tippecanoe_zoom,
+            ));
         }
 
         let feature_collection = serde_json::json!({
@@ -242,12 +271,14 @@ impl PostgisReader {
         Ok(features)
     }
 
-    /// Export a derived geometry layer (labels/boundary) as GeoJSON FeatureCollection
+    /// Export a derived geometry layer (labels/boundary) as GeoJSON FeatureCollection.
+    /// `tippecanoe_zoom` works as in [`Self::export_layer_geojson`].
     pub async fn export_derived_layer_geojson(
         &self,
         layer: &LayerConfig,
         derived_type: DerivedGeomType,
         output_path: &str,
+        tippecanoe_zoom: Option<(u8, u8)>,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         let schema = layer.schema.as_deref().unwrap_or("public");
@@ -302,12 +333,12 @@ impl PostgisReader {
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
 
-            features.push(serde_json::json!({
-                "type": "Feature",
-                "id": feature_id,
-                "geometry": geometry,
-                "properties": properties,
-            }));
+            features.push(geojson_feature(
+                feature_id,
+                geometry,
+                properties,
+                tippecanoe_zoom,
+            ));
         }
 
         let feature_collection = serde_json::json!({
@@ -556,4 +587,37 @@ pub struct FeatureData {
     pub properties: JsonValue,
     pub bounds: Bounds,
     pub layer_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_geojson_feature_without_zoom_range_has_no_tippecanoe_member() {
+        let f = geojson_feature(
+            7,
+            serde_json::json!({"type": "Point", "coordinates": [0.0, 0.0]}),
+            serde_json::json!({"name": "a"}),
+            None,
+        );
+        assert_eq!(f["type"], "Feature");
+        assert_eq!(f["id"], 7);
+        assert_eq!(f["properties"]["name"], "a");
+        assert!(f.get("tippecanoe").is_none());
+    }
+
+    #[test]
+    fn test_geojson_feature_with_zoom_range_carries_tippecanoe_object() {
+        let f = geojson_feature(
+            1,
+            serde_json::json!({"type": "Point", "coordinates": [0.0, 0.0]}),
+            serde_json::json!({}),
+            Some((10, 14)),
+        );
+        assert_eq!(f["tippecanoe"]["minzoom"], 10);
+        assert_eq!(f["tippecanoe"]["maxzoom"], 14);
+        // The zoom object is a feature member, never a property
+        assert!(f["properties"].get("tippecanoe").is_none());
+    }
 }

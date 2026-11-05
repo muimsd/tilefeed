@@ -61,24 +61,44 @@ pub fn check_required_tools(
     Ok(())
 }
 
+/// One layer (original or derived) exported to a GeoJSON temp file.
+struct ExportedLayer {
+    name: String,
+    path: String,
+    /// The layer's zoom range when narrower than the source's. Derived layers
+    /// inherit their parent's.
+    zoom_override: Option<(u8, u8)>,
+}
+
 /// Export all layers (including derived) to GeoJSON temp files.
-/// Returns Vec<(layer_name, geojson_path)>.
+///
+/// With `stamp_tippecanoe_zoom`, features of a layer with its own zoom range carry
+/// Tippecanoe's per-feature `"tippecanoe": {"minzoom", "maxzoom"}` object.
 async fn export_all_layers(
     source: &SourceConfig,
     reader: &PostgisReader,
     temp_dir: &std::path::Path,
-) -> Result<Vec<(String, String)>> {
-    let mut geojson_files: Vec<(String, String)> = Vec::new();
+    stamp_tippecanoe_zoom: bool,
+) -> Result<Vec<ExportedLayer>> {
+    let mut geojson_files: Vec<ExportedLayer> = Vec::new();
 
     for layer in &source.layers {
+        let zoom_override = source.layer_zoom_override(layer);
+        let stamp = zoom_override.filter(|_| stamp_tippecanoe_zoom);
         // Original layer
         let geojson_path = temp_dir
             .join(format!("{}.geojson", layer.name))
             .to_string_lossy()
             .to_string();
 
-        reader.export_layer_geojson(layer, &geojson_path).await?;
-        geojson_files.push((layer.name.clone(), geojson_path));
+        reader
+            .export_layer_geojson(layer, &geojson_path, stamp)
+            .await?;
+        geojson_files.push(ExportedLayer {
+            name: layer.name.clone(),
+            path: geojson_path,
+            zoom_override,
+        });
 
         // Derived label points layer
         if layer.generate_label_points {
@@ -89,9 +109,18 @@ async fn export_all_layers(
                 .to_string();
 
             reader
-                .export_derived_layer_geojson(layer, DerivedGeomType::LabelPoint, &label_path)
+                .export_derived_layer_geojson(
+                    layer,
+                    DerivedGeomType::LabelPoint,
+                    &label_path,
+                    stamp,
+                )
                 .await?;
-            geojson_files.push((label_name, label_path));
+            geojson_files.push(ExportedLayer {
+                name: label_name,
+                path: label_path,
+                zoom_override,
+            });
         }
 
         // Derived boundary lines layer
@@ -103,9 +132,18 @@ async fn export_all_layers(
                 .to_string();
 
             reader
-                .export_derived_layer_geojson(layer, DerivedGeomType::BoundaryLine, &boundary_path)
+                .export_derived_layer_geojson(
+                    layer,
+                    DerivedGeomType::BoundaryLine,
+                    &boundary_path,
+                    stamp,
+                )
                 .await?;
-            geojson_files.push((boundary_name, boundary_path));
+            geojson_files.push(ExportedLayer {
+                name: boundary_name,
+                path: boundary_path,
+                zoom_override,
+            });
         }
     }
 
@@ -113,9 +151,9 @@ async fn export_all_layers(
 }
 
 /// Clean up temp files
-async fn cleanup_temp(geojson_files: &[(String, String)], temp_dir: &std::path::Path) {
-    for (_, path) in geojson_files {
-        let _ = tokio::fs::remove_file(path).await;
+async fn cleanup_temp(geojson_files: &[ExportedLayer], temp_dir: &std::path::Path) {
+    for layer in geojson_files {
+        let _ = tokio::fs::remove_file(&layer.path).await;
     }
     let _ = tokio::fs::remove_dir(temp_dir).await;
 }
@@ -132,7 +170,7 @@ async fn generate_with_tippecanoe(
     let temp_dir = std::env::temp_dir().join(format!("tilefeed-export-{}", source.name));
     tokio::fs::create_dir_all(&temp_dir).await?;
 
-    let geojson_files = export_all_layers(source, reader, &temp_dir).await?;
+    let geojson_files = export_all_layers(source, reader, &temp_dir, true).await?;
 
     let bin = tippecanoe_bin.unwrap_or("tippecanoe");
     let mut cmd = tokio::process::Command::new(bin);
@@ -200,9 +238,9 @@ async fn generate_with_tippecanoe(
         }
     }
 
-    for (layer_name, path) in &geojson_files {
+    for layer in &geojson_files {
         cmd.arg("--named-layer")
-            .arg(format!("{}:{}", layer_name, path));
+            .arg(format!("{}:{}", layer.name, layer.path));
     }
 
     info!("Running Tippecanoe for source '{}': {:?}", source.name, cmd);
@@ -238,7 +276,7 @@ async fn generate_with_gdal(
     let temp_dir = std::env::temp_dir().join(format!("tilefeed-export-{}", source.name));
     tokio::fs::create_dir_all(&temp_dir).await?;
 
-    let geojson_files = export_all_layers(source, reader, &temp_dir).await?;
+    let geojson_files = export_all_layers(source, reader, &temp_dir, false).await?;
 
     // GDAL's ogr2ogr can write MBTiles directly from GeoJSON inputs
     // We merge all layers into a single MBTiles using ogr2ogr
@@ -247,7 +285,8 @@ async fn generate_with_gdal(
     // Remove existing file so ogr2ogr creates fresh
     let _ = tokio::fs::remove_file(mbtiles_path).await;
 
-    for (i, (layer_name, geojson_path)) in geojson_files.iter().enumerate() {
+    for (i, exported) in geojson_files.iter().enumerate() {
+        let layer_name = &exported.name;
         let bin = ogr2ogr_bin.unwrap_or("ogr2ogr");
         let mut cmd = tokio::process::Command::new(bin);
 
@@ -260,7 +299,7 @@ async fn generate_with_gdal(
         }
 
         cmd.arg(mbtiles_path);
-        cmd.arg(geojson_path);
+        cmd.arg(&exported.path);
 
         // Layer naming
         cmd.arg("-nln").arg(layer_name);
@@ -268,6 +307,9 @@ async fn generate_with_gdal(
         // Zoom range
         cmd.arg("-dsco").arg(format!("MINZOOM={}", source.min_zoom));
         cmd.arg("-dsco").arg(format!("MAXZOOM={}", source.max_zoom));
+
+        // Per-layer zoom range, narrower than the dataset's
+        cmd.args(gdal_layer_zoom_args(exported.zoom_override));
 
         // MVT format
         cmd.arg("-dsco").arg("TYPE=overlay");
@@ -300,6 +342,21 @@ async fn generate_with_gdal(
 
     cleanup_temp(&geojson_files, &temp_dir).await;
     Ok(())
+}
+
+/// `-lco MINZOOM=… -lco MAXZOOM=…` for a layer with its own zoom range. These are
+/// the MBTiles/MVT drivers' layer creation options; without them the layer spans
+/// the dataset's `MINZOOM`/`MAXZOOM`.
+fn gdal_layer_zoom_args(zoom_override: Option<(u8, u8)>) -> Vec<String> {
+    match zoom_override {
+        Some((min, max)) => vec![
+            "-lco".to_string(),
+            format!("MINZOOM={}", min),
+            "-lco".to_string(),
+            format!("MAXZOOM={}", max),
+        ],
+        None => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +394,13 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
     let mut total_tiles = 0u64;
 
     for z in source.min_zoom..=source.max_zoom {
+        // Layers with their own zoom range drop out of zooms outside it; a zoom
+        // no layer covers has nothing to encode.
+        let zoom_layers = source.tile_layers_at_zoom(z);
+        if zoom_layers.is_empty() {
+            continue;
+        }
+
         let max_tile = (1u32 << z) - 1;
         let mut zoom_tiles = 0u64;
 
@@ -349,40 +413,17 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
                 let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> =
                     HashMap::new();
 
-                for layer in &source.layers {
-                    let features = reader.get_features_in_bounds(layer, &bounds).await?;
+                for tl in &zoom_layers {
+                    let features = match tl.derived {
+                        None => reader.get_features_in_bounds(tl.layer, &bounds).await?,
+                        Some(derived) => {
+                            reader
+                                .get_derived_features_in_bounds(tl.layer, derived, &bounds)
+                                .await?
+                        }
+                    };
                     if !features.is_empty() {
-                        features_by_layer.insert(layer.name.clone(), features);
-                    }
-
-                    // Derived label points
-                    if layer.generate_label_points {
-                        let label_features = reader
-                            .get_derived_features_in_bounds(
-                                layer,
-                                DerivedGeomType::LabelPoint,
-                                &bounds,
-                            )
-                            .await?;
-                        if !label_features.is_empty() {
-                            features_by_layer
-                                .insert(format!("{}_labels", layer.name), label_features);
-                        }
-                    }
-
-                    // Derived boundary lines
-                    if layer.generate_boundary_lines {
-                        let boundary_features = reader
-                            .get_derived_features_in_bounds(
-                                layer,
-                                DerivedGeomType::BoundaryLine,
-                                &bounds,
-                            )
-                            .await?;
-                        if !boundary_features.is_empty() {
-                            features_by_layer
-                                .insert(format!("{}_boundary", layer.name), boundary_features);
-                        }
+                        features_by_layer.insert(tl.name.clone(), features);
                     }
                 }
 
@@ -430,6 +471,19 @@ mod tests {
             layers: vec![],
             tippecanoe: TippecanoeConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_gdal_layer_zoom_args_none_without_override() {
+        assert!(gdal_layer_zoom_args(None).is_empty());
+    }
+
+    #[test]
+    fn test_gdal_layer_zoom_args_with_override() {
+        assert_eq!(
+            gdal_layer_zoom_args(Some((10, 14))),
+            vec!["-lco", "MINZOOM=10", "-lco", "MAXZOOM=14"]
+        );
     }
 
     #[test]
