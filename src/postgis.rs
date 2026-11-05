@@ -54,7 +54,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}"::bigint as feature_id,
+                "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
@@ -76,6 +76,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -130,7 +131,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}"::bigint as feature_id,
+                "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties,
                 ST_XMin(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmin,
@@ -193,7 +194,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}"::bigint as feature_id,
+                "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
@@ -226,6 +227,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -274,7 +276,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}"::bigint as feature_id,
+                "{id_col}" as feature_id,
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
@@ -298,6 +300,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -367,7 +370,7 @@ impl PostgisReader {
 
         let mut query = format!(
             r#"SELECT
-                "{id_col}"::bigint as feature_id,
+                "{id_col}" as feature_id,
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
@@ -405,6 +408,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
