@@ -398,6 +398,8 @@ async fn serve_tilejson(
 
     let mut layers: Vec<serde_json::Value> = Vec::new();
     for l in &source_config.layers {
+        // TileJSON 3.0 per-layer zoom range; derived layers share their parent's
+        let (layer_min, layer_max) = source_config.layer_zoom_range(l);
         let fields = l
             .properties
             .as_ref()
@@ -411,6 +413,8 @@ async fn serve_tilejson(
         layers.push(serde_json::json!({
             "id": l.name,
             "fields": fields,
+            "minzoom": layer_min,
+            "maxzoom": layer_max,
         }));
 
         // Include derived layers in TileJSON
@@ -418,12 +422,16 @@ async fn serve_tilejson(
             layers.push(serde_json::json!({
                 "id": format!("{}_labels", l.name),
                 "fields": fields,
+                "minzoom": layer_min,
+                "maxzoom": layer_max,
             }));
         }
         if l.generate_boundary_lines {
             layers.push(serde_json::json!({
                 "id": format!("{}_boundary", l.name),
                 "fields": fields,
+                "minzoom": layer_min,
+                "maxzoom": layer_max,
             }));
         }
     }
@@ -600,6 +608,8 @@ mod tests {
                     property_rules: None,
                     generate_label_points: true,
                     generate_boundary_lines: false,
+                    min_zoom: None,
+                    max_zoom: None,
                     label_point_method: Default::default(),
                     label_point_column: None,
                 }],
@@ -1475,6 +1485,40 @@ mod tests {
         assert_eq!(layers.len(), 2);
         assert_eq!(layers[0]["id"], "buildings");
         assert_eq!(layers[1]["id"], "buildings_labels");
+        // Without a per-layer range, layers span the source's zooms
+        assert_eq!(layers[0]["minzoom"], 0);
+        assert_eq!(layers[0]["maxzoom"], 14);
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_reports_per_layer_zoom_range() {
+        let mut config = make_test_config();
+        config.sources[0].layers[0].min_zoom = Some(10);
+        config.sources[0].layers[0].max_zoom = Some(12);
+        let app = make_app(config, HashMap::new());
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // The tileset keeps the source range; the layer and its derived layer narrow it
+        assert_eq!(json["minzoom"], 0);
+        assert_eq!(json["maxzoom"], 14);
+        let layers = json["vector_layers"].as_array().unwrap();
+        for layer in layers {
+            assert_eq!(layer["minzoom"], 10, "{}", layer["id"]);
+            assert_eq!(layer["maxzoom"], 12, "{}", layer["id"]);
+        }
     }
 
     #[tokio::test]

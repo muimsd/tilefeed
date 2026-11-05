@@ -757,6 +757,8 @@ mod tests {
             }]),
             generate_label_points: false,
             generate_boundary_lines: false,
+            min_zoom: None,
+            max_zoom: None,
             label_point_method: Default::default(),
             label_point_column: None,
         };
@@ -806,6 +808,8 @@ mod tests {
             }]),
             generate_label_points: false,
             generate_boundary_lines: false,
+            min_zoom: None,
+            max_zoom: None,
             label_point_method: Default::default(),
             label_point_column: None,
         };
@@ -1078,6 +1082,8 @@ mod tests {
             property_rules: None,
             generate_label_points: false,
             generate_boundary_lines: false,
+            min_zoom: None,
+            max_zoom: None,
             label_point_method: Default::default(),
             label_point_column: None,
         };
@@ -1100,6 +1106,8 @@ mod tests {
             property_rules: None,
             generate_label_points: false,
             generate_boundary_lines: false,
+            min_zoom: None,
+            max_zoom: None,
             label_point_method: Default::default(),
             label_point_column: None,
         };
@@ -1171,6 +1179,8 @@ mod tests {
             ]),
             generate_label_points: false,
             generate_boundary_lines: false,
+            min_zoom: None,
+            max_zoom: None,
             label_point_method: Default::default(),
             label_point_column: None,
         };
@@ -1206,6 +1216,8 @@ mod tests {
             property_rules: None,
             generate_label_points: false,
             generate_boundary_lines: false,
+            min_zoom: None,
+            max_zoom: None,
             label_point_method: Default::default(),
             label_point_column: None,
         };

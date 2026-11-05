@@ -8,7 +8,7 @@ use tokio_postgres::AsyncMessage;
 use tracing::{error, info, warn};
 
 use crate::cache::TileCache;
-use crate::config::{AppConfig, DerivedGeomType};
+use crate::config::AppConfig;
 use crate::events::EventSender;
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::metrics;
@@ -254,6 +254,86 @@ mod tests {
         assert!(next_batch(&mut rx, 50).await.is_err());
     }
 
+    // --- per-layer zoom range ---
+
+    fn zoom_source() -> crate::config::SourceConfig {
+        let cfg: crate::config::SourceConfig = toml_source(
+            r#"
+            name = "s"
+            mbtiles_path = "/tmp/s.mbtiles"
+            min_zoom = 0
+            max_zoom = 14
+
+            [[layers]]
+            name = "everywhere"
+            table = "a"
+
+            [[layers]]
+            name = "detail"
+            table = "b"
+            min_zoom = 10
+            generate_label_points = true
+            "#,
+        );
+        cfg.validate_layer_zooms().unwrap();
+        cfg
+    }
+
+    fn toml_source(src: &str) -> crate::config::SourceConfig {
+        config::Config::builder()
+            .add_source(config::File::from_str(src, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap()
+    }
+
+    fn small_bounds() -> Bounds {
+        Bounds {
+            min_lon: 10.0,
+            min_lat: 50.0,
+            max_lon: 10.001,
+            max_lat: 50.001,
+        }
+    }
+
+    #[test]
+    fn test_affected_tiles_stay_within_layer_zoom_range() {
+        let source = zoom_source();
+        let detail = source.find_layer("detail").unwrap();
+
+        let tiles = affected_tiles(&source, detail, &small_bounds());
+        let zooms: std::collections::BTreeSet<u8> = tiles.iter().map(|t| t.z).collect();
+        assert_eq!(zooms, (10..=14).collect());
+    }
+
+    #[test]
+    fn test_affected_tiles_without_layer_range_cover_source_range() {
+        let source = zoom_source();
+        let everywhere = source.find_layer("everywhere").unwrap();
+
+        let tiles = affected_tiles(&source, everywhere, &small_bounds());
+        let zooms: std::collections::BTreeSet<u8> = tiles.iter().map(|t| t.z).collect();
+        assert_eq!(zooms, (0..=14).collect());
+    }
+
+    #[test]
+    fn test_regenerated_tiles_only_encode_layers_in_range() {
+        // regenerate_single_tile queries and encodes exactly `tile_layers_at_zoom(z)`,
+        // so a tile below a layer's min_zoom never gains it or its derived layers.
+        let source = zoom_source();
+        let names = |z: u8| -> Vec<String> {
+            source
+                .tile_layers_at_zoom(z)
+                .into_iter()
+                .map(|tl| tl.name)
+                .collect()
+        };
+        assert_eq!(names(9), vec!["everywhere"]);
+        assert_eq!(names(10), vec!["everywhere", "detail", "detail_labels"]);
+        assert_eq!(names(14), vec!["everywhere", "detail", "detail_labels"]);
+    }
+
     // --- parse_notification tests ---
 
     #[test]
@@ -424,19 +504,11 @@ async fn update_source(
         };
 
         if let Some(feat) = reader.get_feature(layer, event.feature_id).await? {
-            all_affected.extend(tiles_for_bounds(
-                &feat.bounds,
-                source.min_zoom,
-                source.max_zoom,
-            ));
+            all_affected.extend(affected_tiles(source, layer, &feat.bounds));
         }
 
         if let Some(ref old_bounds) = event.old_bounds {
-            all_affected.extend(tiles_for_bounds(
-                old_bounds,
-                source.min_zoom,
-                source.max_zoom,
-            ));
+            all_affected.extend(affected_tiles(source, layer, old_bounds));
         }
     }
 
@@ -570,6 +642,17 @@ async fn update_source(
     Ok(())
 }
 
+/// Tiles a change to `layer` within `bounds` can alter: only those at the zooms
+/// the layer (and its derived layers) is encoded at.
+fn affected_tiles(
+    source: &crate::config::SourceConfig,
+    layer: &crate::config::LayerConfig,
+    bounds: &Bounds,
+) -> Vec<TileCoord> {
+    let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
+    tiles_for_bounds(bounds, min_zoom, max_zoom)
+}
+
 async fn regenerate_single_tile(
     source: &crate::config::SourceConfig,
     reader: &PostgisReader,
@@ -579,34 +662,21 @@ async fn regenerate_single_tile(
     let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
     let mut layer_configs: HashMap<String, &crate::config::LayerConfig> = HashMap::new();
 
-    for layer in &source.layers {
-        // Original polygon/geometry layer
-        let features = reader.get_features_in_bounds(layer, &bounds).await?;
+    // Only layers whose zoom range covers this tile; the rest stay out of it.
+    for tl in source.tile_layers_at_zoom(tile_coord.z) {
+        let features = match tl.derived {
+            None => {
+                layer_configs.insert(tl.layer.name.clone(), tl.layer);
+                reader.get_features_in_bounds(tl.layer, &bounds).await?
+            }
+            Some(derived) => {
+                reader
+                    .get_derived_features_in_bounds(tl.layer, derived, &bounds)
+                    .await?
+            }
+        };
         if !features.is_empty() {
-            features_by_layer.insert(layer.name.clone(), features);
-        }
-        layer_configs.insert(layer.name.clone(), layer);
-
-        // Derived label points layer (centroid of polygons)
-        if layer.generate_label_points {
-            let label_name = format!("{}_labels", layer.name);
-            let label_features = reader
-                .get_derived_features_in_bounds(layer, DerivedGeomType::LabelPoint, &bounds)
-                .await?;
-            if !label_features.is_empty() {
-                features_by_layer.insert(label_name, label_features);
-            }
-        }
-
-        // Derived boundary lines layer (polygon outline as linestring)
-        if layer.generate_boundary_lines {
-            let boundary_name = format!("{}_boundary", layer.name);
-            let boundary_features = reader
-                .get_derived_features_in_bounds(layer, DerivedGeomType::BoundaryLine, &bounds)
-                .await?;
-            if !boundary_features.is_empty() {
-                features_by_layer.insert(boundary_name, boundary_features);
-            }
+            features_by_layer.insert(tl.name, features);
         }
     }
 

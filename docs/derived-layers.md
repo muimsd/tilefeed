@@ -57,4 +57,4 @@ generate_boundary_lines = true
 # Creates: parks + parks_labels + parks_boundary
 ```
 
-Derived layers inherit the same properties as the parent layer. They appear in TileJSON metadata and are included in both full generation and incremental updates.
+Derived layers inherit the same properties as the parent layer, and its [zoom range](configuration.md#per-layer-zoom-range) when `min_zoom`/`max_zoom` is set. They appear in TileJSON metadata and are included in both full generation and incremental updates.

@@ -92,6 +92,7 @@ id_column = "id"
 srid = 4326
 properties = ["name", "class"]
 simplify_tolerance = 0.00001
+min_zoom = 6   # only in tiles at zoom 6-14 (the source's max_zoom)
 ```
 
 ## Section Reference
@@ -209,6 +210,55 @@ See [Metrics](metrics.md) for the full metric reference.
 | `label_point_method` | string | no | `point_on_surface` (default) or `centroid` |
 | `label_point_column` | string | no | Use this existing point column as the label point; overrides `label_point_method` |
 | `generate_boundary_lines` | bool | no | Generate `{name}_boundary` polyline layer |
+| `min_zoom` | int | no | Lowest zoom the layer appears at (default: the source's `min_zoom`) |
+| `max_zoom` | int | no | Highest zoom the layer appears at (default: the source's `max_zoom`) |
+
+#### Per-layer zoom range
+
+`min_zoom` and `max_zoom` restrict a layer to part of its source's zoom range —
+for example, building footprints only from zoom 13, or a country-outline layer only
+up to zoom 6. Either may be set alone; the other defaults to the source's bound.
+Derived layers (`{name}_labels`, `{name}_boundary`) follow their parent's range.
+
+```toml
+[[sources]]
+name = "basemap"
+mbtiles_path = "./basemap.mbtiles"
+min_zoom = 0
+max_zoom = 14
+
+[[sources.layers]]
+name = "countries"
+table = "countries"
+max_zoom = 6          # zoom 0-6
+
+[[sources.layers]]
+name = "buildings"
+table = "buildings"
+min_zoom = 13         # zoom 13-14
+generate_label_points = true   # buildings_labels: also zoom 13-14
+```
+
+The range must lie inside the source's: `tilefeed` refuses to start when
+`min_zoom > max_zoom` or when either is outside the source's `min_zoom..=max_zoom`,
+naming the layer.
+
+Like any change to a layer's config, changing its zoom range needs a full
+`generate`. Incremental updates only rewrite tiles inside the layer's current
+range, so tiles built under the old range keep their old content at zooms the
+layer no longer covers.
+
+All generation backends honour it:
+
+| Backend | How |
+|---------|-----|
+| `tippecanoe` | Each exported feature carries Tippecanoe's `"tippecanoe": {"minzoom": …, "maxzoom": …}` object, with only the bounds the layer sets (so `min_zoom` alone doesn't cap the layer under `--extend-zooms-if-still-dropping`) |
+| `gdal` | `ogr2ogr` is given the layer creation options `-lco MINZOOM=… -lco MAXZOOM=…` |
+| `native` | The layer is not queried or encoded for tiles outside its range |
+
+Incremental updates only re-encode tiles inside the changed layer's range, and a
+re-encoded tile only contains the layers whose range covers its zoom. The TileJSON
+endpoint reports each layer's range as `minzoom`/`maxzoom` in `vector_layers`.
 
 ### `[[sources.layers.property_rules]]`
 

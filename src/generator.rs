@@ -3,7 +3,7 @@ use futures_util::stream::{self, StreamExt};
 use std::collections::HashMap;
 use tracing::info;
 
-use crate::config::{DerivedGeomType, GenerationBackend, SourceConfig};
+use crate::config::{DerivedGeomType, GenerationBackend, LayerConfig, SourceConfig, TileLayer};
 use crate::mbtiles::MbtilesStore;
 use crate::mvt;
 use crate::postgis::PostgisReader;
@@ -62,24 +62,49 @@ pub fn check_required_tools(
     Ok(())
 }
 
+/// One layer (original or derived) exported to a GeoJSON temp file.
+struct ExportedLayer {
+    name: String,
+    path: String,
+    /// The layer's zoom range when narrower than the source's. Derived layers
+    /// inherit their parent's.
+    zoom_override: Option<(u8, u8)>,
+}
+
 /// Export all layers (including derived) to GeoJSON temp files.
-/// Returns Vec<(layer_name, geojson_path)>.
+///
+/// With `stamp_tippecanoe_zoom`, features of a layer with its own zoom range carry
+/// Tippecanoe's per-feature `"tippecanoe": {"minzoom", "maxzoom"}` object.
 async fn export_all_layers(
     source: &SourceConfig,
     reader: &PostgisReader,
     temp_dir: &std::path::Path,
-) -> Result<Vec<(String, String)>> {
-    let mut geojson_files: Vec<(String, String)> = Vec::new();
+    stamp_tippecanoe_zoom: bool,
+) -> Result<Vec<ExportedLayer>> {
+    let mut geojson_files: Vec<ExportedLayer> = Vec::new();
 
     for layer in &source.layers {
+        let zoom_override = source.layer_zoom_override(layer);
+        // Only the bounds the layer sets are stamped: a layer with just
+        // min_zoom keeps following the tileset upward (e.g. with
+        // --extend-zooms-if-still-dropping).
+        let stamp = zoom_override
+            .filter(|_| stamp_tippecanoe_zoom)
+            .map(|_| (layer.min_zoom, layer.max_zoom));
         // Original layer
         let geojson_path = temp_dir
             .join(format!("{}.geojson", layer.name))
             .to_string_lossy()
             .to_string();
 
-        reader.export_layer_geojson(layer, &geojson_path).await?;
-        geojson_files.push((layer.name.clone(), geojson_path));
+        reader
+            .export_layer_geojson(layer, &geojson_path, stamp)
+            .await?;
+        geojson_files.push(ExportedLayer {
+            name: layer.name.clone(),
+            path: geojson_path,
+            zoom_override,
+        });
 
         // Derived label points layer
         if layer.generate_label_points {
@@ -90,9 +115,18 @@ async fn export_all_layers(
                 .to_string();
 
             reader
-                .export_derived_layer_geojson(layer, DerivedGeomType::LabelPoint, &label_path)
+                .export_derived_layer_geojson(
+                    layer,
+                    DerivedGeomType::LabelPoint,
+                    &label_path,
+                    stamp,
+                )
                 .await?;
-            geojson_files.push((label_name, label_path));
+            geojson_files.push(ExportedLayer {
+                name: label_name,
+                path: label_path,
+                zoom_override,
+            });
         }
 
         // Derived boundary lines layer
@@ -104,9 +138,18 @@ async fn export_all_layers(
                 .to_string();
 
             reader
-                .export_derived_layer_geojson(layer, DerivedGeomType::BoundaryLine, &boundary_path)
+                .export_derived_layer_geojson(
+                    layer,
+                    DerivedGeomType::BoundaryLine,
+                    &boundary_path,
+                    stamp,
+                )
                 .await?;
-            geojson_files.push((boundary_name, boundary_path));
+            geojson_files.push(ExportedLayer {
+                name: boundary_name,
+                path: boundary_path,
+                zoom_override,
+            });
         }
     }
 
@@ -114,9 +157,9 @@ async fn export_all_layers(
 }
 
 /// Clean up temp files
-async fn cleanup_temp(geojson_files: &[(String, String)], temp_dir: &std::path::Path) {
-    for (_, path) in geojson_files {
-        let _ = tokio::fs::remove_file(path).await;
+async fn cleanup_temp(geojson_files: &[ExportedLayer], temp_dir: &std::path::Path) {
+    for layer in geojson_files {
+        let _ = tokio::fs::remove_file(&layer.path).await;
     }
     let _ = tokio::fs::remove_dir(temp_dir).await;
 }
@@ -133,7 +176,7 @@ async fn generate_with_tippecanoe(
     let temp_dir = std::env::temp_dir().join(format!("tilefeed-export-{}", source.name));
     tokio::fs::create_dir_all(&temp_dir).await?;
 
-    let geojson_files = export_all_layers(source, reader, &temp_dir).await?;
+    let geojson_files = export_all_layers(source, reader, &temp_dir, true).await?;
 
     let bin = tippecanoe_bin.unwrap_or("tippecanoe");
     let mut cmd = tokio::process::Command::new(bin);
@@ -201,9 +244,9 @@ async fn generate_with_tippecanoe(
         }
     }
 
-    for (layer_name, path) in &geojson_files {
+    for layer in &geojson_files {
         cmd.arg("--named-layer")
-            .arg(format!("{}:{}", layer_name, path));
+            .arg(format!("{}:{}", layer.name, layer.path));
     }
 
     info!("Running Tippecanoe for source '{}': {:?}", source.name, cmd);
@@ -239,7 +282,7 @@ async fn generate_with_gdal(
     let temp_dir = std::env::temp_dir().join(format!("tilefeed-export-{}", source.name));
     tokio::fs::create_dir_all(&temp_dir).await?;
 
-    let geojson_files = export_all_layers(source, reader, &temp_dir).await?;
+    let geojson_files = export_all_layers(source, reader, &temp_dir, false).await?;
 
     // GDAL's ogr2ogr can write MBTiles directly from GeoJSON inputs
     // We merge all layers into a single MBTiles using ogr2ogr
@@ -248,7 +291,8 @@ async fn generate_with_gdal(
     // Remove existing file so ogr2ogr creates fresh
     let _ = tokio::fs::remove_file(mbtiles_path).await;
 
-    for (i, (layer_name, geojson_path)) in geojson_files.iter().enumerate() {
+    for (i, exported) in geojson_files.iter().enumerate() {
+        let layer_name = &exported.name;
         let bin = ogr2ogr_bin.unwrap_or("ogr2ogr");
         let mut cmd = tokio::process::Command::new(bin);
 
@@ -261,7 +305,7 @@ async fn generate_with_gdal(
         }
 
         cmd.arg(mbtiles_path);
-        cmd.arg(geojson_path);
+        cmd.arg(&exported.path);
 
         // Layer naming
         cmd.arg("-nln").arg(layer_name);
@@ -269,6 +313,9 @@ async fn generate_with_gdal(
         // Zoom range
         cmd.arg("-dsco").arg(format!("MINZOOM={}", source.min_zoom));
         cmd.arg("-dsco").arg(format!("MAXZOOM={}", source.max_zoom));
+
+        // Per-layer zoom range, narrower than the dataset's
+        cmd.args(gdal_layer_zoom_args(exported.zoom_override));
 
         // MVT format
         cmd.arg("-dsco").arg("TYPE=overlay");
@@ -301,6 +348,21 @@ async fn generate_with_gdal(
 
     cleanup_temp(&geojson_files, &temp_dir).await;
     Ok(())
+}
+
+/// `-lco MINZOOM=… -lco MAXZOOM=…` for a layer with its own zoom range. These are
+/// the MBTiles/MVT drivers' layer creation options; without them the layer spans
+/// the dataset's `MINZOOM`/`MAXZOOM`.
+fn gdal_layer_zoom_args(zoom_override: Option<(u8, u8)>) -> Vec<String> {
+    match zoom_override {
+        Some((min, max)) => vec![
+            "-lco".to_string(),
+            format!("MINZOOM={}", min),
+            "-lco".to_string(),
+            format!("MAXZOOM={}", max),
+        ],
+        None => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +418,10 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
 
     // Walk the quadtree top-down: every tile in the extent at min_zoom, then
     // only children of tiles that had data. A child's envelope lies inside its
-    // parent's, so an empty parent implies empty children.
+    // parent's, so an empty parent implies empty children, for every layer.
+    // A layer that starts deeper than the current zoom is not encoded yet, but
+    // a cheap existence check for it still decides where to descend, so the
+    // walk never has to fall back to scanning a whole extent.
     let mut level = tiles_for_bounds(&extent, source.min_zoom, source.min_zoom);
     for z in source.min_zoom..=source.max_zoom {
         if level.is_empty() {
@@ -364,8 +429,16 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
         }
         let candidates = level.len();
         let layer_configs = &layer_configs;
+        // Both depend only on z: computed once per zoom, not per tile.
+        let active = source.tile_layers_at_zoom(z);
+        let pending: Vec<&LayerConfig> = source
+            .layers
+            .iter()
+            .filter(|l| source.layer_zoom_range(l).0 > z)
+            .collect();
+        let (active, pending) = (&active, &pending);
         let mut results = stream::iter(level.into_iter().map(|tile| async move {
-            let features = fetch_tile_features(source, reader, &tile).await?;
+            let features = fetch_tile_features(reader, &tile, active).await?;
             let encoded = if features.is_empty() {
                 None
             } else {
@@ -375,21 +448,26 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
                     layer_configs,
                 )?)
             };
-            Ok::<_, anyhow::Error>((tile, encoded))
+            let expand =
+                encoded.is_some() || any_layer_has_features(reader, pending, &tile).await?;
+            Ok::<_, anyhow::Error>((tile, encoded, expand))
         }))
         .buffer_unordered(concurrency);
 
-        let mut non_empty = Vec::new();
+        let mut zoom_tiles = 0u64;
+        let mut expand = Vec::new();
         while let Some(result) = results.next().await {
-            let (tile, encoded) = result?;
+            let (tile, encoded, descend) = result?;
             if let Some(tile_data) = encoded {
                 store.put_tile(tile.z, tile.x, tile.y, &tile_data)?;
-                non_empty.push(tile);
+                zoom_tiles += 1;
+            }
+            if descend {
+                expand.push(tile);
             }
         }
         drop(results);
 
-        let zoom_tiles = non_empty.len() as u64;
         info!(
             "Zoom {}: generated {} tiles ({} candidates) for source '{}'",
             z, zoom_tiles, candidates, source.name
@@ -397,7 +475,7 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
         total_tiles += zoom_tiles;
 
         level = if z < source.max_zoom {
-            children_within(&non_empty, &extent)
+            children_within(&expand, &extent)
         } else {
             Vec::new()
         };
@@ -414,43 +492,46 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
 /// Margin (degrees, ~10 cm) added around the data extent before tiling.
 const EXTENT_MARGIN_DEG: f64 = 1e-6;
 
-/// Query every layer (and derived layer) of `source` for one tile.
+/// Query the given tile layers (those active at the tile's zoom) for one tile.
 async fn fetch_tile_features(
-    source: &SourceConfig,
     reader: &PostgisReader,
     tile: &TileCoord,
+    tile_layers: &[TileLayer<'_>],
 ) -> Result<HashMap<String, Vec<crate::postgis::FeatureData>>> {
     let bounds = tile.bounds();
     let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
 
-    for layer in &source.layers {
-        let features = reader.get_features_in_bounds(layer, &bounds).await?;
+    for tl in tile_layers {
+        let features = match tl.derived {
+            None => reader.get_features_in_bounds(tl.layer, &bounds).await?,
+            Some(derived) => {
+                reader
+                    .get_derived_features_in_bounds(tl.layer, derived, &bounds)
+                    .await?
+            }
+        };
         if !features.is_empty() {
-            features_by_layer.insert(layer.name.clone(), features);
-        }
-
-        // Derived label points
-        if layer.generate_label_points {
-            let label_features = reader
-                .get_derived_features_in_bounds(layer, DerivedGeomType::LabelPoint, &bounds)
-                .await?;
-            if !label_features.is_empty() {
-                features_by_layer.insert(format!("{}_labels", layer.name), label_features);
-            }
-        }
-
-        // Derived boundary lines
-        if layer.generate_boundary_lines {
-            let boundary_features = reader
-                .get_derived_features_in_bounds(layer, DerivedGeomType::BoundaryLine, &bounds)
-                .await?;
-            if !boundary_features.is_empty() {
-                features_by_layer.insert(format!("{}_boundary", layer.name), boundary_features);
-            }
+            features_by_layer.insert(tl.name.clone(), features);
         }
     }
 
     Ok(features_by_layer)
+}
+
+/// Whether any of `layers` has a feature (or label point) in the tile. Used for
+/// layers that start deeper, to decide which tiles the walk descends into.
+async fn any_layer_has_features(
+    reader: &PostgisReader,
+    layers: &[&LayerConfig],
+    tile: &TileCoord,
+) -> Result<bool> {
+    let bounds = tile.bounds();
+    for layer in layers {
+        if reader.layer_has_features_in_bounds(layer, &bounds).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -468,6 +549,19 @@ mod tests {
             layers: vec![],
             tippecanoe: TippecanoeConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_gdal_layer_zoom_args_none_without_override() {
+        assert!(gdal_layer_zoom_args(None).is_empty());
+    }
+
+    #[test]
+    fn test_gdal_layer_zoom_args_with_override() {
+        assert_eq!(
+            gdal_layer_zoom_args(Some((10, 14))),
+            vec!["-lco", "MINZOOM=10", "-lco", "MAXZOOM=14"]
+        );
     }
 
     #[test]

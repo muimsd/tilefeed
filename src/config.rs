@@ -248,6 +248,12 @@ pub struct LayerConfig {
     /// derived from ST_Boundary of the polygon.
     #[serde(default)]
     pub generate_boundary_lines: bool,
+    /// Lowest zoom this layer (and its derived layers) appears at. Must lie within
+    /// the source's zoom range; defaults to the source's `min_zoom`.
+    pub min_zoom: Option<u8>,
+    /// Highest zoom this layer (and its derived layers) appears at. Must lie within
+    /// the source's zoom range; defaults to the source's `max_zoom`.
+    pub max_zoom: Option<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -529,6 +535,97 @@ impl AppConfig {
 }
 
 impl SourceConfig {
+    /// Effective zoom range of a layer: its own `min_zoom`/`max_zoom`, falling back
+    /// to the source's. Derived layers (`_labels`, `_boundary`) share their
+    /// parent's range.
+    pub fn layer_zoom_range(&self, layer: &LayerConfig) -> (u8, u8) {
+        (
+            layer.min_zoom.unwrap_or(self.min_zoom),
+            layer.max_zoom.unwrap_or(self.max_zoom),
+        )
+    }
+
+    /// The layer's zoom range when it is narrower than the source's, i.e. when a
+    /// generator has to restrict it explicitly. `None` means "every source zoom".
+    pub fn layer_zoom_override(&self, layer: &LayerConfig) -> Option<(u8, u8)> {
+        let range = self.layer_zoom_range(layer);
+        (range != (self.min_zoom, self.max_zoom)).then_some(range)
+    }
+
+    /// Whether a layer (and its derived layers) is encoded into tiles at zoom `z`.
+    pub fn layer_applies_at_zoom(&self, layer: &LayerConfig, z: u8) -> bool {
+        let (min, max) = self.layer_zoom_range(layer);
+        (min..=max).contains(&z)
+    }
+
+    /// Layers to encode into tiles at zoom `z`.
+    pub fn layers_at_zoom(&self, z: u8) -> impl Iterator<Item = &LayerConfig> {
+        self.layers
+            .iter()
+            .filter(move |l| self.layer_applies_at_zoom(l, z))
+    }
+
+    /// Every tile layer (original and derived) to query and encode for a tile at
+    /// zoom `z`, in encoding order. Derived layers follow their parent's range.
+    pub fn tile_layers_at_zoom(&self, z: u8) -> Vec<TileLayer<'_>> {
+        let mut out = Vec::new();
+        for layer in self.layers_at_zoom(z) {
+            out.push(TileLayer {
+                name: layer.name.clone(),
+                layer,
+                derived: None,
+            });
+            if layer.generate_label_points {
+                out.push(TileLayer {
+                    name: format!("{}_labels", layer.name),
+                    layer,
+                    derived: Some(DerivedGeomType::LabelPoint),
+                });
+            }
+            if layer.generate_boundary_lines {
+                out.push(TileLayer {
+                    name: format!("{}_boundary", layer.name),
+                    layer,
+                    derived: Some(DerivedGeomType::BoundaryLine),
+                });
+            }
+        }
+        out
+    }
+
+    /// Check the per-layer zoom ranges against each other and the source's range.
+    pub fn validate_layer_zooms(&self) -> anyhow::Result<()> {
+        for layer in &self.layers {
+            let (min, max) = self.layer_zoom_range(layer);
+            if let Some(z) = layer.min_zoom {
+                if z < self.min_zoom || z > self.max_zoom {
+                    anyhow::bail!(
+                        "layer '{}' in source '{}': min_zoom {} is outside the source's zoom range {}..={}",
+                        layer.name, self.name, z, self.min_zoom, self.max_zoom
+                    );
+                }
+            }
+            if let Some(z) = layer.max_zoom {
+                if z < self.min_zoom || z > self.max_zoom {
+                    anyhow::bail!(
+                        "layer '{}' in source '{}': max_zoom {} is outside the source's zoom range {}..={}",
+                        layer.name, self.name, z, self.min_zoom, self.max_zoom
+                    );
+                }
+            }
+            if min > max {
+                anyhow::bail!(
+                    "layer '{}' in source '{}': min_zoom {} is greater than max_zoom {}",
+                    layer.name,
+                    self.name,
+                    min,
+                    max
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Find a layer by name within this source
     pub fn find_layer(&self, name: &str) -> Option<&LayerConfig> {
         self.layers.iter().find(|l| l.name == name)
@@ -556,6 +653,17 @@ impl SourceConfig {
         }
         names
     }
+}
+
+/// One layer of a tile: an original layer, or a layer derived from one.
+#[derive(Debug, Clone)]
+pub struct TileLayer<'a> {
+    /// Name of the layer inside the tile (`parks`, `parks_labels`, ...)
+    pub name: String,
+    /// The configured layer the features come from
+    pub layer: &'a LayerConfig,
+    /// `None` for the layer itself, otherwise the derived geometry
+    pub derived: Option<DerivedGeomType>,
 }
 
 /// Type of derived geometry to generate from a polygon layer
@@ -623,8 +731,19 @@ pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
         .build()?;
 
     let cfg: AppConfig = settings.try_deserialize()?;
-    check_label_point_columns(&cfg)?;
+    cfg.validate()?;
     Ok(cfg)
+}
+
+impl AppConfig {
+    /// Semantic checks serde cannot express. Run by `load_config`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for source in &self.sources {
+            source.validate_layer_zooms()?;
+        }
+        check_label_point_columns(self)?;
+        Ok(())
+    }
 }
 
 /// `label_point_column` is spliced into SQL as a quoted identifier, so only plain identifiers are allowed.
@@ -666,6 +785,8 @@ mod tests {
             property_rules: None,
             generate_label_points: false,
             generate_boundary_lines: false,
+            min_zoom: None,
+            max_zoom: None,
             label_point_method: Default::default(),
             label_point_column: None,
         }
@@ -1188,6 +1309,211 @@ mod tests {
         // find_layer only matches actual layer names, not derived
         assert!(source.find_layer("parks_labels").is_none());
         assert!(source.find_layer("parks").is_some());
+    }
+
+    // --- per-layer zoom range ---
+
+    fn parse_config(toml: &str) -> anyhow::Result<AppConfig> {
+        let dir = std::env::temp_dir().join(format!(
+            "tilefeed-cfg-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        // Same parse and validation as load_config, without the TILES_*
+        // environment layer, so the test can't pick up the runner's env.
+        let result = config::Config::builder()
+            .add_source(config::File::with_name(path.to_str().unwrap()))
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|s| s.try_deserialize::<AppConfig>().map_err(Into::into))
+            .and_then(|cfg| cfg.validate().map(|_| cfg));
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    fn config_with_layer_zooms(layer_zooms: &str) -> String {
+        format!(
+            r#"
+[database]
+host = "localhost"
+port = 5432
+user = "postgres"
+password = ""
+dbname = "tiles"
+
+[[sources]]
+name = "basemap"
+mbtiles_path = "/tmp/basemap.mbtiles"
+min_zoom = 2
+max_zoom = 14
+
+[[sources.layers]]
+name = "roads"
+table = "roads"
+{layer_zooms}
+"#
+        )
+    }
+
+    #[test]
+    fn test_layer_zoom_range_parses() {
+        let cfg = parse_config(&config_with_layer_zooms("min_zoom = 10\nmax_zoom = 12")).unwrap();
+        let source = &cfg.sources[0];
+        let layer = &source.layers[0];
+        assert_eq!(layer.min_zoom, Some(10));
+        assert_eq!(layer.max_zoom, Some(12));
+        assert_eq!(source.layer_zoom_range(layer), (10, 12));
+        assert_eq!(source.layer_zoom_override(layer), Some((10, 12)));
+    }
+
+    #[test]
+    fn test_layer_zoom_range_defaults_to_source_range() {
+        let cfg = parse_config(&config_with_layer_zooms("")).unwrap();
+        let source = &cfg.sources[0];
+        let layer = &source.layers[0];
+        assert_eq!(layer.min_zoom, None);
+        assert_eq!(layer.max_zoom, None);
+        assert_eq!(source.layer_zoom_range(layer), (2, 14));
+        assert_eq!(source.layer_zoom_override(layer), None);
+        assert!(source.layer_applies_at_zoom(layer, 2));
+        assert!(source.layer_applies_at_zoom(layer, 14));
+    }
+
+    #[test]
+    fn test_layer_zoom_range_one_sided() {
+        let cfg = parse_config(&config_with_layer_zooms("min_zoom = 10")).unwrap();
+        let source = &cfg.sources[0];
+        assert_eq!(source.layer_zoom_range(&source.layers[0]), (10, 14));
+
+        let cfg = parse_config(&config_with_layer_zooms("max_zoom = 6")).unwrap();
+        let source = &cfg.sources[0];
+        assert_eq!(source.layer_zoom_range(&source.layers[0]), (2, 6));
+    }
+
+    #[test]
+    fn test_layer_zoom_range_equal_to_source_range_is_no_override() {
+        let cfg = parse_config(&config_with_layer_zooms("min_zoom = 2\nmax_zoom = 14")).unwrap();
+        let source = &cfg.sources[0];
+        assert_eq!(source.layer_zoom_override(&source.layers[0]), None);
+    }
+
+    #[test]
+    fn test_layer_zoom_range_rejects_min_above_max() {
+        let err = parse_config(&config_with_layer_zooms("min_zoom = 12\nmax_zoom = 10"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'roads'"), "{err}");
+        assert!(
+            err.contains("min_zoom 12 is greater than max_zoom 10"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_layer_zoom_range_rejects_min_above_implied_max() {
+        // min_zoom alone, above the source's max_zoom
+        let err = parse_config(&config_with_layer_zooms("min_zoom = 15"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'roads'"), "{err}");
+        assert!(err.contains("min_zoom 15 is outside"), "{err}");
+    }
+
+    #[test]
+    fn test_layer_zoom_range_rejects_below_source_min() {
+        let err = parse_config(&config_with_layer_zooms("min_zoom = 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("layer 'roads' in source 'basemap'"), "{err}");
+        assert!(
+            err.contains("min_zoom 0 is outside the source's zoom range 2..=14"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_layer_zoom_range_rejects_above_source_max() {
+        let err = parse_config(&config_with_layer_zooms("max_zoom = 16"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_zoom 16 is outside"), "{err}");
+    }
+
+    #[test]
+    fn test_layer_zoom_range_rejects_max_below_source_min() {
+        let err = parse_config(&config_with_layer_zooms("max_zoom = 1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_zoom 1 is outside"), "{err}");
+    }
+
+    #[test]
+    fn test_layers_at_zoom_filters_by_range() {
+        let mut source = sample_source("src", &["base", "detail", "overview"]);
+        source.layers[1].min_zoom = Some(10);
+        source.layers[2].max_zoom = Some(5);
+        source.validate_layer_zooms().unwrap();
+
+        let names =
+            |z: u8| -> Vec<&str> { source.layers_at_zoom(z).map(|l| l.name.as_str()).collect() };
+        assert_eq!(names(0), vec!["base", "overview"]);
+        assert_eq!(names(5), vec!["base", "overview"]);
+        assert_eq!(names(6), vec!["base"]);
+        assert_eq!(names(10), vec!["base", "detail"]);
+        assert_eq!(names(14), vec!["base", "detail"]);
+    }
+
+    #[test]
+    fn test_tile_layers_at_zoom_derived_layers_inherit_parent_range() {
+        let mut source = sample_source("src", &["parks", "roads"]);
+        source.layers[0].generate_label_points = true;
+        source.layers[0].generate_boundary_lines = true;
+        source.layers[0].min_zoom = Some(8);
+        source.layers[0].max_zoom = Some(12);
+
+        let names = |z: u8| -> Vec<String> {
+            source
+                .tile_layers_at_zoom(z)
+                .into_iter()
+                .map(|tl| tl.name)
+                .collect()
+        };
+        assert_eq!(names(7), vec!["roads"]);
+        assert_eq!(
+            names(8),
+            vec!["parks", "parks_labels", "parks_boundary", "roads"]
+        );
+        assert_eq!(
+            names(12),
+            vec!["parks", "parks_labels", "parks_boundary", "roads"]
+        );
+        assert_eq!(names(13), vec!["roads"]);
+
+        let derived: Vec<Option<DerivedGeomType>> = source
+            .tile_layers_at_zoom(8)
+            .into_iter()
+            .map(|tl| tl.derived)
+            .collect();
+        assert_eq!(
+            derived,
+            vec![
+                None,
+                Some(DerivedGeomType::LabelPoint),
+                Some(DerivedGeomType::BoundaryLine),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tile_layers_at_zoom_empty_when_no_layer_covers_zoom() {
+        let mut source = sample_source("src", &["detail"]);
+        source.layers[0].min_zoom = Some(10);
+        assert!(source.tile_layers_at_zoom(9).is_empty());
+        assert_eq!(source.tile_layers_at_zoom(10).len(), 1);
     }
 
     // --- Example config loading tests ---
