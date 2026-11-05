@@ -12,7 +12,7 @@ fn geojson_feature(
     id: i64,
     geometry: JsonValue,
     properties: JsonValue,
-    tippecanoe_zoom: Option<(u8, u8)>,
+    tippecanoe_zoom: Option<TippecanoeZoom>,
 ) -> JsonValue {
     let mut feature = serde_json::json!({
         "type": "Feature",
@@ -21,10 +21,23 @@ fn geojson_feature(
         "properties": properties,
     });
     if let Some((minzoom, maxzoom)) = tippecanoe_zoom {
-        feature["tippecanoe"] = serde_json::json!({ "minzoom": minzoom, "maxzoom": maxzoom });
+        let mut zoom = serde_json::Map::new();
+        if let Some(z) = minzoom {
+            zoom.insert("minzoom".into(), z.into());
+        }
+        if let Some(z) = maxzoom {
+            zoom.insert("maxzoom".into(), z.into());
+        }
+        if !zoom.is_empty() {
+            feature["tippecanoe"] = JsonValue::Object(zoom);
+        }
     }
     feature
 }
+
+/// The `(minzoom, maxzoom)` a layer sets explicitly; an unset bound is left
+/// out of Tippecanoe's per-feature object.
+pub type TippecanoeZoom = (Option<u8>, Option<u8>);
 
 #[derive(Clone)]
 pub struct PostgisReader {
@@ -73,7 +86,7 @@ impl PostgisReader {
         &self,
         layer: &LayerConfig,
         output_path: &str,
-        tippecanoe_zoom: Option<(u8, u8)>,
+        tippecanoe_zoom: Option<TippecanoeZoom>,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         let schema = layer.schema.as_deref().unwrap_or("public");
@@ -271,6 +284,48 @@ impl PostgisReader {
         })
     }
 
+    /// Whether the layer has any feature (or, with a label_point_column, any
+    /// label point) intersecting the bounds. A cheap `EXISTS`, no geometry
+    /// returned.
+    pub async fn layer_has_features_in_bounds(
+        &self,
+        layer: &LayerConfig,
+        bounds: &Bounds,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let schema = layer.schema.as_deref().unwrap_or("public");
+        let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
+        let hits = |col: &str| {
+            format!(
+                r#"("{col}" IS NOT NULL AND ST_Intersects(ST_Transform("{col}", 4326), ST_MakeEnvelope($1, $2, $3, $4, 4326)))"#
+            )
+        };
+        let mut predicate = hits(geom_col);
+        if let Some(label_col) = layer.active_label_column() {
+            predicate = format!("({} OR {})", predicate, hits(label_col));
+        }
+        if let Some(ref filter) = layer.filter {
+            predicate = format!("{} AND ({})", predicate, filter);
+        }
+        let query = format!(
+            r#"SELECT EXISTS (SELECT 1 FROM "{schema}"."{table}" WHERE {predicate})"#,
+            table = layer.table,
+        );
+        let row = client
+            .query_one(
+                &query,
+                &[
+                    &bounds.min_lon,
+                    &bounds.min_lat,
+                    &bounds.max_lon,
+                    &bounds.max_lat,
+                ],
+            )
+            .await
+            .with_context(|| format!("Failed to probe layer '{}'", layer.name))?;
+        Ok(row.get(0))
+    }
+
     /// Get all features intersecting a given tile bounding box
     pub async fn get_features_in_bounds(
         &self,
@@ -350,7 +405,7 @@ impl PostgisReader {
         layer: &LayerConfig,
         derived_type: DerivedGeomType,
         output_path: &str,
-        tippecanoe_zoom: Option<(u8, u8)>,
+        tippecanoe_zoom: Option<TippecanoeZoom>,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         let schema = layer.schema.as_deref().unwrap_or("public");
@@ -685,11 +740,25 @@ mod tests {
             1,
             serde_json::json!({"type": "Point", "coordinates": [0.0, 0.0]}),
             serde_json::json!({}),
-            Some((10, 14)),
+            Some((Some(10), Some(14))),
         );
         assert_eq!(f["tippecanoe"]["minzoom"], 10);
         assert_eq!(f["tippecanoe"]["maxzoom"], 14);
         // The zoom object is a feature member, never a property
         assert!(f["properties"].get("tippecanoe").is_none());
+    }
+
+    #[test]
+    fn test_geojson_feature_stamps_only_the_bounds_the_layer_sets() {
+        // min_zoom alone must not cap the layer at the source's max zoom
+        // (it would stop short under --extend-zooms-if-still-dropping).
+        let f = geojson_feature(
+            1,
+            serde_json::json!({"type": "Point", "coordinates": [0.0, 0.0]}),
+            serde_json::json!({}),
+            Some((Some(10), None)),
+        );
+        assert_eq!(f["tippecanoe"]["minzoom"], 10);
+        assert!(f["tippecanoe"].get("maxzoom").is_none());
     }
 }

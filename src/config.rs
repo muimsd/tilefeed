@@ -1322,7 +1322,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, toml).unwrap();
-        let result = load_config(path.to_str().unwrap());
+        // Same parse and validation as load_config, without the TILES_*
+        // environment layer, so the test can't pick up the runner's env.
+        let result = config::Config::builder()
+            .add_source(config::File::with_name(path.to_str().unwrap()))
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|s| s.try_deserialize::<AppConfig>().map_err(Into::into))
+            .and_then(|cfg| cfg.validate().map(|_| cfg));
         let _ = std::fs::remove_dir_all(&dir);
         result
     }

@@ -3,7 +3,7 @@ use futures_util::stream::{self, StreamExt};
 use std::collections::HashMap;
 use tracing::info;
 
-use crate::config::{DerivedGeomType, GenerationBackend, SourceConfig};
+use crate::config::{DerivedGeomType, GenerationBackend, LayerConfig, SourceConfig, TileLayer};
 use crate::mbtiles::MbtilesStore;
 use crate::mvt;
 use crate::postgis::PostgisReader;
@@ -85,7 +85,12 @@ async fn export_all_layers(
 
     for layer in &source.layers {
         let zoom_override = source.layer_zoom_override(layer);
-        let stamp = zoom_override.filter(|_| stamp_tippecanoe_zoom);
+        // Only the bounds the layer sets are stamped: a layer with just
+        // min_zoom keeps following the tileset upward (e.g. with
+        // --extend-zooms-if-still-dropping).
+        let stamp = zoom_override
+            .filter(|_| stamp_tippecanoe_zoom)
+            .map(|_| (layer.min_zoom, layer.max_zoom));
         // Original layer
         let geojson_path = temp_dir
             .join(format!("{}.geojson", layer.name))
@@ -385,15 +390,12 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
     // except points from a label_point_column, which get_layer_extent also
     // covers.
     let mut extent: Option<crate::postgis::Bounds> = None;
-    // Per-layer extents, to seed layers that start below the source's min_zoom.
-    let mut layer_extents: Vec<(&crate::config::LayerConfig, crate::postgis::Bounds)> = Vec::new();
     for layer in &source.layers {
         if let Some(b) = reader.get_layer_extent(layer).await? {
             extent = Some(match extent {
                 Some(e) => union_bounds(&e, &b),
-                None => b.clone(),
+                None => b,
             });
-            layer_extents.push((layer, expand_bounds(&b, EXTENT_MARGIN_DEG)));
         }
     }
     let Some(extent) = extent else {
@@ -414,30 +416,29 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
     let concurrency = reader.max_connections().max(1);
     let mut total_tiles = 0u64;
 
-    // Walk the quadtree top-down: children of tiles that had data, plus, at
-    // each layer's first zoom, every tile in that layer's extent. A child's
-    // envelope lies inside its parent's, so a layer present in a child was
-    // present (and queried) in the parent too, unless the layer starts at the
-    // child's zoom, which is exactly what the seeding covers.
-    let mut next: Vec<TileCoord> = Vec::new();
+    // Walk the quadtree top-down: every tile in the extent at min_zoom, then
+    // only children of tiles that had data. A child's envelope lies inside its
+    // parent's, so an empty parent implies empty children, for every layer.
+    // A layer that starts deeper than the current zoom is not encoded yet, but
+    // a cheap existence check for it still decides where to descend, so the
+    // walk never has to fall back to scanning a whole extent.
+    let mut level = tiles_for_bounds(&extent, source.min_zoom, source.min_zoom);
     for z in source.min_zoom..=source.max_zoom {
-        let mut level: Vec<TileCoord> = std::mem::take(&mut next);
-        for (layer, bounds) in &layer_extents {
-            if source.layer_zoom_range(layer).0 == z {
-                level.extend(tiles_for_bounds(bounds, z, z));
-            }
-        }
-        level.sort_by_key(|t| (t.x, t.y));
-        level.dedup();
-        // No layer covers this zoom, or nothing to look at: carry on, a layer
-        // may still start deeper.
-        if level.is_empty() || source.tile_layers_at_zoom(z).is_empty() {
-            continue;
+        if level.is_empty() {
+            break;
         }
         let candidates = level.len();
         let layer_configs = &layer_configs;
+        // Both depend only on z: computed once per zoom, not per tile.
+        let active = source.tile_layers_at_zoom(z);
+        let pending: Vec<&LayerConfig> = source
+            .layers
+            .iter()
+            .filter(|l| source.layer_zoom_range(l).0 > z)
+            .collect();
+        let (active, pending) = (&active, &pending);
         let mut results = stream::iter(level.into_iter().map(|tile| async move {
-            let features = fetch_tile_features(source, reader, &tile).await?;
+            let features = fetch_tile_features(reader, &tile, active).await?;
             let encoded = if features.is_empty() {
                 None
             } else {
@@ -447,30 +448,37 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
                     layer_configs,
                 )?)
             };
-            Ok::<_, anyhow::Error>((tile, encoded))
+            let expand =
+                encoded.is_some() || any_layer_has_features(reader, pending, &tile).await?;
+            Ok::<_, anyhow::Error>((tile, encoded, expand))
         }))
         .buffer_unordered(concurrency);
 
-        let mut non_empty = Vec::new();
+        let mut zoom_tiles = 0u64;
+        let mut expand = Vec::new();
         while let Some(result) = results.next().await {
-            let (tile, encoded) = result?;
+            let (tile, encoded, descend) = result?;
             if let Some(tile_data) = encoded {
                 store.put_tile(tile.z, tile.x, tile.y, &tile_data)?;
-                non_empty.push(tile);
+                zoom_tiles += 1;
+            }
+            if descend {
+                expand.push(tile);
             }
         }
         drop(results);
 
-        let zoom_tiles = non_empty.len() as u64;
         info!(
             "Zoom {}: generated {} tiles ({} candidates) for source '{}'",
             z, zoom_tiles, candidates, source.name
         );
         total_tiles += zoom_tiles;
 
-        if z < source.max_zoom {
-            next = children_within(&non_empty, &extent);
-        }
+        level = if z < source.max_zoom {
+            children_within(&expand, &extent)
+        } else {
+            Vec::new()
+        };
     }
 
     info!(
@@ -484,16 +492,16 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
 /// Margin (degrees, ~10 cm) added around the data extent before tiling.
 const EXTENT_MARGIN_DEG: f64 = 1e-6;
 
-/// Query every layer (and derived layer) of `source` active at the tile's zoom.
+/// Query the given tile layers (those active at the tile's zoom) for one tile.
 async fn fetch_tile_features(
-    source: &SourceConfig,
     reader: &PostgisReader,
     tile: &TileCoord,
+    tile_layers: &[TileLayer<'_>],
 ) -> Result<HashMap<String, Vec<crate::postgis::FeatureData>>> {
     let bounds = tile.bounds();
     let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
 
-    for tl in source.tile_layers_at_zoom(tile.z) {
+    for tl in tile_layers {
         let features = match tl.derived {
             None => reader.get_features_in_bounds(tl.layer, &bounds).await?,
             Some(derived) => {
@@ -503,11 +511,27 @@ async fn fetch_tile_features(
             }
         };
         if !features.is_empty() {
-            features_by_layer.insert(tl.name, features);
+            features_by_layer.insert(tl.name.clone(), features);
         }
     }
 
     Ok(features_by_layer)
+}
+
+/// Whether any of `layers` has a feature (or label point) in the tile. Used for
+/// layers that start deeper, to decide which tiles the walk descends into.
+async fn any_layer_has_features(
+    reader: &PostgisReader,
+    layers: &[&LayerConfig],
+    tile: &TileCoord,
+) -> Result<bool> {
+    let bounds = tile.bounds();
+    for layer in layers {
+        if reader.layer_has_features_in_bounds(layer, &bounds).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

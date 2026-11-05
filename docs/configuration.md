@@ -243,11 +243,16 @@ The range must lie inside the source's: `tilefeed` refuses to start when
 `min_zoom > max_zoom` or when either is outside the source's `min_zoom..=max_zoom`,
 naming the layer.
 
+Like any change to a layer's config, changing its zoom range needs a full
+`generate`. Incremental updates only rewrite tiles inside the layer's current
+range, so tiles built under the old range keep their old content at zooms the
+layer no longer covers.
+
 All generation backends honour it:
 
 | Backend | How |
 |---------|-----|
-| `tippecanoe` | Each exported feature carries Tippecanoe's `"tippecanoe": {"minzoom": …, "maxzoom": …}` object |
+| `tippecanoe` | Each exported feature carries Tippecanoe's `"tippecanoe": {"minzoom": …, "maxzoom": …}` object, with only the bounds the layer sets (so `min_zoom` alone doesn't cap the layer under `--extend-zooms-if-still-dropping`) |
 | `gdal` | `ogr2ogr` is given the layer creation options `-lco MINZOOM=… -lco MAXZOOM=…` |
 | `native` | The layer is not queried or encoded for tiles outside its range |
 
