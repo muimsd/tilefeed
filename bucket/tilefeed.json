@@ -1,6 +1,6 @@
 {
     "version": "0.9.0",
-    "description": "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY",
+    "description": "Dynamic vector tiles from PostGIS and GDAL files",
     "homepage": "https://github.com/muimsd/tilefeed",
     "license": "MIT",
     "architecture": {

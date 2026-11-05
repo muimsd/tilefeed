@@ -1,5 +1,5 @@
 class Tilefeed < Formula
-  desc "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
+  desc "Dynamic vector tiles from PostGIS and GDAL files"
   homepage "https://github.com/muimsd/tilefeed"
   version "0.9.0"
   license "MIT"
