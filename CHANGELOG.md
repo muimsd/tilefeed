@@ -9,11 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tile cache.** `serve` keeps tiles in memory with their ETag, in an LRU bounded by `[serve.cache] max_size_mb` (default 64) with an optional `ttl_secs`. Incremental updates clear exactly the tiles they rewrite, right after the MBTiles commit, and commits by other processes (a cron `generate`, a separate `watch`) clear the source within about 2 seconds, detected via SQLite's `data_version`. Only zooms within the source's range are cached. New metrics: `tilefeed_tile_cache_*`.
+- **Out-of-range tile coordinates return 404.** `x` or `y` ≥ 2^z (or z > 30) used to wrap around in the TMS flip.
+- **Configurable `Cache-Control`.** `[serve] max_age_secs` (default 300, the previous fixed value). `0` sends `no-cache`, so browsers revalidate with the ETag and see updates immediately. 304 responses now carry `Cache-Control` too.
+- **Label point method.** Layers with `generate_label_points = true` accept `label_point_method` (`point_on_surface`, the default and previous behaviour, or `centroid` for the center of mass) and `label_point_column` (use an existing point column instead of computing one).
+- **TLS to PostgreSQL.** New `[database]` keys `sslmode` (`disable` | `prefer` | `require` | `verify-ca` | `verify-full`, libpq semantics, default `prefer`) and `sslrootcert`. Uses rustls (ring) for both the connection pool and the LISTEN/NOTIFY connection, so managed databases that enforce TLS (Supabase, Neon, RDS, Cloud SQL, Crunchy Bridge) can now be reached. `verify-ca` requires `sslrootcert`; `verify-full` verifies against `sslrootcert` or the bundled webpki roots. Unix-socket hosts never use TLS, as in libpq.
 - **Per-layer zoom range**: `min_zoom` / `max_zoom` on `[[sources.layers]]` restrict a layer to part of its source's zoom range (e.g. buildings only from zoom 13). Either may be set alone; derived `_labels` / `_boundary` layers follow their parent. All three backends honour it — Tippecanoe through per-feature `"tippecanoe": {"minzoom", "maxzoom"}` objects, GDAL through the `MINZOOM`/`MAXZOOM` layer creation options, and the native encoder by skipping the layer outside its range. Incremental updates only re-encode tiles inside the changed layer's range and never write a layer into a tile outside it, and TileJSON reports each layer's `minzoom`/`maxzoom`. See [docs/configuration.md](docs/configuration.md#per-layer-zoom-range).
 
 ### Fixed
 
 - Per-layer `min_zoom` / `max_zoom` keys were accepted and silently ignored, so a layer meant for "zoom 10–14" appeared at every zoom of its source. Config loading now also rejects a range with `min_zoom > max_zoom` or one outside the source's range, naming the layer.
+- **The native generator no longer walks the whole world.** `generation_backend = "native"` iterated every `x,y` at every zoom and issued a query per tile per layer, so even a 900-row table at z10–15 never finished. It now restricts tiles to the data extent and descends the quadtree only below non-empty tiles, running tile queries concurrently. Output for tiles with data is unchanged.
+- Listener reconnect logs now include the underlying cause (e.g. `server does not support TLS`) instead of only the outermost error context.
+- Database connections are configured field by field rather than through a `key=value` string, so passwords containing spaces or quotes work for the LISTEN connection.
 
 ## [0.9.0] - 2026-09-12
 

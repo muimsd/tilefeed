@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde_json::Value as JsonValue;
-use tokio_postgres::NoTls;
 use tracing::info;
 
 use crate::config::{DatabaseConfig, DerivedGeomType, LayerConfig};
@@ -34,25 +33,34 @@ pub struct PostgisReader {
 
 impl PostgisReader {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
-        let mut pool_cfg = PoolConfig::new();
-        pool_cfg.host = Some(config.host.clone());
-        pool_cfg.port = Some(config.port);
-        pool_cfg.user = Some(config.user.clone());
-        pool_cfg.password = Some(config.password.clone());
-        pool_cfg.dbname = Some(config.dbname.clone());
+        let tls = crate::pgtls::make_tls_connector(config)?;
+        let manager = Manager::from_config(
+            config.pg_config(),
+            tls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
 
         let pool_size = config.pool_size.unwrap_or(4);
-        let pool = pool_cfg
-            .builder(NoTls)
-            .context("Failed to create pool builder")?
+        let pool = Pool::builder(manager)
             .max_size(pool_size)
             .runtime(Runtime::Tokio1)
             .build()
             .context("Failed to build connection pool")?;
 
         // Verify connectivity
-        let _client = pool.get().await.context("Failed to connect to PostGIS")?;
-        info!("Connected to PostGIS (pool_size={})", pool_size);
+        let _client = pool.get().await.with_context(|| {
+            format!(
+                "Failed to connect to PostGIS (sslmode={})",
+                config.sslmode.as_str()
+            )
+        })?;
+        info!(
+            "Connected to PostGIS (pool_size={}, sslmode={})",
+            pool_size,
+            config.sslmode.as_str()
+        );
 
         Ok(Self { pool })
     }
@@ -105,6 +113,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -157,17 +166,25 @@ impl PostgisReader {
             None => "*".to_string(),
         };
 
+        // Affected tiles must cover the label point too, which a
+        // label_point_column may place outside the geometry.
+        let bounds_geom = match layer.active_label_column() {
+            Some(label_col) => format!(
+                r#"ST_Envelope(ST_Collect(ST_Transform("{geom_col}", 4326), ST_Transform(COALESCE("{label_col}", "{geom_col}"), 4326)))"#
+            ),
+            None => format!(r#"ST_Transform(ST_Envelope("{geom_col}"), 4326)"#),
+        };
         let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties,
-                ST_XMin(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmin,
-                ST_YMin(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as ymin,
-                ST_XMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmax,
-                ST_YMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as ymax
+                ST_XMin({bounds_geom}) as xmin,
+                ST_YMin({bounds_geom}) as ymin,
+                ST_XMax({bounds_geom}) as xmax,
+                ST_YMax({bounds_geom}) as ymax
             FROM "{schema}"."{table}"
-            WHERE "{id_col}" = $1 AND "{geom_col}" IS NOT NULL"#,
+            WHERE "{id_col}" = $1::bigint AND "{geom_col}" IS NOT NULL"#,
             table = layer.table,
         );
 
@@ -198,6 +215,60 @@ impl PostgisReader {
             }
             None => Ok(None),
         }
+    }
+
+    /// Maximum number of pooled connections (upper bound for useful query concurrency).
+    pub fn max_connections(&self) -> usize {
+        self.pool.status().max_size
+    }
+
+    /// Extent of a layer's (filtered) geometries in EPSG:4326, or `None` if the
+    /// layer has no rows. Geometries are transformed before aggregating so the
+    /// box is exact rather than a reprojected source-SRID box.
+    pub async fn get_layer_extent(&self, layer: &LayerConfig) -> Result<Option<Bounds>> {
+        let client = self.pool.get().await?;
+        let schema = layer.schema.as_deref().unwrap_or("public");
+        let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
+
+        // A label_point_column may place points outside the polygons'
+        // extent, so it widens the extent too.
+        let extent_geom = match layer.active_label_column() {
+            Some(label_col) => format!(
+                r#"ST_Collect(ST_Transform("{geom_col}", 4326), ST_Transform(COALESCE("{label_col}", "{geom_col}"), 4326))"#
+            ),
+            None => format!(r#"ST_Transform("{geom_col}", 4326)"#),
+        };
+        let mut inner = format!(
+            r#"SELECT ST_Extent({extent_geom}) AS e
+            FROM "{schema}"."{table}"
+            WHERE "{geom_col}" IS NOT NULL"#,
+            table = layer.table,
+        );
+        if let Some(ref filter) = layer.filter {
+            inner.push_str(&format!(" AND ({})", filter));
+        }
+        let query = format!(
+            "SELECT ST_XMin(e), ST_YMin(e), ST_XMax(e), ST_YMax(e) FROM ({}) s",
+            inner
+        );
+
+        let row = client
+            .query_one(&query, &[])
+            .await
+            .with_context(|| format!("Failed to compute extent of layer '{}'", layer.name))?;
+        let min_lon: Option<f64> = row.get(0);
+        let min_lat: Option<f64> = row.get(1);
+        let max_lon: Option<f64> = row.get(2);
+        let max_lat: Option<f64> = row.get(3);
+        Ok(match (min_lon, min_lat, max_lon, max_lat) {
+            (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) => Some(Bounds {
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat,
+            }),
+            _ => None,
+        })
     }
 
     /// Get all features intersecting a given tile bounding box
@@ -255,6 +326,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -295,13 +367,12 @@ impl PostgisReader {
         };
 
         let geom_transform = match derived_type {
-            DerivedGeomType::LabelPoint => {
-                format!("ST_PointOnSurface(ST_Transform(\"{geom_col}\", 4326))")
-            }
+            DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
             DerivedGeomType::BoundaryLine => {
                 format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
             }
         };
+        let src_col = layer.derived_source_column(derived_type, geom_col);
 
         let mut query = format!(
             r#"SELECT
@@ -309,7 +380,7 @@ impl PostgisReader {
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
-            WHERE "{geom_col}" IS NOT NULL"#,
+            WHERE "{src_col}" IS NOT NULL"#,
             table = layer.table,
         );
 
@@ -329,6 +400,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -388,13 +460,12 @@ impl PostgisReader {
         };
 
         let geom_transform = match derived_type {
-            DerivedGeomType::LabelPoint => {
-                format!("ST_PointOnSurface(ST_Transform(\"{geom_col}\", 4326))")
-            }
+            DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
             DerivedGeomType::BoundaryLine => {
                 format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
             }
         };
+        let src_col = layer.derived_source_column(derived_type, geom_col);
 
         let mut query = format!(
             r#"SELECT
@@ -402,9 +473,9 @@ impl PostgisReader {
                 ST_AsGeoJSON({geom_transform})::json as geometry,
                 row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
             FROM "{schema}"."{table}"
-            WHERE "{geom_col}" IS NOT NULL
+            WHERE "{src_col}" IS NOT NULL
               AND ST_Intersects(
-                  ST_Transform("{geom_col}", 4326),
+                  ST_Transform("{src_col}", 4326),
                   ST_MakeEnvelope($1, $2, $3, $4, 4326)
               )"#,
             table = layer.table,
@@ -436,6 +507,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");

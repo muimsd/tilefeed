@@ -43,19 +43,24 @@ fn lat_to_tile_y(lat: f64, zoom: u8) -> u32 {
     ((1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor() as u32
 }
 
+/// Inclusive XYZ tile range `(x_min, x_max, y_min, y_max)` covering `bounds` at `zoom`.
+/// Coordinates outside the Web Mercator square are clamped to the edge tiles.
+pub fn tile_range_for_bounds(bounds: &Bounds, zoom: u8) -> (u32, u32, u32, u32) {
+    let max_tile = (1u32 << zoom) - 1;
+    let x_min = lon_to_tile_x(bounds.min_lon, zoom).min(max_tile);
+    let x_max = lon_to_tile_x(bounds.max_lon, zoom).min(max_tile);
+    // Note: lat_to_tile_y is inverted (higher lat = lower y)
+    let y_min = lat_to_tile_y(bounds.max_lat, zoom).min(max_tile);
+    let y_max = lat_to_tile_y(bounds.min_lat, zoom).min(max_tile);
+    (x_min, x_max, y_min, y_max)
+}
+
 /// Get all tiles that intersect the given bounding box at the specified zoom levels
 pub fn tiles_for_bounds(bounds: &Bounds, min_zoom: u8, max_zoom: u8) -> Vec<TileCoord> {
     let mut tiles = Vec::new();
 
     for z in min_zoom..=max_zoom {
-        let max_tile = (1u32 << z) - 1;
-
-        let x_min = lon_to_tile_x(bounds.min_lon, z).min(max_tile);
-        let x_max = lon_to_tile_x(bounds.max_lon, z).min(max_tile);
-        // Note: lat_to_tile_y is inverted (higher lat = lower y)
-        let y_min = lat_to_tile_y(bounds.max_lat, z).min(max_tile);
-        let y_max = lat_to_tile_y(bounds.min_lat, z).min(max_tile);
-
+        let (x_min, x_max, y_min, y_max) = tile_range_for_bounds(bounds, z);
         for x in x_min..=x_max {
             for y in y_min..=y_max {
                 tiles.push(TileCoord { z, x, y });
@@ -64,6 +69,53 @@ pub fn tiles_for_bounds(bounds: &Bounds, min_zoom: u8, max_zoom: u8) -> Vec<Tile
     }
 
     tiles
+}
+
+/// Smallest bounds containing both `a` and `b`.
+pub fn union_bounds(a: &Bounds, b: &Bounds) -> Bounds {
+    Bounds {
+        min_lon: a.min_lon.min(b.min_lon),
+        min_lat: a.min_lat.min(b.min_lat),
+        max_lon: a.max_lon.max(b.max_lon),
+        max_lat: a.max_lat.max(b.max_lat),
+    }
+}
+
+/// Grow `bounds` by `margin` degrees on every side.
+pub fn expand_bounds(bounds: &Bounds, margin: f64) -> Bounds {
+    Bounds {
+        min_lon: bounds.min_lon - margin,
+        min_lat: bounds.min_lat - margin,
+        max_lon: bounds.max_lon + margin,
+        max_lat: bounds.max_lat + margin,
+    }
+}
+
+/// Next quadtree level for a top-down walk: the children of `parents` (all at
+/// the same zoom) that intersect `extent`, sorted and de-duplicated.
+///
+/// A child tile's envelope is contained in its parent's, so a child can only
+/// hold features if its parent does — expanding only non-empty parents never
+/// skips a tile with data.
+pub fn children_within(parents: &[TileCoord], extent: &Bounds) -> Vec<TileCoord> {
+    let mut out = Vec::with_capacity(parents.len() * 4);
+    let Some(first) = parents.first() else {
+        return out;
+    };
+    let z = first.z + 1;
+    let (x_min, x_max, y_min, y_max) = tile_range_for_bounds(extent, z);
+    for p in parents {
+        debug_assert_eq!(p.z + 1, z, "parents must share one zoom level");
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let (x, y) = (p.x * 2 + dx, p.y * 2 + dy);
+            if (x_min..=x_max).contains(&x) && (y_min..=y_max).contains(&y) {
+                out.push(TileCoord { z, x, y });
+            }
+        }
+    }
+    out.sort_by_key(|t| (t.x, t.y));
+    out.dedup();
+    out
 }
 
 /// Convert tile-relative coordinates (0..extent) to pixel within tile
@@ -77,6 +129,132 @@ pub fn world_to_tile_coords(lon: f64, lat: f64, tile: &TileCoord, extent: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lisbon() -> Bounds {
+        // Extent of the demo "parcels" table
+        Bounds {
+            min_lon: -9.16,
+            min_lat: 38.71,
+            max_lon: -9.1301,
+            max_lat: 38.7339,
+        }
+    }
+
+    #[test]
+    fn test_tile_range_for_small_bbox_is_tiny() {
+        let b = lisbon();
+        let (x0, x1, y0, y1) = tile_range_for_bounds(&b, 10);
+        // The bbox straddles the x=485/486 boundary at z10
+        assert_eq!((x0, x1), (485, 486));
+        assert_eq!(y0, y1);
+        let (x0, x1, y0, y1) = tile_range_for_bounds(&b, 15);
+        // ~0.03deg wide at z15 is a handful of tiles, not 2^15 squared
+        assert!(x1 - x0 < 4, "x range {}..{}", x0, x1);
+        assert!(y1 - y0 < 4, "y range {}..{}", y0, y1);
+        // Every tile in the range intersects the bbox
+        for t in tiles_for_bounds(&b, 15, 15) {
+            let tb = t.bounds();
+            assert!(tb.min_lon <= b.max_lon && tb.max_lon >= b.min_lon);
+            assert!(tb.min_lat <= b.max_lat && tb.max_lat >= b.min_lat);
+        }
+    }
+
+    #[test]
+    fn test_tile_range_clamps_out_of_range_coords() {
+        let b = Bounds {
+            min_lon: -200.0,
+            min_lat: -90.0,
+            max_lon: 200.0,
+            max_lat: 90.0,
+        };
+        assert_eq!(tile_range_for_bounds(&b, 3), (0, 7, 0, 7));
+    }
+
+    #[test]
+    fn test_union_and_expand_bounds() {
+        let a = Bounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 1.0,
+            max_lat: 1.0,
+        };
+        let b = Bounds {
+            min_lon: -2.0,
+            min_lat: 0.5,
+            max_lon: 0.5,
+            max_lat: 3.0,
+        };
+        let u = union_bounds(&a, &b);
+        assert_eq!(
+            (u.min_lon, u.min_lat, u.max_lon, u.max_lat),
+            (-2.0, 0.0, 1.0, 3.0)
+        );
+        let e = expand_bounds(&a, 0.5);
+        assert_eq!(
+            (e.min_lon, e.min_lat, e.max_lon, e.max_lat),
+            (-0.5, -0.5, 1.5, 1.5)
+        );
+    }
+
+    #[test]
+    fn test_children_within_matches_full_range_scan() {
+        // Walking the quadtree from every tile at z10 must reach exactly the
+        // tiles a flat scan of the extent finds at each deeper zoom.
+        let b = lisbon();
+        let mut level = tiles_for_bounds(&b, 10, 10);
+        for z in 11..=15u8 {
+            level = children_within(&level, &b);
+            let mut flat = tiles_for_bounds(&b, z, z);
+            flat.sort_by_key(|t| (t.x, t.y));
+            assert_eq!(level, flat, "zoom {}", z);
+        }
+    }
+
+    #[test]
+    fn test_children_within_only_expands_given_parents() {
+        let world = Bounds {
+            min_lon: -180.0,
+            min_lat: -85.0,
+            max_lon: 180.0,
+            max_lat: 85.0,
+        };
+        let parents = [TileCoord { z: 1, x: 1, y: 0 }];
+        let kids = children_within(&parents, &world);
+        assert_eq!(
+            kids,
+            vec![
+                TileCoord { z: 2, x: 2, y: 0 },
+                TileCoord { z: 2, x: 2, y: 1 },
+                TileCoord { z: 2, x: 3, y: 0 },
+                TileCoord { z: 2, x: 3, y: 1 },
+            ]
+        );
+        // Children are geometrically inside the parent
+        let pb = parents[0].bounds();
+        for k in &kids {
+            let kb = k.bounds();
+            assert!(kb.min_lon >= pb.min_lon && kb.max_lon <= pb.max_lon);
+            assert!(kb.min_lat >= pb.min_lat && kb.max_lat <= pb.max_lat);
+        }
+        assert!(children_within(&[], &world).is_empty());
+    }
+
+    #[test]
+    fn test_children_within_filters_by_extent() {
+        let b = lisbon();
+        let parent = tiles_for_bounds(&b, 10, 10);
+        assert_eq!(parent.len(), 2);
+        // Only the first parent: its children never spill into the second's
+        let kids = children_within(&parent[..1], &b);
+        assert!(!kids.is_empty() && kids.len() <= 4);
+        for k in &kids {
+            assert_eq!(k.x / 2, parent[0].x);
+        }
+        let (x0, x1, y0, y1) = tile_range_for_bounds(&b, 11);
+        for k in &kids {
+            assert!((x0..=x1).contains(&k.x) && (y0..=y1).contains(&k.y));
+        }
+    }
 
     #[test]
     fn test_tile_bounds_roundtrip() {

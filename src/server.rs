@@ -14,18 +14,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::cache::{CachedTile, Lookup, TileCache};
 use crate::config::{AppConfig, ServeConfig};
 use crate::events::{EventSender, TileEvent};
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::{metrics, GaugeGuard};
+
+type Stores = HashMap<String, Arc<Mutex<MbtilesStore>>>;
 
 #[derive(Clone)]
 struct AppState {
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     config: Arc<AppConfig>,
     event_tx: Option<EventSender>,
+    cache: Option<Arc<TileCache>>,
+    cache_control: header::HeaderValue,
 }
 
 /// Stand-in `source` label for requests naming a source that does not exist.
@@ -49,16 +54,32 @@ pub fn build_server(
     config: &Arc<AppConfig>,
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     event_tx: Option<EventSender>,
+    cache: Option<Arc<TileCache>>,
 ) -> Result<TileServer> {
-    let state = AppState {
-        stores,
-        config: config.clone(),
-        event_tx,
-    };
+    let watched = cache.clone().map(|cache| (cache, stores.clone()));
+    let state = app_state(config, stores, event_tx, cache)?;
 
     Ok(TileServer {
         addr: crate::metrics::bind_addr(config.serve.host(), config.serve.port()),
         router: build_router(config, state)?,
+        watched,
+    })
+}
+
+fn app_state(
+    config: &Arc<AppConfig>,
+    stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
+    event_tx: Option<EventSender>,
+    cache: Option<Arc<TileCache>>,
+) -> Result<AppState> {
+    let cache_control = header::HeaderValue::from_str(&config.serve.cache_control())
+        .map_err(|e| anyhow::anyhow!("Invalid Cache-Control value: {}", e))?;
+    Ok(AppState {
+        stores,
+        config: config.clone(),
+        event_tx,
+        cache,
+        cache_control,
     })
 }
 
@@ -66,12 +87,25 @@ pub fn build_server(
 pub struct TileServer {
     addr: String,
     router: Router,
+    /// The cache and the stores it caches, watched for outside writes.
+    watched: Option<(Arc<TileCache>, Stores)>,
 }
+
+/// How often each MBTiles file is checked for commits by other processes.
+const EXTERNAL_WRITE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl TileServer {
     pub async fn run(self) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(&self.addr).await?;
         info!("Tile server listening on http://{}", self.addr);
+
+        if let Some((cache, stores)) = self.watched {
+            tokio::spawn(clear_cache_on_external_writes(
+                cache,
+                stores,
+                EXTERNAL_WRITE_POLL,
+            ));
+        }
 
         axum::serve(listener, self.router).await?;
         Ok(())
@@ -95,6 +129,48 @@ fn build_router(config: &AppConfig, state: AppState) -> Result<Router> {
         .layer(cors);
 
     Ok(mount_metrics(app, config)?.with_state(state))
+}
+
+/// Clear a source's cached tiles when another process commits to its MBTiles:
+/// a cron `generate`, a separate `watch`, a manual edit. Writes by this
+/// process's updater share the connection, so they never trip this; the
+/// updater clears exactly the tiles it wrote instead.
+///
+/// SQLite's `data_version` changes only when a *different* connection commits,
+/// which is exactly the case to catch.
+async fn clear_cache_on_external_writes(
+    cache: Arc<TileCache>,
+    stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
+    poll: std::time::Duration,
+) {
+    let mut last: HashMap<String, i64> = HashMap::new();
+    let mut interval = tokio::time::interval(poll);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        for (source, store) in &stores {
+            let version = match store.lock().await.data_version() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "Could not check MBTiles of source '{}' for changes: {}",
+                        source, e
+                    );
+                    continue;
+                }
+            };
+            match last.insert(source.clone(), version) {
+                Some(previous) if previous != version => {
+                    let cleared = cache.clear_source(source);
+                    info!(
+                        "MBTiles of source '{}' changed outside this process; cleared {} cached tile(s)",
+                        source, cleared
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Add the metrics route if this server is the one serving metrics.
@@ -161,6 +237,33 @@ async fn serve_tile(
         }
     };
 
+    // x and y must address a tile at zoom z; past z30 the TMS flip overflows.
+    if z > 30 || x >= (1u32 << z) || y >= (1u32 << z) {
+        m.tile_requests.with(&[&source, "bad_request"]).inc();
+        return (StatusCode::NOT_FOUND, "Tile coordinates out of range").into_response();
+    }
+
+    // Only zooms the source actually has are cached, so requests outside its
+    // range (overzoom probes, crawlers) cannot push real tiles out.
+    let cache = state.cache.as_ref().filter(|_| {
+        state
+            .config
+            .sources
+            .iter()
+            .find(|s| s.name == source)
+            .is_some_and(|s| (s.min_zoom..=s.max_zoom).contains(&z))
+    });
+
+    // On a miss the generation is taken before the store read, so an update
+    // committed while we read makes the cache refuse what we read.
+    let generation = match cache.map(|c| c.lookup(&source, z, x, y)) {
+        Some(Lookup::Hit(tile)) => {
+            return tile_response(&tile, &headers, &source, &state.cache_control);
+        }
+        Some(Lookup::Miss { generation }) => Some(generation),
+        None => None,
+    };
+
     let read_started = std::time::Instant::now();
     let tile_data = {
         let store = store.lock().await;
@@ -176,56 +279,88 @@ async fn serve_tile(
         .with(&[&source])
         .observe_since(read_started);
 
-    match tile_data {
-        None => {
-            m.tile_requests.with(&[&source, "empty"]).inc();
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let tile = match tile_data {
+        None => CachedTile::Empty,
         Some(data) => {
-            // Compute ETag
             let mut hasher = Sha256::new();
             hasher.update(&data);
             let etag = format!("\"{}\"", to_hex(&hasher.finalize()[..8]));
-
-            // Check If-None-Match
-            if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
-                if let Ok(val) = if_none_match.to_str() {
-                    if val == etag || val == "*" {
-                        m.tile_requests.with(&[&source, "not_modified"]).inc();
-                        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
-                    }
-                }
+            CachedTile::Tile {
+                data: data.into(),
+                etag,
             }
+        }
+    };
 
-            m.tile_requests.with(&[&source, "hit"]).inc();
-            m.tile_bytes.with(&[&source]).add(data.len() as u64);
+    if let (Some(cache), Some(generation)) = (cache, generation) {
+        cache.insert(&source, z, x, y, tile.clone(), generation);
+    }
 
-            let mut response_headers = HeaderMap::new();
-            response_headers.insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/x-protobuf"),
-            );
-            response_headers.insert(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("public, max-age=300"),
-            );
-            if let Ok(value) = header::HeaderValue::from_str(&etag) {
-                response_headers.insert(header::ETAG, value);
+    tile_response(&tile, &headers, &source, &state.cache_control)
+}
+
+/// Build the HTTP response for a tile, from the cache or freshly read.
+fn tile_response(
+    tile: &CachedTile,
+    headers: &HeaderMap,
+    source: &str,
+    cache_control: &header::HeaderValue,
+) -> Response {
+    let m = metrics();
+    let (data, etag) = match tile {
+        CachedTile::Empty => {
+            m.tile_requests.with(&[source, "empty"]).inc();
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        CachedTile::Tile { data, etag } => (data, etag),
+    };
+
+    // Check If-None-Match
+    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(val) = if_none_match.to_str() {
+            if val == etag || val == "*" {
+                m.tile_requests.with(&[source, "not_modified"]).inc();
+                // A 304 carries the Cache-Control the 200 would have, so
+                // caches refreshed by revalidation pick up the current policy.
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (header::ETAG, header::HeaderValue::from_str(etag).ok()),
+                        (header::CACHE_CONTROL, Some(cache_control.clone())),
+                    ]
+                    .into_iter()
+                    .filter_map(|(k, v)| v.map(|v| (k, v)))
+                    .collect::<HeaderMap>(),
+                )
+                    .into_response();
             }
-
-            // Tiles are gzipped by the native encoder and by Tippecanoe's default,
-            // but not when `no_tile_compression` is set, so advertise the encoding
-            // the stored bytes actually have rather than assuming gzip.
-            if crate::mvt::is_gzipped(&data) {
-                response_headers.insert(
-                    header::CONTENT_ENCODING,
-                    header::HeaderValue::from_static("gzip"),
-                );
-            }
-
-            (response_headers, data).into_response()
         }
     }
+
+    m.tile_requests.with(&[source, "hit"]).inc();
+    m.tile_bytes.with(&[source]).add(data.len() as u64);
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/x-protobuf"),
+    );
+    response_headers.insert(header::CACHE_CONTROL, cache_control.clone());
+    if let Ok(value) = header::HeaderValue::from_str(etag) {
+        response_headers.insert(header::ETAG, value);
+    }
+
+    // Tiles are gzipped by the native encoder and by Tippecanoe's default,
+    // but not when `no_tile_compression` is set, so advertise the encoding
+    // the stored bytes actually have rather than assuming gzip.
+    if crate::mvt::is_gzipped(data) {
+        response_headers.insert(
+            header::CONTENT_ENCODING,
+            header::HeaderValue::from_static("gzip"),
+        );
+    }
+
+    (response_headers, data.clone()).into_response()
 }
 
 async fn serve_tilejson(
@@ -450,6 +585,8 @@ mod tests {
                 password: "secret".to_string(),
                 dbname: "test".to_string(),
                 pool_size: None,
+                sslmode: SslMode::default(),
+                sslrootcert: None,
             },
             sources: vec![SourceConfig {
                 name: "test_source".to_string(),
@@ -473,6 +610,8 @@ mod tests {
                     generate_boundary_lines: false,
                     min_zoom: None,
                     max_zoom: None,
+                    label_point_method: Default::default(),
+                    label_point_column: None,
                 }],
                 tippecanoe: TippecanoeConfig::default(),
             }],
@@ -524,15 +663,18 @@ mod tests {
         stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
         event_tx: Option<EventSender>,
     ) -> Result<Router> {
+        try_make_app_with_cache(config, stores, event_tx, None)
+    }
+
+    fn try_make_app_with_cache(
+        config: AppConfig,
+        stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
+        event_tx: Option<EventSender>,
+        cache: Option<Arc<TileCache>>,
+    ) -> Result<Router> {
         let config = Arc::new(config);
-        build_router(
-            &config,
-            AppState {
-                stores,
-                config: config.clone(),
-                event_tx,
-            },
-        )
+        let state = app_state(&config, stores, event_tx, cache)?;
+        build_router(&config, state)
     }
 
     async fn send_request(app: Router, request: Request<Body>) -> Response {
@@ -883,6 +1025,7 @@ mod tests {
             host: None,
             port: None,
             cors_origins: Some(vec!["http://localhost:3000".to_string()]),
+            ..Default::default()
         };
         let _cors = build_cors_layer(&config);
     }
@@ -893,6 +1036,7 @@ mod tests {
             host: None,
             port: None,
             cors_origins: Some(vec![]),
+            ..Default::default()
         };
         // Empty origins should fall through to Any
         let _cors = build_cors_layer(&config);
@@ -978,6 +1122,238 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn get_tile_body(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let response = send_request(
+            app,
+            Request::builder().uri(uri).body(Body::empty()).unwrap(),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn test_cache_serves_cached_tile_until_invalidated() {
+        let (path, store) = make_test_store();
+        let store = Arc::new(Mutex::new(store));
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), store.clone());
+        let cache = Arc::new(TileCache::new(1 << 20, None));
+        let app =
+            try_make_app_with_cache(make_test_config(), stores, None, Some(cache.clone())).unwrap();
+
+        let (status, body) = get_tile_body(app.clone(), "/test_source/0/0/0.pbf").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"tile_data");
+
+        // Written behind the cache's back: the cached tile is still served.
+        store.lock().await.put_tile(0, 0, 0, b"new_data").unwrap();
+        let (_, body) = get_tile_body(app.clone(), "/test_source/0/0/0.pbf").await;
+        assert_eq!(body, b"tile_data");
+
+        // The updater clears the tile after writing it: the new one is served.
+        assert_eq!(cache.invalidate("test_source", [(0, 0, 0)]), 1);
+        let (_, body) = get_tile_body(app.clone(), "/test_source/0/0/0.pbf").await;
+        assert_eq!(body, b"new_data");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_cache_clears_emptied_tile_and_caches_empty() {
+        let (path, store) = make_test_store();
+        let store = Arc::new(Mutex::new(store));
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), store.clone());
+        let cache = Arc::new(TileCache::new(1 << 20, None));
+        let app =
+            try_make_app_with_cache(make_test_config(), stores, None, Some(cache.clone())).unwrap();
+
+        // An empty tile is cached as empty...
+        let (status, _) = get_tile_body(app.clone(), "/test_source/1/0/0.pbf").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        store.lock().await.put_tile(1, 0, 0, b"filled").unwrap();
+        let (status, _) = get_tile_body(app.clone(), "/test_source/1/0/0.pbf").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        cache.invalidate("test_source", [(1, 0, 0)]);
+        let (status, body) = get_tile_body(app.clone(), "/test_source/1/0/0.pbf").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"filled");
+
+        // ...and a deleted tile stops being served once cleared.
+        get_tile_body(app.clone(), "/test_source/0/0/0.pbf").await;
+        store.lock().await.delete_tile(0, 0, 0).unwrap();
+        cache.invalidate("test_source", [(0, 0, 0)]);
+        let (status, _) = get_tile_body(app.clone(), "/test_source/0/0/0.pbf").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_cached_tile_keeps_etag_and_304() {
+        let (path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+        let cache = Arc::new(TileCache::new(1 << 20, None));
+        let app = try_make_app_with_cache(make_test_config(), stores, None, Some(cache)).unwrap();
+
+        let first = send_request(
+            app.clone(),
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let etag = first.headers().get("etag").unwrap().clone();
+        // Served from the cache now; same ETag, and revalidation still 304s.
+        let second = send_request(
+            app.clone(),
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .header("if-none-match", etag.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(second.headers().get("etag").unwrap(), &etag);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_external_write_clears_source_cache() {
+        let (path, store) = make_test_store();
+        let store = Arc::new(Mutex::new(store));
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), store.clone());
+        let cache = Arc::new(TileCache::new(1 << 20, None));
+        let app = try_make_app_with_cache(
+            make_test_config(),
+            stores.clone(),
+            None,
+            Some(cache.clone()),
+        )
+        .unwrap();
+        let task = tokio::spawn(clear_cache_on_external_writes(
+            cache.clone(),
+            stores,
+            std::time::Duration::from_millis(10),
+        ));
+
+        let (_, body) = get_tile_body(app.clone(), "/test_source/0/0/0.pbf").await;
+        assert_eq!(body, b"tile_data");
+        // Let the watcher record the current version before the outside write.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Another process (here: another connection) rewrites the tile.
+        let other = MbtilesStore::open(&path).unwrap();
+        other.put_tile(0, 0, 0, b"outside").unwrap();
+        drop(other);
+
+        let mut body = Vec::new();
+        for _ in 0..100 {
+            body = get_tile_body(app.clone(), "/test_source/0/0/0.pbf").await.1;
+            if body == b"outside" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(body, b"outside");
+        task.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_out_of_range_coordinates_are_rejected_and_not_cached() {
+        let (path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+        let cache = Arc::new(TileCache::new(1 << 20, None));
+        let app =
+            try_make_app_with_cache(make_test_config(), stores, None, Some(cache.clone())).unwrap();
+
+        for uri in [
+            "/test_source/3/8/0.pbf",
+            "/test_source/3/0/8.pbf",
+            "/test_source/31/0/0.pbf",
+            "/test_source/200/0/0.pbf",
+        ] {
+            let (status, _) = get_tile_body(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{}", uri);
+        }
+        // Valid but outside the source's zoom range: served, not cached.
+        let max = make_test_config().sources[0].max_zoom;
+        let uri = format!("/test_source/{}/0/0.pbf", max + 1);
+        let (status, _) = get_tile_body(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(cache.sources_cached(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_not_modified_carries_cache_control() {
+        let (path, store) = make_test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+        let mut config = make_test_config();
+        config.serve.max_age_secs = Some(0);
+        let app = make_app(config, stores);
+        let first = send_request(
+            app.clone(),
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let etag = first.headers().get("etag").unwrap().clone();
+        let second = send_request(
+            app,
+            Request::builder()
+                .uri("/test_source/0/0/0.pbf")
+                .header("if-none-match", etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(second.headers().get("cache-control").unwrap(), "no-cache");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_cache_control_is_configurable() {
+        for (max_age, expected) in [
+            (None, "public, max-age=300"),
+            (Some(0), "no-cache"),
+            (Some(60), "public, max-age=60"),
+        ] {
+            let (path, store) = make_test_store();
+            let mut stores = HashMap::new();
+            stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+            let mut config = make_test_config();
+            config.serve.max_age_secs = max_age;
+            let response = send_request(
+                make_app(config, stores),
+                Request::builder()
+                    .uri("/test_source/0/0/0.pbf")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.headers().get("cache-control").unwrap(), expected);
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[tokio::test]

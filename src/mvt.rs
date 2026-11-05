@@ -759,6 +759,8 @@ mod tests {
             generate_boundary_lines: false,
             min_zoom: None,
             max_zoom: None,
+            label_point_method: Default::default(),
+            label_point_column: None,
         };
 
         // At zoom 5 (below 10), properties should be excluded
@@ -808,6 +810,8 @@ mod tests {
             generate_boundary_lines: false,
             min_zoom: None,
             max_zoom: None,
+            label_point_method: Default::default(),
+            label_point_column: None,
         };
 
         let mut features_by_layer = HashMap::new();
@@ -1080,6 +1084,8 @@ mod tests {
             generate_boundary_lines: false,
             min_zoom: None,
             max_zoom: None,
+            label_point_method: Default::default(),
+            label_point_column: None,
         };
         assert_eq!(simplification_tolerance(Some(&cfg), 10), None);
     }
@@ -1102,6 +1108,8 @@ mod tests {
             generate_boundary_lines: false,
             min_zoom: None,
             max_zoom: None,
+            label_point_method: Default::default(),
+            label_point_column: None,
         };
 
         let low_zoom = simplification_tolerance(Some(&cfg), 5).unwrap();
@@ -1173,6 +1181,8 @@ mod tests {
             generate_boundary_lines: false,
             min_zoom: None,
             max_zoom: None,
+            label_point_method: Default::default(),
+            label_point_column: None,
         };
 
         // At zoom 3 (below both thresholds): both excluded
@@ -1208,6 +1218,8 @@ mod tests {
             generate_boundary_lines: false,
             min_zoom: None,
             max_zoom: None,
+            label_point_method: Default::default(),
+            label_point_column: None,
         };
 
         let excluded = compute_excluded_properties(Some(&cfg), 0);
