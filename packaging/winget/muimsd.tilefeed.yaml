@@ -4,7 +4,7 @@ PackageName: tilefeed
 Publisher: muimsd
 License: MIT
 LicenseUrl: https://github.com/muimsd/tilefeed/blob/main/LICENSE
-ShortDescription: PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY
+ShortDescription: Dynamic vector tiles from PostGIS and GDAL files
 PackageUrl: https://github.com/muimsd/tilefeed
 Tags:
   - postgis

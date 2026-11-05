@@ -2,10 +2,10 @@
 name = "tilefeed"
 version = "0.9.0"
 edition = "2021"
-description = "PostGIS vector tile pipeline with incremental MBTiles updates via LISTEN/NOTIFY"
+description = "Dynamic vector tiles from PostGIS and GDAL files"
 license = "MIT"
 repository = "https://github.com/muimsd/tilefeed"
-keywords = ["postgis", "vector-tiles", "mbtiles", "tippecanoe", "gis"]
+keywords = ["postgis", "gdal", "vector-tiles", "mbtiles", "gis"]
 categories = ["command-line-utilities", "database"]
 readme = "README.md"
 rust-version = "1.70"

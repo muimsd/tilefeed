@@ -84,6 +84,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -146,7 +147,7 @@ impl PostgisReader {
                 ST_XMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as xmax,
                 ST_YMax(ST_Transform(ST_Envelope("{geom_col}"), 4326)) as ymax
             FROM "{schema}"."{table}"
-            WHERE "{id_col}" = $1 AND "{geom_col}" IS NOT NULL"#,
+            WHERE "{id_col}" = $1::bigint AND "{geom_col}" IS NOT NULL"#,
             table = layer.table,
         );
 
@@ -280,6 +281,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -350,6 +352,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
@@ -455,6 +458,7 @@ impl PostgisReader {
             let feature_id: i64 = row
                 .try_get::<_, i64>("feature_id")
                 .or_else(|_| row.try_get::<_, i32>("feature_id").map(|v| v as i64))
+                .or_else(|_| row.try_get::<_, i16>("feature_id").map(|v| v as i64))
                 .unwrap_or(0);
             let geometry: JsonValue = row.get("geometry");
             let properties: JsonValue = row.get("properties");
