@@ -41,7 +41,8 @@ fn geojson_feature(
 /// With `properties` listed, only those columns. Without, every column except
 /// geometry and geography ones (the geometry is sent as the geometry, and
 /// other spatial columns would land as hex WKB strings). The whole row is
-/// taken through the table name, so a column named like its table shadows it.
+/// referenced as `"schema"."table".*`: a bare `"table"` would resolve to a
+/// column of the same name, if the table has one.
 fn properties_sql(layer: &LayerConfig, schema: &str) -> String {
     match &layer.properties {
         Some(props) => {
@@ -56,7 +57,7 @@ fn properties_sql(layer: &LayerConfig, schema: &str) -> String {
         // comes from the outer table instead. The column list is an
         // uncorrelated subquery, planned once per statement.
         None => format!(
-            r#"(to_jsonb("{table}") - ARRAY(
+            r#"(to_jsonb("{schema}"."{table}".*) - ARRAY(
                 SELECT a.attname::text FROM pg_attribute a
                 JOIN pg_type t ON t.oid = a.atttypid
                 WHERE a.attrelid = '"{schema}"."{table}"'::regclass
@@ -742,7 +743,7 @@ mod tests {
         // the whole row must come from the outer table.
         let sql = properties_sql(&layer(""), "gis");
         assert!(!sql.contains("SELECT *"));
-        assert!(sql.starts_with(r#"(to_jsonb("parks") - ARRAY("#));
+        assert!(sql.starts_with(r#"(to_jsonb("gis"."parks".*) - ARRAY("#));
         assert!(sql.contains(r#"'"gis"."parks"'::regclass"#));
         assert!(sql.contains("('geometry', 'geography')"));
     }
