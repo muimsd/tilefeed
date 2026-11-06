@@ -119,9 +119,12 @@
                 .map((v) => v.toFixed(5))
                 .join(',');
             const zoom = map.getZoom().toFixed(2);
-            return `${TILE_SERVER}/events?bbox=${bbox}&zoom=${zoom}&source=${SOURCE_NAME}`;
+            // `since` makes the server replay what arrived while reconnecting.
+            const since = lastEventId ? `&since=${lastEventId}` : '';
+            return `${TILE_SERVER}/events?bbox=${bbox}&zoom=${zoom}&source=${SOURCE_NAME}${since}`;
         }
 
+        let lastEventId = null;
         let es = null;
         let retryTimer = null;
 
@@ -136,7 +139,16 @@
                 statusEl.className = 'connected';
             };
 
+            // Every event carries an id; remember the latest to resume from.
+            es.addEventListener('ready', (e) => { lastEventId = e.lastEventId; });
+            es.addEventListener('resync', () => {
+                lastEventId = null;
+                addEventLog('Missed updates — reloading tiles');
+                refreshSource(SOURCE_NAME);
+            });
+
             es.addEventListener('update_complete', (e) => {
+                lastEventId = e.lastEventId;
                 const data = JSON.parse(e.data);
                 addEventLog(
                     `Update in view: ${data.tiles_updated} tiles in "${data.source}" ` +
@@ -146,6 +158,7 @@
             });
 
             es.addEventListener('generate_complete', (e) => {
+                lastEventId = e.lastEventId;
                 const data = JSON.parse(e.data);
                 addEventLog(
                     `Generate: "${data.source}" completed in ${data.duration_ms}ms`
@@ -162,8 +175,8 @@
             };
         }
 
-        // Re-subscribe when the view settles (debounced). An update that lands
-        // during the few milliseconds of reconnecting is not delivered.
+        // Re-subscribe when the view settles (debounced). Updates that land
+        // while reconnecting are replayed thanks to `since`.
         let moveTimer = null;
         map.on('moveend', () => {
             clearTimeout(moveTimer);

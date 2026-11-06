@@ -174,26 +174,35 @@ GET /events?bbox=<west>,<south>,<east>,<north>&zoom=<zoom>&source=<name>[,<name>
 | `zoom` | The map's zoom, fractional is fine. Updates to layers not drawn at that zoom are skipped (a `min_zoom = 13` buildings layer doesn't wake a client at zoom 8). Above the source's `max_zoom` the client is overzooming, so changes at `max_zoom` count. |
 | `source` | Only these sources. Unknown names are rejected. |
 
-Every parameter is optional and they combine. With `zoom`, the view is widened to the edges of the tiles that cover it, because the map draws whole tiles and a tile's buffer can show a feature just outside the visible area. `generate_complete` and updates without `areas` always pass the viewport check, since they may have changed anything. Invalid values return `400` with the reason.
+Every parameter is optional and they combine. With `zoom`, the view is widened to the edges of the tiles that cover it, because the map draws whole tiles. Changes at `floor(zoom)` and one level deeper count, since 256px sources and zoom transitions show tiles a level below the integer zoom. `generate_complete` and updates without `areas` always pass the viewport check, since they may have changed anything. Invalid values return `400` with the reason.
 
-The view is fixed for the life of the connection, so re-subscribe when the map moves. The same code works in MapLibre GL JS and Mapbox GL JS:
+The view is fixed for the life of the connection, so re-subscribe when the map moves. Pass the id of the last event you received as `since`, and the server first replays the updates you missed while reconnecting that touch the new view. The same code works in MapLibre GL JS and Mapbox GL JS:
 
 ```javascript
-let es;
+let es, lastId = null;
 function subscribe() {
     if (es) es.close();
     const b = map.getBounds();
     const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(',');
-    es = new EventSource(`${server}/events?bbox=${bbox}&zoom=${map.getZoom()}&source=basemap`);
-    es.addEventListener('update_complete', (e) => refresh(JSON.parse(e.data).source));
-    es.addEventListener('generate_complete', (e) => refresh(JSON.parse(e.data).source));
+    const since = lastId ? `&since=${lastId}` : '';
+    es = new EventSource(`${server}/events?bbox=${bbox}&zoom=${map.getZoom()}&source=basemap${since}`);
+    es.addEventListener('ready', (e) => { lastId = e.lastEventId; });
+    es.addEventListener('resync', () => { lastId = null; refresh('basemap'); });
+    for (const type of ['update_complete', 'generate_complete']) {
+        es.addEventListener(type, (e) => { lastId = e.lastEventId; refresh(JSON.parse(e.data).source); });
+    }
 }
 let timer;
 map.on('moveend', () => { clearTimeout(timer); timer = setTimeout(subscribe, 300); });
 map.on('load', subscribe);
 ```
 
-An update committed during the moment of reconnecting is not delivered to that client. When freshness right after a pan matters, set `[serve] max_age_secs = 0` so newly loaded tiles are always revalidated.
+### Event ids, replay and `resync`
+
+Every event carries an SSE `id`, numbered in order. The server keeps the last 256 events. A connection with `since=<id>`, or the `Last-Event-ID` header that `EventSource` sends when it reconnects on its own, first receives the retained events after that id, filtered by its viewport. Two extra event types frame this:
+
+- **`ready`**: sent once the replay is done, with `id` set to the newest event so far (`{"last_event_id": 42}`). Record its `lastEventId`, so a later reconnect knows where to resume even if no update has matched your view yet.
+- **`resync`**: some events can't be replayed, because they have aged out of the history, the server restarted, or the client fell too far behind. Reload the tiles of every source you show.
 
 Viewport filtering happens per connection, before the cooldown below, so an aggregated event only accumulates changes that client can see.
 

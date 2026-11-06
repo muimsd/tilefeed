@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::cache::{CachedTile, Lookup, TileCache};
 use crate::config::{AppConfig, ServeConfig};
-use crate::events::{EventSender, TileEvent};
+use crate::events::{EventSender, Subscription, TileEvent};
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::{metrics, GaugeGuard};
 use crate::viewport::{EventsQuery, Viewport};
@@ -457,11 +457,18 @@ async fn health_check() -> &'static str {
     "ok"
 }
 
-/// `GET /events[?bbox=w,s,e,n][&zoom=z][&source=a,b]`. With a viewport, the
-/// client only gets updates that change tiles it can see (see `viewport.rs`).
+/// `GET /events[?bbox=w,s,e,n][&zoom=z][&source=a,b][&since=id]`.
+///
+/// With a viewport, the client only gets updates that change tiles it can see
+/// (see `viewport.rs`). Every event carries an SSE `id`; a client reconnecting
+/// with `since` (or the `Last-Event-ID` header `EventSource` sends on its own
+/// retries) first gets the retained events it missed that match its new
+/// viewport, or a `resync` event when they are no longer available. A `ready`
+/// event marks the end of the replay and carries the current id.
 async fn sse_handler(
     State(state): State<AppState>,
     Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>>,
     (StatusCode, String),
@@ -470,9 +477,21 @@ async fn sse_handler(
         .event_tx
         .as_ref()
         .ok_or((StatusCode::NOT_FOUND, "Not Found".to_string()))?;
-    let viewport = Viewport::parse(&query, state.config.sources.iter().map(|s| s.name.as_str()))
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let mut rx = event_tx.subscribe();
+    let mut viewport =
+        Viewport::parse(&query, state.config.sources.iter().map(|s| s.name.as_str()))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let since = query.since.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+    });
+    let Subscription {
+        replay,
+        mut rx,
+        latest_id,
+        complete,
+    } = event_tx.subscribe_since(since);
 
     metrics().sse_connections.get().inc();
     // Held by the stream below, so the gauge drops when the client disconnects.
@@ -489,30 +508,44 @@ async fn sse_handler(
         // Move the gauge guard into the stream so it lives as long as the connection.
         let _client_guard = _client_guard;
 
+        if !complete {
+            yield Ok(resync_sse());
+        }
+        for missed in replay {
+            if viewport.wants(&missed.event) {
+                if let Some(sse) = event_to_sse(&missed.event, missed.id) {
+                    yield Ok(sse);
+                }
+            }
+        }
+        yield Ok(ready_sse(latest_id));
+
         match cooldown {
             None => {
                 // No cooldown — forward every event immediately
                 loop {
                     match rx.recv().await {
-                        Ok(event) if !viewport.wants(&event) => continue,
-                        Ok(event) => {
-                            if let Some(sse) = event_to_sse(&event) {
+                        Ok(e) if !viewport.wants(&e.event) => continue,
+                        Ok(e) => {
+                            if let Some(sse) = event_to_sse(&e.event, e.id) {
                                 yield Ok(sse);
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        // Events were dropped for this slow client; tell it
+                        // to refresh rather than leave tiles stale.
+                        Err(broadcast::error::RecvError::Lagged(_)) => yield Ok(resync_sse()),
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
             Some(cooldown) => {
                 // Trailing-edge throttle per source
-                let mut pending: HashMap<String, (TileEvent, tokio::time::Instant)> = HashMap::new();
+                let mut pending: HashMap<String, PendingEvent> = HashMap::new();
 
                 loop {
                     let next_flush = pending
                         .values()
-                        .map(|(_, started)| *started + cooldown)
+                        .map(|p| p.started + cooldown)
                         .min();
                     let sleep_until = next_flush
                         .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
@@ -522,24 +555,28 @@ async fn sse_handler(
                             match result {
                                 // Filter before merging, so an aggregated event
                                 // only accumulates changes this client can see.
-                                Ok(event) if !viewport.wants(&event) => {}
-                                Ok(event) => {
-                                    let source = event.source().to_string();
+                                Ok(e) if !viewport.wants(&e.event) => {}
+                                Ok(e) => {
+                                    let source = e.event.source().to_string();
                                     match pending.get_mut(&source) {
-                                        Some((existing, _)) => {
-                                            existing.merge(&event);
+                                        Some(p) => {
+                                            p.event.merge(&e.event);
+                                            p.last_id = e.id;
                                         }
                                         None => {
-                                            pending.insert(source, (event, tokio::time::Instant::now()));
+                                            pending.insert(source, PendingEvent {
+                                                first_id: e.id,
+                                                last_id: e.id,
+                                                event: e.event,
+                                                started: tokio::time::Instant::now(),
+                                            });
                                         }
                                     }
                                 }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Lagged(_)) => yield Ok(resync_sse()),
                                 Err(broadcast::error::RecvError::Closed) => {
-                                    for (_, (event, _)) in pending.drain() {
-                                        if let Some(sse) = event_to_sse(&event) {
-                                            yield Ok(sse);
-                                        }
+                                    for (id, event) in flush_pending(&mut pending, |_| true) {
+                                        if let Some(sse) = event_to_sse(&event, id) { yield Ok(sse); }
                                     }
                                     break;
                                 }
@@ -547,18 +584,8 @@ async fn sse_handler(
                         }
                         _ = tokio::time::sleep_until(sleep_until) => {
                             let now = tokio::time::Instant::now();
-                            let expired: Vec<String> = pending
-                                .iter()
-                                .filter(|(_, (_, started))| now >= *started + cooldown)
-                                .map(|(source, _)| source.clone())
-                                .collect();
-
-                            for source in expired {
-                                if let Some((event, _)) = pending.remove(&source) {
-                                    if let Some(sse) = event_to_sse(&event) {
-                                        yield Ok(sse);
-                                    }
-                                }
+                            for (id, event) in flush_pending(&mut pending, |p| now >= p.started + cooldown) {
+                                if let Some(sse) = event_to_sse(&event, id) { yield Ok(sse); }
                             }
                         }
                     }
@@ -570,14 +597,72 @@ async fn sse_handler(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-fn event_to_sse(event: &TileEvent) -> Option<SseEvent> {
+/// A source's events accumulated during an SSE cooldown window.
+struct PendingEvent {
+    event: TileEvent,
+    started: tokio::time::Instant,
+    first_id: u64,
+    last_id: u64,
+}
+
+/// Take the pending events `due` selects, each with the SSE id to send it with.
+///
+/// The SSE id a client resumes from must not pass an event it hasn't been
+/// sent: another source's events may still be waiting out their cooldown, so
+/// each flushed event's id is held below the oldest one still pending.
+fn flush_pending(
+    pending: &mut HashMap<String, PendingEvent>,
+    due: impl Fn(&PendingEvent) -> bool,
+) -> Vec<(u64, TileEvent)> {
+    let due_sources: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| due(p))
+        .map(|(source, _)| source.clone())
+        .collect();
+    let mut flushed: Vec<PendingEvent> = due_sources
+        .iter()
+        .filter_map(|source| pending.remove(source))
+        .collect();
+    flushed.sort_by_key(|p| p.last_id);
+    let still_waiting = pending.values().map(|p| p.first_id).min();
+    flushed
+        .into_iter()
+        .map(|p| {
+            let id = match still_waiting {
+                Some(first) => p.last_id.min(first.saturating_sub(1)),
+                None => p.last_id,
+            };
+            (id, p.event)
+        })
+        .collect()
+}
+
+fn event_to_sse(event: &TileEvent, id: u64) -> Option<SseEvent> {
     let event_type = match event {
         TileEvent::GenerateComplete { .. } => "generate_complete",
         TileEvent::UpdateComplete { .. } => "update_complete",
     };
-    serde_json::to_string(event)
-        .ok()
-        .map(|data| SseEvent::default().event(event_type).data(data))
+    serde_json::to_string(event).ok().map(|data| {
+        SseEvent::default()
+            .event(event_type)
+            .id(id.to_string())
+            .data(data)
+    })
+}
+
+/// End of the replay; its id is where a reconnect resumes from.
+fn ready_sse(latest_id: u64) -> SseEvent {
+    SseEvent::default()
+        .event("ready")
+        .id(latest_id.to_string())
+        .data(format!(r#"{{"last_event_id":{latest_id}}}"#))
+}
+
+/// Updates were missed and can't be replayed: reload every source shown.
+fn resync_sse() -> SseEvent {
+    SseEvent::default()
+        .event("resync")
+        .data(r#"{"reason":"missed_events"}"#)
 }
 
 #[cfg(test)]
@@ -1702,6 +1787,121 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("\"tiles_updated\":222"));
         assert!(!body_str.contains("\"tiles_updated\":111"));
+    }
+
+    async fn sse_body(app: Router, request: Request<Body>, event_tx: EventSender) -> String {
+        let response = send_request(app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(event_tx);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn generated(source: &str, duration_ms: u64) -> TileEvent {
+        TileEvent::GenerateComplete {
+            source: source.to_string(),
+            duration_ms,
+        }
+    }
+
+    /// SSE body for `request` against a bus that has already sent `sent`.
+    /// Every handle to the bus is dropped before reading, so the stream ends.
+    async fn sse_after(sent: &[TileEvent], request: Request<Body>) -> String {
+        let event_tx = crate::events::create_event_bus();
+        let _keep = event_tx.subscribe();
+        for event in sent {
+            event_tx.send(event.clone()).unwrap();
+        }
+        let app = make_app_with_events(make_test_config(), HashMap::new(), Some(event_tx.clone()));
+        sse_body(app, request, event_tx).await
+    }
+
+    #[tokio::test]
+    async fn test_sse_replays_missed_events_since_id() {
+        let sent: Vec<TileEvent> = [101, 102, 103]
+            .into_iter()
+            .map(|ms| generated("test_source", ms))
+            .collect();
+
+        // A map re-subscribing after having seen event 1.
+        let request = Request::builder()
+            .uri("/events?since=1")
+            .body(Body::empty())
+            .unwrap();
+        let body = sse_after(&sent, request).await;
+        assert!(!body.contains("101") && body.contains("102") && body.contains("103"));
+        assert!(body.contains("id: 3"));
+        assert!(body.contains("event: ready"));
+        assert!(!body.contains("event: resync"));
+        // Replayed events come before `ready`.
+        assert!(body.find("103").unwrap() < body.find("event: ready").unwrap());
+
+        // EventSource's own retry sends Last-Event-ID instead.
+        let request = Request::builder()
+            .uri("/events")
+            .header("last-event-id", "2")
+            .body(Body::empty())
+            .unwrap();
+        let body = sse_after(&sent, request).await;
+        assert!(!body.contains("102") && body.contains("103"));
+
+        // The replay is filtered by the new viewport's sources too.
+        let request = Request::builder()
+            .uri("/events?since=0&source=test_source")
+            .body(Body::empty())
+            .unwrap();
+        let mut other = sent.clone();
+        other.push(generated("test_source_2", 999));
+        let body = sse_after(&other, request).await;
+        assert!(body.contains("101") && !body.contains("999"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_asks_for_resync_when_history_is_gone() {
+        // An id this server never issued (it restarted since).
+        let request = Request::builder()
+            .uri("/events?since=500")
+            .body(Body::empty())
+            .unwrap();
+        let body = sse_after(&[generated("test_source", 1)], request).await;
+        assert!(body.contains("event: resync"));
+        assert!(body.contains("event: ready"));
+    }
+
+    #[test]
+    fn test_cooldown_flush_holds_id_below_pending_events() {
+        let now = tokio::time::Instant::now();
+        let mut pending = HashMap::new();
+        pending.insert(
+            "a".to_string(),
+            PendingEvent {
+                event: generated("a", 1),
+                started: now,
+                first_id: 7,
+                last_id: 9,
+            },
+        );
+        pending.insert(
+            "b".to_string(),
+            PendingEvent {
+                event: generated("b", 1),
+                started: now,
+                first_id: 5,
+                last_id: 8,
+            },
+        );
+        // Flush only "a": "b" (from id 5) is still waiting, so resuming from
+        // "a"'s id must not skip it.
+        let sent = flush_pending(&mut pending, |p| p.first_id == 7);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, 4);
+        assert_eq!(sent[0].1.source(), "a");
+        assert_eq!(pending.len(), 1);
+        // With nothing else pending, the event's own last id is used.
+        let sent = flush_pending(&mut pending, |_| true);
+        assert_eq!(sent[0].0, 8);
     }
 
     #[tokio::test]

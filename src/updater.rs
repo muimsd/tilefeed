@@ -183,11 +183,18 @@ fn parse_notification(payload: &str) -> Result<UpdateEvent> {
             .as_i64()
             .context("Missing 'id' in notification")?;
 
-        let old_bounds = json.get("old_bounds").map(|ob| Bounds {
-            min_lon: ob["min_lon"].as_f64().unwrap_or(0.0),
-            min_lat: ob["min_lat"].as_f64().unwrap_or(0.0),
-            max_lon: ob["max_lon"].as_f64().unwrap_or(0.0),
-            max_lat: ob["max_lat"].as_f64().unwrap_or(0.0),
+        // The trigger sends nulls when the old geometry was NULL. Anything but
+        // four numbers forming a box is no old location at all — defaulting
+        // the gaps to 0 would regenerate (and announce) tiles at 0,0.
+        let old_bounds = json.get("old_bounds").and_then(|ob| {
+            let field = |k: &str| ob[k].as_f64().filter(|v| v.is_finite());
+            let bounds = Bounds {
+                min_lon: field("min_lon")?,
+                min_lat: field("min_lat")?,
+                max_lon: field("max_lon")?,
+                max_lat: field("max_lat")?,
+            };
+            (bounds.min_lon <= bounds.max_lon && bounds.min_lat <= bounds.max_lat).then_some(bounds)
         });
 
         return Ok(UpdateEvent {
@@ -414,12 +421,18 @@ mod tests {
 
     #[test]
     fn test_parse_notification_json_old_bounds_partial() {
-        // old_bounds with missing fields should default to 0.0
-        let payload = r#"{"layer": "test", "id": 1, "old_bounds": {"min_lon": 5.0}}"#;
-        let event = parse_notification(payload).unwrap();
-        let bounds = event.old_bounds.unwrap();
-        assert!((bounds.min_lon - 5.0).abs() < 1e-6);
-        assert!((bounds.min_lat - 0.0).abs() < 1e-6);
+        // A partial or null box (old geometry was NULL) is no old location,
+        // not a box at 0,0.
+        for payload in [
+            r#"{"layer": "test", "id": 1, "old_bounds": {"min_lon": 5.0}}"#,
+            r#"{"layer": "test", "id": 1, "old_bounds": {"min_lon": null, "min_lat": null, "max_lon": null, "max_lat": null}}"#,
+            r#"{"layer": "test", "id": 1, "old_bounds": {"min_lon": 5, "min_lat": 0, "max_lon": 1, "max_lat": 1}}"#,
+        ] {
+            assert!(
+                parse_notification(payload).unwrap().old_bounds.is_none(),
+                "{payload}"
+            );
+        }
     }
 }
 

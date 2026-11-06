@@ -1,5 +1,6 @@
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// A region an incremental update changed: the bounding box of a feature's new or
@@ -15,6 +16,19 @@ pub struct ChangedArea {
 }
 
 impl ChangedArea {
+    pub fn new(bounds: &crate::postgis::Bounds, min_zoom: u8, max_zoom: u8) -> Self {
+        ChangedArea {
+            bbox: [
+                bounds.min_lon,
+                bounds.min_lat,
+                bounds.max_lon,
+                bounds.max_lat,
+            ],
+            min_zoom,
+            max_zoom,
+        }
+    }
+
     fn union(a: &ChangedArea, b: &ChangedArea) -> ChangedArea {
         ChangedArea {
             bbox: [
@@ -37,6 +51,18 @@ pub const MAX_CHANGED_AREAS: usize = 64;
 /// Shrink `areas` to at most [`MAX_CHANGED_AREAS`], only ever growing the region
 /// they cover.
 fn compact_areas(areas: &mut Vec<ChangedArea>) {
+    // A feature edited in several merged batches repeats its box; drop the
+    // repeats wherever they are before deciding whether to coarsen.
+    areas.sort_by(|a, b| {
+        a.bbox
+            .iter()
+            .zip(&b.bbox)
+            .map(|(x, y)| x.total_cmp(y))
+            .find(|o| o.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.min_zoom.cmp(&b.min_zoom))
+            .then(a.max_zoom.cmp(&b.max_zoom))
+    });
     areas.dedup();
     if areas.len() <= MAX_CHANGED_AREAS {
         return;
@@ -182,12 +208,106 @@ impl TileEvent {
     }
 }
 
-/// Shared event bus for SSE and webhook consumers
-pub type EventSender = broadcast::Sender<TileEvent>;
+/// An event as broadcast on the bus, numbered in send order (from 1).
+#[derive(Debug, Clone)]
+pub struct Sequenced {
+    pub id: u64,
+    pub event: TileEvent,
+}
+
+/// How many recent events the bus keeps for SSE clients that reconnect.
+pub const EVENT_HISTORY: usize = 256;
+
+/// What a new subscriber gets: the retained events after the id it asked
+/// for, a receiver for everything after those, and whether the history could
+/// cover the request.
+pub struct Subscription {
+    pub replay: Vec<Sequenced>,
+    pub rx: broadcast::Receiver<Sequenced>,
+    /// Id of the newest event sent so far (0 before the first).
+    pub latest_id: u64,
+    /// `false` when the requested id is older than the retained history or
+    /// newer than any id sent (the server restarted): events may be missing.
+    pub complete: bool,
+}
+
+struct History {
+    latest_id: u64,
+    recent: VecDeque<Sequenced>,
+}
+
+/// Broadcast bus for SSE and webhook consumers. Every event gets an id, and
+/// the last [`EVENT_HISTORY`] are kept so an SSE client that reconnects (a map
+/// re-subscribing for a new viewport) can catch up on what it missed.
+pub struct EventBus {
+    tx: broadcast::Sender<Sequenced>,
+    history: Mutex<History>,
+}
+
+impl EventBus {
+    pub fn send(&self, event: TileEvent) -> Result<usize, broadcast::error::SendError<Sequenced>> {
+        // Numbering, recording and broadcasting happen under one lock, so a
+        // concurrent `subscribe_since` sees each event in exactly one of its
+        // replay or its receiver.
+        let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        history.latest_id += 1;
+        let sequenced = Sequenced {
+            id: history.latest_id,
+            event,
+        };
+        if history.recent.len() == EVENT_HISTORY {
+            history.recent.pop_front();
+        }
+        history.recent.push_back(sequenced.clone());
+        self.tx.send(sequenced)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Sequenced> {
+        self.tx.subscribe()
+    }
+
+    /// Subscribe, replaying the retained events with an id above `since`.
+    pub fn subscribe_since(&self, since: Option<u64>) -> Subscription {
+        let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = self.tx.subscribe();
+        let latest_id = history.latest_id;
+        let Some(since) = since else {
+            return Subscription {
+                replay: Vec::new(),
+                rx,
+                latest_id,
+                complete: true,
+            };
+        };
+        let oldest_retained = history.recent.front().map_or(latest_id + 1, |e| e.id);
+        let complete = since <= latest_id && since + 1 >= oldest_retained;
+        let replay = history
+            .recent
+            .iter()
+            .filter(|e| e.id > since)
+            .cloned()
+            .collect();
+        Subscription {
+            replay,
+            rx,
+            latest_id,
+            complete,
+        }
+    }
+}
+
+/// Shared handle to the event bus.
+pub type EventSender = Arc<EventBus>;
 
 pub fn create_event_bus() -> EventSender {
-    let (tx, _) = broadcast::channel(256);
-    tx
+    let (tx, _) = broadcast::channel(EVENT_HISTORY);
+    Arc::new(EventBus {
+        tx,
+        history: Mutex::new(History {
+            latest_id: 0,
+            recent: VecDeque::with_capacity(EVENT_HISTORY),
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -205,7 +325,7 @@ mod tests {
         })
         .unwrap();
 
-        let event = rx.try_recv().unwrap();
+        let event = rx.try_recv().unwrap().event;
         match event {
             TileEvent::GenerateComplete {
                 source,
@@ -279,6 +399,55 @@ mod tests {
         assert_eq!(parsed["source"], "basemap");
         assert_eq!(parsed["tiles_updated"], 7);
         assert_eq!(parsed["affected_zooms"], serde_json::json!([10]));
+    }
+
+    fn generated(source: &str) -> TileEvent {
+        TileEvent::GenerateComplete {
+            source: source.into(),
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn test_subscribe_since_replays_missed_events() {
+        let bus = create_event_bus();
+        let _keep_open = bus.subscribe();
+        for name in ["a", "b", "c"] {
+            bus.send(generated(name)).unwrap();
+        }
+
+        let sub = bus.subscribe_since(Some(1));
+        assert!(sub.complete);
+        assert_eq!(sub.latest_id, 3);
+        let ids: Vec<u64> = sub.replay.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![2, 3]);
+
+        // Nothing replayed twice: the receiver starts after the replay.
+        let mut rx = sub.rx;
+        bus.send(generated("d")).unwrap();
+        assert_eq!(rx.try_recv().unwrap().id, 4);
+        assert!(rx.try_recv().is_err());
+
+        // Up to date, and no `since` at all.
+        let sub = bus.subscribe_since(Some(4));
+        assert!(sub.complete && sub.replay.is_empty());
+        let sub = bus.subscribe_since(None);
+        assert!(sub.complete && sub.replay.is_empty());
+    }
+
+    #[test]
+    fn test_subscribe_since_reports_gaps() {
+        let bus = create_event_bus();
+        let _keep_open = bus.subscribe();
+        for _ in 0..EVENT_HISTORY + 10 {
+            bus.send(generated("a")).unwrap();
+        }
+        // Expired from the history
+        assert!(!bus.subscribe_since(Some(5)).complete);
+        // Oldest retained is 11, so asking from 10 is still complete
+        assert!(bus.subscribe_since(Some(10)).complete);
+        // An id this bus never issued: the server restarted
+        assert!(!bus.subscribe_since(Some(10_000)).complete);
     }
 
     #[test]

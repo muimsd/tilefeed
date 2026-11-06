@@ -48,7 +48,7 @@ impl WebhookNotifier {
         let mut rx = event_tx.subscribe();
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
+                match rx.recv().await.map(|e| e.event) {
                     Ok(event) => {
                         if self.should_send(&event) {
                             self.send_all(&event).await;
@@ -82,7 +82,7 @@ impl WebhookNotifier {
 
                 tokio::select! {
                     result = rx.recv() => {
-                        match result {
+                        match result.map(|e| e.event) {
                             Ok(event) => {
                                 if !self.should_send(&event) {
                                     continue;
