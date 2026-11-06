@@ -41,7 +41,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY with debounced batching
 - [TLS to PostgreSQL](docs/configuration.md#database) (`sslmode`, `sslrootcert`) for managed databases such as Supabase, Neon, RDS and Cloud SQL
 - Built-in HTTP tile server with ETag caching, CORS, configurable `Cache-Control`, and [TileJSON 3.0.0](docs/serving.md)
-- [In-memory tile cache](docs/serving.md#tile-cache) for `serve`, cleared tile by tile as updates land and when another process writes the MBTiles
+- [In-memory tile cache](docs/serving.md#tile-cache) for `serve`, cleared tile by tile as updates land, and per source when another process writes the MBTiles
 - [Derived geometry layers](docs/derived-layers.md): auto-generated label points (point on surface, centroid, or your own point column) and boundary lines from polygons
 - Native generator that only visits tiles inside the data's extent, descending the quadtree below non-empty tiles
 - Geometry simplification (Douglas-Peucker) with per-zoom scaling
@@ -184,7 +184,7 @@ port = 5432
 user = "postgres"
 password = "postgres"
 dbname = "geodata"
-# sslmode = "require"   # managed databases; verify-full + sslrootcert to check the certificate
+# sslmode = "require"   # managed databases; verify-full also checks the certificate
 
 [serve]
 host = "0.0.0.0"
