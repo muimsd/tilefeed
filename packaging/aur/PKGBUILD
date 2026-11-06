@@ -1,6 +1,6 @@
 # Maintainer: muimsd
 pkgname=tilefeed
-pkgver=0.10.0
+pkgver=0.11.0
 pkgrel=1
 pkgdesc="Dynamic vector tiles from PostGIS and GDAL files"
 arch=('x86_64')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('gcc-libs')
 makedepends=('cargo' 'protobuf')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/muimsd/tilefeed/archive/v$pkgver.tar.gz")
-sha256sums=('d4359d4ecae81bb274aba5ef2f0ca60847d6efc87f225b385633068b3b7675d1')
+sha256sums=('7f1d7bdc27b2b934e8f531a6c812d508afb4d49e6fc45ec8e5afb5c6969c2c53')
 
 prepare() {
     cd "$pkgname-$pkgver"
