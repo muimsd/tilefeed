@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Layers without `properties` failed** in native generation, incremental updates and Tippecanoe export (`SELECT * with no tables specified is not valid`). They now include every column except geometry and geography columns.
 - A notification whose old geometry was NULL (or whose `old_bounds` was incomplete) was read as a box at 0,0, so tiles at Null Island were regenerated for nothing.
 
 ## [0.10.0] - 2026-11-06

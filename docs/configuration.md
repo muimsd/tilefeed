@@ -212,7 +212,7 @@ See [Metrics](metrics.md) for the full metric reference.
 | `geometry_column` | string | no | Geometry column (default: `"geom"`) |
 | `id_column` | string | no | Feature ID column |
 | `srid` | int | no | SRID (default: 4326) |
-| `properties` | string[] | no | Properties to include in tiles |
+| `properties` | string[] | no | Properties to include in tiles. Omit it to include every column except geometry and geography columns |
 | `filter` | string | no | SQL WHERE clause to filter features |
 | `simplify_tolerance` | float | no | Douglas-Peucker tolerance in degrees (scaled per zoom) |
 | `generate_label_points` | bool | no | Generate `{name}_labels` point layer (see derived-layers.md) |

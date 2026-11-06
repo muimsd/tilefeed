@@ -35,6 +35,38 @@ fn geojson_feature(
     feature
 }
 
+/// SQL for a feature's `properties` object, evaluated in a query whose FROM
+/// is the layer's table (unaliased).
+///
+/// With `properties` listed, only those columns. Without, every column except
+/// geometry and geography ones (the geometry is sent as the geometry, and
+/// other spatial columns would land as hex WKB strings). The whole row is
+/// taken through the table name, so a column named like its table shadows it.
+fn properties_sql(layer: &LayerConfig, schema: &str) -> String {
+    match &layer.properties {
+        Some(props) => {
+            let cols = props
+                .iter()
+                .map(|p| format!("\"{}\"", p))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("row_to_json((SELECT r FROM (SELECT {cols}) r))")
+        }
+        // `SELECT *` has no table inside the scalar subquery, so the row
+        // comes from the outer table instead. The column list is an
+        // uncorrelated subquery, planned once per statement.
+        None => format!(
+            r#"(to_jsonb("{table}") - ARRAY(
+                SELECT a.attname::text FROM pg_attribute a
+                JOIN pg_type t ON t.oid = a.atttypid
+                WHERE a.attrelid = '"{schema}"."{table}"'::regclass
+                  AND a.attnum > 0 AND NOT a.attisdropped
+                  AND t.typname IN ('geometry', 'geography')))"#,
+            table = layer.table,
+        ),
+    }
+}
+
 /// The `(minzoom, maxzoom)` a layer sets explicitly; an unset bound is left
 /// out of Tippecanoe's per-feature object.
 pub type TippecanoeZoom = (Option<u8>, Option<u8>);
@@ -93,20 +125,13 @@ impl PostgisReader {
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
-        let props_select = match &layer.properties {
-            Some(props) => props
-                .iter()
-                .map(|p| format!("\"{}\"", p))
-                .collect::<Vec<_>>()
-                .join(", "),
-            None => "*".to_string(),
-        };
+        let props_sql = properties_sql(layer, schema);
 
         let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
-                row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
+                {props_sql} as properties
             FROM "{schema}"."{table}"
             WHERE "{geom_col}" IS NOT NULL"#,
             table = layer.table,
@@ -170,14 +195,7 @@ impl PostgisReader {
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
-        let props_select = match &layer.properties {
-            Some(props) => props
-                .iter()
-                .map(|p| format!("\"{}\"", p))
-                .collect::<Vec<_>>()
-                .join(", "),
-            None => "*".to_string(),
-        };
+        let props_sql = properties_sql(layer, schema);
 
         // Affected tiles must cover the label point too, which a
         // label_point_column may place outside the geometry.
@@ -191,7 +209,7 @@ impl PostgisReader {
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
-                row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties,
+                {props_sql} as properties,
                 ST_XMin({bounds_geom}) as xmin,
                 ST_YMin({bounds_geom}) as ymin,
                 ST_XMax({bounds_geom}) as xmax,
@@ -337,20 +355,13 @@ impl PostgisReader {
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
-        let props_select = match &layer.properties {
-            Some(props) => props
-                .iter()
-                .map(|p| format!("\"{}\"", p))
-                .collect::<Vec<_>>()
-                .join(", "),
-            None => "*".to_string(),
-        };
+        let props_sql = properties_sql(layer, schema);
 
         let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
-                row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
+                {props_sql} as properties
             FROM "{schema}"."{table}"
             WHERE "{geom_col}" IS NOT NULL
               AND ST_Intersects(
@@ -412,14 +423,7 @@ impl PostgisReader {
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
-        let props_select = match &layer.properties {
-            Some(props) => props
-                .iter()
-                .map(|p| format!("\"{}\"", p))
-                .collect::<Vec<_>>()
-                .join(", "),
-            None => "*".to_string(),
-        };
+        let props_sql = properties_sql(layer, schema);
 
         let geom_transform = match derived_type {
             DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
@@ -433,7 +437,7 @@ impl PostgisReader {
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON({geom_transform})::json as geometry,
-                row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
+                {props_sql} as properties
             FROM "{schema}"."{table}"
             WHERE "{src_col}" IS NOT NULL"#,
             table = layer.table,
@@ -505,14 +509,7 @@ impl PostgisReader {
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
-        let props_select = match &layer.properties {
-            Some(props) => props
-                .iter()
-                .map(|p| format!("\"{}\"", p))
-                .collect::<Vec<_>>()
-                .join(", "),
-            None => "*".to_string(),
-        };
+        let props_sql = properties_sql(layer, schema);
 
         let geom_transform = match derived_type {
             DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
@@ -526,7 +523,7 @@ impl PostgisReader {
             r#"SELECT
                 "{id_col}" as feature_id,
                 ST_AsGeoJSON({geom_transform})::json as geometry,
-                row_to_json((SELECT r FROM (SELECT {props_select}) r)) as properties
+                {props_sql} as properties
             FROM "{schema}"."{table}"
             WHERE "{src_col}" IS NOT NULL
               AND ST_Intersects(
@@ -719,6 +716,36 @@ pub struct FeatureData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layer(extra: &str) -> LayerConfig {
+        let toml = format!("name = \"parks\"\ntable = \"parks\"\n{extra}");
+        config::Config::builder()
+            .add_source(config::File::from_str(&toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_properties_sql_lists_configured_columns() {
+        let sql = properties_sql(&layer(r#"properties = ["name", "area"]"#), "public");
+        assert_eq!(
+            sql,
+            r#"row_to_json((SELECT r FROM (SELECT "name", "area") r))"#
+        );
+    }
+
+    #[test]
+    fn test_properties_sql_without_list_takes_the_row_minus_spatial_columns() {
+        // `SELECT *` with no FROM is invalid inside the scalar subquery, so
+        // the whole row must come from the outer table.
+        let sql = properties_sql(&layer(""), "gis");
+        assert!(!sql.contains("SELECT *"));
+        assert!(sql.starts_with(r#"(to_jsonb("parks") - ARRAY("#));
+        assert!(sql.contains(r#"'"gis"."parks"'::regclass"#));
+        assert!(sql.contains("('geometry', 'geography')"));
+    }
 
     #[test]
     fn test_geojson_feature_without_zoom_range_has_no_tippecanoe_member() {
