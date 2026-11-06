@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-06
+
 ### Added
 
 - **Viewport-filtered SSE.** `GET /events?bbox=w,s,e,n&zoom=z&source=name` sends a client only the updates that change tiles in its view: outside the box, or at zooms where the changed layer isn't drawn, they are skipped. Handles antimeridian and unwrapped longitudes from MapLibre/Mapbox `getBounds()`, and overzoom past the source's `max_zoom`. `update_complete` events (SSE and webhooks) now include `areas`, the bounding box and zoom range of each change. Every SSE event now has an `id`. The server keeps the last 256 events, so a client reconnecting with `since=<id>` (or `Last-Event-ID`) gets the updates it missed. A `ready` event marks the end of the replay, and a `resync` event tells the client to reload when the missed events are no longer available. The MapLibre example re-subscribes as the map moves, without losing updates. See [docs/serving.md](docs/serving.md#only-the-changes-in-view).
@@ -113,7 +115,8 @@ Initial release.
 - CI with tests on all platforms, clippy, formatting checks, and release builds
 - Local-parks example with end-to-end walkthrough
 
-[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.11.0
 [0.10.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.10.0
 [0.9.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.9.0
 [0.8.1]: https://github.com/muimsd/tilefeed/releases/tag/v0.8.1
