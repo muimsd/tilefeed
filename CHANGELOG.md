@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-06
+
 ### Added
 
 - **Tile cache.** `serve` keeps tiles in memory with their ETag, in an LRU bounded by `[serve.cache] max_size_mb` (default 64) with an optional `ttl_secs`. Incremental updates clear exactly the tiles they rewrite, right after the MBTiles commit, and commits by other processes (a cron `generate`, a separate `watch`) clear the source within about 2 seconds, detected via SQLite's `data_version`. Only zooms within the source's range are cached. New metrics: `tilefeed_tile_cache_*`.
@@ -18,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Incremental updates failed for layers whose `id_column` is `int2`/`int4` (`serial`, `integer`): the feature lookup bound an `i64` parameter against a 32-bit column. The id is now cast to `bigint` and decoded from any integer width.
 - Per-layer `min_zoom` / `max_zoom` keys were accepted and silently ignored, so a layer meant for "zoom 10–14" appeared at every zoom of its source. Config loading now also rejects a range with `min_zoom > max_zoom` or one outside the source's range, naming the layer.
 - **The native generator no longer walks the whole world.** `generation_backend = "native"` iterated every `x,y` at every zoom and issued a query per tile per layer, so even a 900-row table at z10–15 never finished. It now restricts tiles to the data extent and descends the quadtree only below non-empty tiles, running tile queries concurrently. Output for tiles with data is unchanged.
 - Listener reconnect logs now include the underlying cause (e.g. `server does not support TLS`) instead of only the outermost error context.
@@ -101,6 +104,8 @@ Initial release.
 - CI with tests on all platforms, clippy, formatting checks, and release builds
 - Local-parks example with end-to-end walkthrough
 
+[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.10.0
 [0.9.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.9.0
 [0.8.1]: https://github.com/muimsd/tilefeed/releases/tag/v0.8.1
 [0.7.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.7.0
