@@ -496,6 +496,7 @@ async fn update_source(
     let event_tx = outputs.event_tx.as_ref();
     let cache = outputs.cache.as_ref();
     let mut all_affected: Vec<TileCoord> = Vec::new();
+    let mut areas: Vec<crate::events::ChangedArea> = Vec::new();
 
     for event in events {
         let layer = match source.find_layer(&event.layer_name) {
@@ -503,12 +504,27 @@ async fn update_source(
             None => continue,
         };
 
+        let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
+        let mut record = |bounds: &Bounds| {
+            all_affected.extend(affected_tiles(source, layer, bounds));
+            areas.push(crate::events::ChangedArea {
+                bbox: [
+                    bounds.min_lon,
+                    bounds.min_lat,
+                    bounds.max_lon,
+                    bounds.max_lat,
+                ],
+                min_zoom,
+                max_zoom,
+            });
+        };
+
         if let Some(feat) = reader.get_feature(layer, event.feature_id).await? {
-            all_affected.extend(affected_tiles(source, layer, &feat.bounds));
+            record(&feat.bounds);
         }
 
         if let Some(ref old_bounds) = event.old_bounds {
-            all_affected.extend(affected_tiles(source, layer, old_bounds));
+            record(old_bounds);
         }
     }
 
@@ -630,13 +646,16 @@ async fn update_source(
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        let _ = event_tx.send(crate::events::TileEvent::update_complete(
-            source.name.clone(),
-            all_affected.len(),
-            &zooms,
-            source.max_zoom,
-            layers,
-        ));
+        let _ = event_tx.send(
+            crate::events::TileEvent::update_complete(
+                source.name.clone(),
+                all_affected.len(),
+                &zooms,
+                source.max_zoom,
+                layers,
+            )
+            .with_areas(areas),
+        );
     }
 
     Ok(())

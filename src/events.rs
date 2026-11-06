@@ -2,6 +2,65 @@ use serde::Serialize;
 use std::collections::HashSet;
 use tokio::sync::broadcast;
 
+/// A region an incremental update changed: the bounding box of a feature's new or
+/// old geometry, and the zooms at which its layer is encoded. Clients use it (and
+/// the server's `/events?bbox=…&zoom=…` filter does) to tell whether a change is
+/// visible in a given viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ChangedArea {
+    /// `[west, south, east, north]` in degrees (EPSG:4326)
+    pub bbox: [f64; 4],
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+}
+
+impl ChangedArea {
+    fn union(a: &ChangedArea, b: &ChangedArea) -> ChangedArea {
+        ChangedArea {
+            bbox: [
+                a.bbox[0].min(b.bbox[0]),
+                a.bbox[1].min(b.bbox[1]),
+                a.bbox[2].max(b.bbox[2]),
+                a.bbox[3].max(b.bbox[3]),
+            ],
+            min_zoom: a.min_zoom.min(b.min_zoom),
+            max_zoom: a.max_zoom.max(b.max_zoom),
+        }
+    }
+}
+
+/// Most areas one event carries. Past this they are merged into one box per zoom
+/// range (then into a single box), so a large batch or a long cooldown can't grow
+/// the payload without bound — at the cost of a coarser, never narrower, area.
+pub const MAX_CHANGED_AREAS: usize = 64;
+
+/// Shrink `areas` to at most [`MAX_CHANGED_AREAS`], only ever growing the region
+/// they cover.
+fn compact_areas(areas: &mut Vec<ChangedArea>) {
+    areas.dedup();
+    if areas.len() <= MAX_CHANGED_AREAS {
+        return;
+    }
+    let mut by_zoom: Vec<ChangedArea> = Vec::new();
+    for area in areas.iter() {
+        match by_zoom
+            .iter_mut()
+            .find(|a| a.min_zoom == area.min_zoom && a.max_zoom == area.max_zoom)
+        {
+            Some(existing) => *existing = ChangedArea::union(existing, area),
+            None => by_zoom.push(*area),
+        }
+    }
+    if by_zoom.len() > MAX_CHANGED_AREAS {
+        let all = by_zoom
+            .iter()
+            .skip(1)
+            .fold(by_zoom[0], |acc, a| ChangedArea::union(&acc, a));
+        by_zoom = vec![all];
+    }
+    *areas = by_zoom;
+}
+
 /// Events emitted by the tile pipeline
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -18,6 +77,8 @@ pub enum TileEvent {
         /// so the frontend should also invalidate overzoomed views.
         max_zoom: u8,
         layers_affected: Vec<String>,
+        /// Where the change happened. Empty means unknown — treat it as everywhere.
+        areas: Vec<ChangedArea>,
     },
 }
 
@@ -46,7 +107,17 @@ impl TileEvent {
             affected_zooms,
             max_zoom,
             layers_affected: layers,
+            areas: Vec::new(),
         }
+    }
+
+    /// Attach the changed areas to an `UpdateComplete` event (no-op otherwise).
+    pub fn with_areas(mut self, new_areas: Vec<ChangedArea>) -> Self {
+        if let TileEvent::UpdateComplete { areas, .. } = &mut self {
+            *areas = new_areas;
+            compact_areas(areas);
+        }
+        self
     }
 
     /// Merge another event into this one (accumulates tiles, zooms, layers).
@@ -60,15 +131,24 @@ impl TileEvent {
                     tiles_updated,
                     affected_zooms,
                     layers_affected,
+                    areas,
                     ..
                 },
                 TileEvent::UpdateComplete {
                     tiles_updated: other_tiles,
                     affected_zooms: other_zooms,
                     layers_affected: other_layers,
+                    areas: other_areas,
                     ..
                 },
             ) => {
+                // An event with no areas means "anywhere"; merging keeps that.
+                if areas.is_empty() || other_areas.is_empty() {
+                    areas.clear();
+                } else {
+                    areas.extend(other_areas.iter().copied());
+                    compact_areas(areas);
+                }
                 *tiles_updated += other_tiles;
                 let mut zoom_set: HashSet<u8> = affected_zooms.iter().copied().collect();
                 zoom_set.extend(other_zooms);
@@ -307,6 +387,66 @@ mod tests {
                 assert_eq!(duration_ms, 500);
             }
             _ => panic!("Should still be GenerateComplete"),
+        }
+    }
+
+    fn area(w: f64, s: f64, e: f64, n: f64, min_zoom: u8, max_zoom: u8) -> ChangedArea {
+        ChangedArea {
+            bbox: [w, s, e, n],
+            min_zoom,
+            max_zoom,
+        }
+    }
+
+    #[test]
+    fn test_areas_serialize_and_merge() {
+        let mut e1 = TileEvent::update_complete("src".into(), 1, &HashSet::new(), 14, vec![])
+            .with_areas(vec![area(1.0, 2.0, 3.0, 4.0, 0, 14)]);
+        let json: serde_json::Value = serde_json::to_value(&e1).unwrap();
+        assert_eq!(
+            json["areas"],
+            serde_json::json!([{"bbox": [1.0, 2.0, 3.0, 4.0], "min_zoom": 0, "max_zoom": 14}])
+        );
+
+        let e2 = TileEvent::update_complete("src".into(), 1, &HashSet::new(), 14, vec![])
+            .with_areas(vec![area(10.0, 10.0, 11.0, 11.0, 12, 14)]);
+        e1.merge(&e2);
+        match &e1 {
+            TileEvent::UpdateComplete { areas, .. } => assert_eq!(areas.len(), 2),
+            _ => panic!("Wrong type"),
+        }
+
+        // Merging an event of unknown extent widens the result to "anywhere".
+        let unknown = TileEvent::update_complete("src".into(), 1, &HashSet::new(), 14, vec![]);
+        e1.merge(&unknown);
+        match &e1 {
+            TileEvent::UpdateComplete { areas, .. } => assert!(areas.is_empty()),
+            _ => panic!("Wrong type"),
+        }
+    }
+
+    #[test]
+    fn test_areas_are_compacted_without_shrinking() {
+        let many: Vec<ChangedArea> = (0..200)
+            .map(|i| {
+                let x = i as f64 * 0.1;
+                area(x, x, x + 0.05, x + 0.05, (i % 3) as u8, 14)
+            })
+            .collect();
+        let e = TileEvent::update_complete("src".into(), 1, &HashSet::new(), 14, vec![])
+            .with_areas(many.clone());
+        let TileEvent::UpdateComplete { areas, .. } = e else {
+            panic!("Wrong type")
+        };
+        assert!(areas.len() <= MAX_CHANGED_AREAS);
+        // Every original area is still covered, at its zooms.
+        for a in &many {
+            assert!(areas.iter().any(|c| c.bbox[0] <= a.bbox[0]
+                && c.bbox[1] <= a.bbox[1]
+                && c.bbox[2] >= a.bbox[2]
+                && c.bbox[3] >= a.bbox[3]
+                && c.min_zoom <= a.min_zoom
+                && c.max_zoom >= a.max_zoom));
         }
     }
 

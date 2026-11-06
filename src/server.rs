@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -21,6 +21,7 @@ use crate::config::{AppConfig, ServeConfig};
 use crate::events::{EventSender, TileEvent};
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::{metrics, GaugeGuard};
+use crate::viewport::{EventsQuery, Viewport};
 
 type Stores = HashMap<String, Arc<Mutex<MbtilesStore>>>;
 
@@ -456,13 +457,21 @@ async fn health_check() -> &'static str {
     "ok"
 }
 
+/// `GET /events[?bbox=w,s,e,n][&zoom=z][&source=a,b]`. With a viewport, the
+/// client only gets updates that change tiles it can see (see `viewport.rs`).
 async fn sse_handler(
     State(state): State<AppState>,
+    Query(query): Query<EventsQuery>,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>>,
-    StatusCode,
+    (StatusCode, String),
 > {
-    let event_tx = state.event_tx.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let event_tx = state
+        .event_tx
+        .as_ref()
+        .ok_or((StatusCode::NOT_FOUND, "Not Found".to_string()))?;
+    let viewport = Viewport::parse(&query, state.config.sources.iter().map(|s| s.name.as_str()))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let mut rx = event_tx.subscribe();
 
     metrics().sse_connections.get().inc();
@@ -485,6 +494,7 @@ async fn sse_handler(
                 // No cooldown — forward every event immediately
                 loop {
                     match rx.recv().await {
+                        Ok(event) if !viewport.wants(&event) => continue,
                         Ok(event) => {
                             if let Some(sse) = event_to_sse(&event) {
                                 yield Ok(sse);
@@ -510,6 +520,9 @@ async fn sse_handler(
                     tokio::select! {
                         result = rx.recv() => {
                             match result {
+                                // Filter before merging, so an aggregated event
+                                // only accumulates changes this client can see.
+                                Ok(event) if !viewport.wants(&event) => {}
                                 Ok(event) => {
                                     let source = event.source().to_string();
                                     match pending.get_mut(&source) {
@@ -1644,6 +1657,71 @@ mod tests {
         assert!(body_str.contains("event: generate_complete"));
         assert!(body_str.contains("test_source"));
         assert!(body_str.contains("1234"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_viewport_filter_drops_changes_out_of_view() {
+        let config = make_test_config();
+        let event_tx = crate::events::create_event_bus();
+        let app = make_app_with_events(config, HashMap::new(), Some(event_tx.clone()));
+
+        // A client looking at Paris at z12, through the production router.
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/events?bbox=2.2,48.8,2.5,48.9&zoom=12&source=test_source")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let at = |tiles: usize, bbox: [f64; 4]| {
+            TileEvent::update_complete(
+                "test_source".to_string(),
+                tiles,
+                &std::collections::HashSet::new(),
+                14,
+                vec![],
+            )
+            .with_areas(vec![crate::events::ChangedArea {
+                bbox,
+                min_zoom: 0,
+                max_zoom: 14,
+            }])
+        };
+        event_tx
+            .send(at(111, [139.7, 35.6, 139.71, 35.61]))
+            .unwrap(); // Tokyo
+        event_tx.send(at(222, [2.34, 48.85, 2.35, 48.86])).unwrap(); // Paris
+        drop(event_tx);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"tiles_updated\":222"));
+        assert!(!body_str.contains("\"tiles_updated\":111"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_rejects_bad_viewport() {
+        let config = make_test_config();
+        let event_tx = crate::events::create_event_bus();
+        for uri in [
+            "/events?bbox=1,2,3",
+            "/events?zoom=99",
+            "/events?zoom=abc",
+            "/events?source=ghost",
+        ] {
+            let app = make_app_with_events(config.clone(), HashMap::new(), Some(event_tx.clone()));
+            let response = send_request(
+                app,
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     #[tokio::test]

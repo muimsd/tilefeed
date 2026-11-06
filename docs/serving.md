@@ -123,9 +123,15 @@ The `GET /events` endpoint provides a live stream of tile update events using [S
   "tiles_updated": 42,
   "affected_zooms": [10, 11, 12, 13, 14],
   "max_zoom": 14,
-  "layers_affected": ["buildings", "roads"]
+  "layers_affected": ["buildings", "roads"],
+  "areas": [
+    { "bbox": [2.3412, 48.8530, 2.3431, 48.8544], "min_zoom": 13, "max_zoom": 14 },
+    { "bbox": [2.2950, 48.8580, 2.2990, 48.8600], "min_zoom": 0, "max_zoom": 14 }
+  ]
 }
 ```
+
+`areas` lists where the change happened: the bounding box (`[west, south, east, north]`, EPSG:4326) of each changed feature's new and old geometry, with the zoom range its layer is encoded at. An event carries at most 64 areas; beyond that they are merged into larger boxes, which can only widen the region, never narrow it. An empty `areas` means the extent is unknown and should be treated as "anywhere".
 
 **`generate_complete`** — Sent after a full tile generation:
 
@@ -153,6 +159,43 @@ es.addEventListener('update_complete', (e) => {
 ```
 
 A full MapLibre integration example is available at `examples/webhook-sse/map.html`.
+
+### Only the changes in view
+
+By default every client receives every event. A client can instead subscribe with what it is showing, and the server then sends only the updates that change tiles in that view:
+
+```
+GET /events?bbox=<west>,<south>,<east>,<north>&zoom=<zoom>&source=<name>[,<name>]
+```
+
+| Parameter | Meaning |
+|---|---|
+| `bbox` | The visible area in degrees. Longitudes may be unwrapped past ±180 (as `getBounds()` returns them after panning across the antimeridian), or `west > east` for a view that crosses it. |
+| `zoom` | The map's zoom, fractional is fine. Updates to layers not drawn at that zoom are skipped (a `min_zoom = 13` buildings layer doesn't wake a client at zoom 8). Above the source's `max_zoom` the client is overzooming, so changes at `max_zoom` count. |
+| `source` | Only these sources. Unknown names are rejected. |
+
+Every parameter is optional and they combine. With `zoom`, the view is widened to the edges of the tiles that cover it, because the map draws whole tiles and a tile's buffer can show a feature just outside the visible area. `generate_complete` and updates without `areas` always pass the viewport check, since they may have changed anything. Invalid values return `400` with the reason.
+
+The view is fixed for the life of the connection, so re-subscribe when the map moves. The same code works in MapLibre GL JS and Mapbox GL JS:
+
+```javascript
+let es;
+function subscribe() {
+    if (es) es.close();
+    const b = map.getBounds();
+    const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(',');
+    es = new EventSource(`${server}/events?bbox=${bbox}&zoom=${map.getZoom()}&source=basemap`);
+    es.addEventListener('update_complete', (e) => refresh(JSON.parse(e.data).source));
+    es.addEventListener('generate_complete', (e) => refresh(JSON.parse(e.data).source));
+}
+let timer;
+map.on('moveend', () => { clearTimeout(timer); timer = setTimeout(subscribe, 300); });
+map.on('load', subscribe);
+```
+
+An update committed during the moment of reconnecting is not delivered to that client. When freshness right after a pan matters, set `[serve] max_age_secs = 0` so newly loaded tiles are always revalidated.
+
+Viewport filtering happens per connection, before the cooldown below, so an aggregated event only accumulates changes that client can see.
 
 ### Cooldown / Throttle
 

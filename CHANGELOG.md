@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Viewport-filtered SSE.** `GET /events?bbox=w,s,e,n&zoom=z&source=name` sends a client only the updates that change tiles in its view: outside the box, or at zooms where the changed layer isn't drawn, they are skipped. Handles antimeridian and unwrapped longitudes from MapLibre/Mapbox `getBounds()`, and overzoom past the source's `max_zoom`. `update_complete` events (SSE and webhooks) now include `areas`, the bounding box and zoom range of each change. The MapLibre example re-subscribes as the map moves. See [docs/serving.md](docs/serving.md#only-the-changes-in-view).
+
 ## [0.10.0] - 2026-11-06
 
 ### Added
