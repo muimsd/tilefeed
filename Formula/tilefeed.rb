@@ -1,28 +1,28 @@
 class Tilefeed < Formula
   desc "Dynamic vector tiles from PostGIS and GDAL files"
   homepage "https://github.com/muimsd/tilefeed"
-  version "0.9.0"
+  version "0.10.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/muimsd/tilefeed/releases/download/v0.9.0/tilefeed-aarch64-apple-darwin.tar.gz"
-      sha256 "e1034abef51c6ca77cd2e3d8f4c9c78f2d29d518d4b6b3dd146c6e950b23d000"
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.10.0/tilefeed-aarch64-apple-darwin.tar.gz"
+      sha256 "959517a0b6cccc112ef0e1117b9f1c7b9f2bd70f8283f6246541225d8f92e947"
     end
     on_intel do
-      url "https://github.com/muimsd/tilefeed/releases/download/v0.9.0/tilefeed-x86_64-apple-darwin.tar.gz"
-      sha256 "75014c1b129b64a0999d07e3dcd1d918afbb9f75c6371669954fb801d9afe3b5"
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.10.0/tilefeed-x86_64-apple-darwin.tar.gz"
+      sha256 "f9ab84ceb94d0bad2bbdbfbf5006c2cdf2f65485de6bf97e5b0cbe5849c53d4f"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/muimsd/tilefeed/releases/download/v0.9.0/tilefeed-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "a04015c68efac5d44b6d80428ccd2cb867825d1431cd99ebc6f2f0725dace212"
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.10.0/tilefeed-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "522db0c9df2ce759d1964583d4f70c2a653eeef7ed054d699456164dd992795d"
     end
     on_intel do
-      url "https://github.com/muimsd/tilefeed/releases/download/v0.9.0/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "d2b4566c854beece6fce7b17f719970126801c3c69458db38008d6ba5c01cbbe"
+      url "https://github.com/muimsd/tilefeed/releases/download/v0.10.0/tilefeed-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "896b403773125a3e250bd8f3c458d1beb94d95e009644f2b9b17494334cc3649"
     end
   end
 
