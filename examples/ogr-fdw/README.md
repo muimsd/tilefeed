@@ -37,7 +37,8 @@ psql -d tilefeed_ogr_example < examples/ogr-fdw/setup.sql
 3. Verify the foreign table was created:
 
 ```bash
-psql -d tilefeed_ogr_example -c "\dt+ buildings"
+psql -d tilefeed_ogr_example -c "\det+"            # lists foreign tables
+psql -d tilefeed_ogr_example -c "\d buildings"      # columns of this one
 ```
 
 ## Discover available layers
@@ -74,18 +75,34 @@ Since foreign tables don't support PostgreSQL LISTEN/NOTIFY, use cron or a sched
 
 ## Performance tips
 
-For large remote data sources, consider materializing the foreign table locally:
+For large remote data sources, keep a local copy and point tilefeed at it. A materialized view is the simplest:
 
 ```sql
--- Create a local materialized view
 CREATE MATERIALIZED VIEW buildings_local AS SELECT * FROM buildings;
-CREATE INDEX idx_buildings_local_geom ON buildings_local USING GIST (geom);
+CREATE UNIQUE INDEX ON buildings_local (id);   -- required for CONCURRENTLY
+CREATE INDEX ON buildings_local USING GIST (geom);
 
--- Refresh periodically (or via pg_cron)
+-- Refresh periodically (or via pg_cron), then run `tilefeed generate`
 REFRESH MATERIALIZED VIEW CONCURRENTLY buildings_local;
 ```
 
-Then update `config.toml` to point at `buildings_local` instead of `buildings`. You can also attach LISTEN/NOTIFY triggers to the materialized view refresh to enable `tilefeed watch`.
+PostgreSQL can't put triggers on a materialized view, so this copy works with scheduled `tilefeed generate` runs, not `tilefeed watch`. To keep incremental updates, sync into a regular table instead. Only rows that actually changed are written, so only they fire the notify trigger:
+
+```sql
+CREATE TABLE buildings_local AS SELECT * FROM buildings;
+ALTER TABLE buildings_local ADD PRIMARY KEY (id);
+CREATE INDEX ON buildings_local USING GIST (geom);
+-- then attach notify_tile_update('buildings') to buildings_local, as in sql/setup_notify.sql
+
+-- Sync (pg_cron or any scheduler). List your own columns in SET and WHERE.
+INSERT INTO buildings_local SELECT * FROM buildings
+ON CONFLICT (id) DO UPDATE
+  SET name = EXCLUDED.name, geom = EXCLUDED.geom
+  WHERE (buildings_local.name, buildings_local.geom)
+        IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.geom);
+DELETE FROM buildings_local l
+WHERE NOT EXISTS (SELECT 1 FROM buildings b WHERE b.id = l.id);
+```
 
 ## Supported data sources
 
