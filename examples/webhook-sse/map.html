@@ -110,35 +110,55 @@
             addEventLog(`Refreshed tiles for "${sourceName}"`);
         }
 
+        // Subscribe with the current viewport, so the server only sends
+        // updates that change tiles this map can see. The same calls work in
+        // Mapbox GL JS (getBounds, getZoom, 'moveend').
+        function eventsUrl() {
+            const b = map.getBounds();
+            const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
+                .map((v) => v.toFixed(5))
+                .join(',');
+            const zoom = map.getZoom().toFixed(2);
+            // `since` makes the server replay what arrived while reconnecting.
+            const since = lastEventId ? `&since=${lastEventId}` : '';
+            return `${TILE_SERVER}/events?bbox=${bbox}&zoom=${zoom}&source=${SOURCE_NAME}${since}`;
+        }
+
+        let lastEventId = null;
+        let es = null;
+        let retryTimer = null;
+
         function connectSSE() {
-            const es = new EventSource(`${TILE_SERVER}/events`);
+            clearTimeout(retryTimer);
+            if (es) es.close();
+            es = new EventSource(eventsUrl());
+            const current = es;
 
             es.onopen = () => {
-                statusEl.textContent = 'SSE: connected';
+                statusEl.textContent = 'SSE: connected (this view only)';
                 statusEl.className = 'connected';
-                addEventLog('Connected to SSE');
             };
 
+            // Every event carries an id; remember the latest to resume from.
+            es.addEventListener('ready', (e) => { lastEventId = e.lastEventId; });
+            es.addEventListener('resync', () => {
+                lastEventId = null;
+                addEventLog('Missed updates — reloading tiles');
+                refreshSource(SOURCE_NAME);
+            });
+
             es.addEventListener('update_complete', (e) => {
+                lastEventId = e.lastEventId;
                 const data = JSON.parse(e.data);
-                const currentZoom = Math.floor(map.getZoom());
-                const maxZoom = data.max_zoom || 14;
-                // Check if the current view is affected — either at a
-                // directly updated zoom or overzooming beyond max_zoom
-                const isOverzooming = currentZoom > maxZoom && data.affected_zooms.includes(maxZoom);
-                const isDirectHit = data.affected_zooms.includes(currentZoom);
-
                 addEventLog(
-                    `Update: ${data.tiles_updated} tiles in "${data.source}" ` +
-                    `(zooms ${data.affected_zooms.join(',')}, max_zoom=${maxZoom})`
+                    `Update in view: ${data.tiles_updated} tiles in "${data.source}" ` +
+                    `(zooms ${data.affected_zooms.join(',')})`
                 );
-
-                // Always refresh — MapLibre needs new tiles at the source
-                // zoom levels, and overzoomed views derive from those same tiles
                 refreshSource(data.source);
             });
 
             es.addEventListener('generate_complete', (e) => {
+                lastEventId = e.lastEventId;
                 const data = JSON.parse(e.data);
                 addEventLog(
                     `Generate: "${data.source}" completed in ${data.duration_ms}ms`
@@ -147,15 +167,26 @@
             });
 
             es.onerror = () => {
+                if (current !== es) return; // superseded by a newer viewport
                 statusEl.textContent = 'SSE: disconnected — retrying...';
                 statusEl.className = 'disconnected';
                 es.close();
-                // Reconnect after 3s
-                setTimeout(connectSSE, 3000);
+                retryTimer = setTimeout(connectSSE, 3000);
             };
         }
 
-        map.on('load', connectSSE);
+        // Re-subscribe when the view settles (debounced). Updates that land
+        // while reconnecting are replayed thanks to `since`.
+        let moveTimer = null;
+        map.on('moveend', () => {
+            clearTimeout(moveTimer);
+            moveTimer = setTimeout(connectSSE, 300);
+        });
+
+        map.on('load', () => {
+            connectSSE();
+            addEventLog('Connected to SSE — pan the map to change what is watched');
+        });
     </script>
 </body>
 </html>

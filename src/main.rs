@@ -15,6 +15,7 @@ mod storage;
 mod tiles;
 mod updater;
 mod validate;
+mod viewport;
 mod webhook;
 
 use anyhow::{Context, Result};

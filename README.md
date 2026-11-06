@@ -45,7 +45,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - Per-zoom property filtering to reduce tile sizes at low zooms
 - Storage backends: local copy, S3, [Mapbox Studio](https://docs.mapbox.com/api/maps/uploads/), custom command
 - [Webhook notifications](docs/serving.md#webhooks) with HMAC-SHA256 signing and configurable cooldown
-- [Server-Sent Events](docs/serving.md#server-sent-events-sse) (`GET /events`) for live tile refresh in frontends
+- [Server-Sent Events](docs/serving.md#server-sent-events-sse) (`GET /events`) for live tile refresh in frontends, optionally [filtered to the map's viewport](docs/serving.md#only-the-changes-in-view) so a client only hears about changes it can see
 - [Prometheus metrics](docs/metrics.md) (`GET /metrics`) for tile serving, generation, updates, webhooks, and publishing
 - [PMTiles export](docs/pmtiles.md) for static hosting on S3/R2/any CDN — no tile server needed
 - CLI tools: `inspect`, `validate`, `diff` for MBTiles diagnostics
