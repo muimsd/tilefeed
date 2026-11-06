@@ -58,7 +58,7 @@ flag rather than changing its command.
 |----------|-------------|
 | `GET /{source}/{z}/{x}/{y}.pbf` | Serve a vector tile (MVT protobuf) |
 | `GET /{source}.json` | TileJSON 3.0.0 metadata |
-| `GET /events` | Server-Sent Events stream for live tile updates |
+| `GET /events` | Server-Sent Events stream for live tile updates; optional `bbox`, `zoom`, `source` and `since` ([details](#only-the-changes-in-view)) |
 | `GET /health` | Health check (returns `ok`) |
 | `GET /metrics` | [Prometheus metrics](metrics.md) (enabled by default, unless `[metrics] port` moves them to their own listener) |
 
@@ -216,7 +216,7 @@ tilefeed can send HTTP POST notifications to external URLs when tiles are update
 
 ### Payload
 
-The request body is the same JSON as SSE events (see above). The `Content-Type` header is `application/json`.
+The request body is the same JSON as SSE events (see above), including `areas` on `update_complete`. The SSE `id` and the `ready`/`resync` events are specific to the stream and are not sent to webhooks. The `Content-Type` header is `application/json`.
 
 ### HMAC Signing
 

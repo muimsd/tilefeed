@@ -39,8 +39,11 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - Multiple sources: separate MBTiles outputs with independent layers and zoom ranges
 - [Per-layer zoom ranges](docs/configuration.md#per-layer-zoom-range) (`min_zoom`/`max_zoom`) within a source, honoured by every backend and by incremental updates
 - Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY with debounced batching
-- Built-in HTTP tile server with ETag caching, CORS, and [TileJSON 3.0.0](docs/serving.md)
-- [Derived geometry layers](docs/derived-layers.md): auto-generated label points and boundary lines from polygons
+- [TLS to PostgreSQL](docs/configuration.md#database) (`sslmode`, `sslrootcert`) for managed databases such as Supabase, Neon, RDS and Cloud SQL
+- Built-in HTTP tile server with ETag caching, CORS, configurable `Cache-Control`, and [TileJSON 3.0.0](docs/serving.md)
+- [In-memory tile cache](docs/serving.md#tile-cache) for `serve`, cleared tile by tile as updates land and when another process writes the MBTiles
+- [Derived geometry layers](docs/derived-layers.md): auto-generated label points (point on surface, centroid, or your own point column) and boundary lines from polygons
+- Native generator that only visits tiles inside the data's extent, descending the quadtree below non-empty tiles
 - Geometry simplification (Douglas-Peucker) with per-zoom scaling
 - Per-zoom property filtering to reduce tile sizes at low zooms
 - Storage backends: local copy, S3, [Mapbox Studio](https://docs.mapbox.com/api/maps/uploads/), custom command
@@ -181,10 +184,15 @@ port = 5432
 user = "postgres"
 password = "postgres"
 dbname = "geodata"
+# sslmode = "require"   # managed databases; verify-full + sslrootcert to check the certificate
 
 [serve]
 host = "0.0.0.0"
 port = 3000
+# max_age_secs = 0      # browsers revalidate every tile (ETag), so edits show at once
+
+# [serve.cache]
+# max_size_mb = 64      # in-memory tile cache, on by default
 
 # [metrics]
 # port = 9090   # dedicated metrics listener; omit to serve /metrics on the tile port
@@ -251,9 +259,9 @@ tilefeed serve --skip-generate
 2. tilefeed debounces notifications into a batch
 3. Events are routed to the correct source based on layer name
 4. Affected tiles are derived from new/old feature bounds
-5. Tiles are regenerated and written into the source's MBTiles
+5. Tiles are regenerated and written into the source's MBTiles, and exactly those tiles are dropped from the server's tile cache
 6. MBTiles artifact is published if `publish_on_update = true`
-7. Webhook and SSE consumers are notified with affected zooms, tile counts, and `max_zoom` for overzoom awareness
+7. Webhook and SSE consumers are notified with affected zooms, tile counts, `max_zoom` for overzoom awareness, and the changed `areas`; SSE clients that subscribed with a viewport only hear about changes inside it
 
 ## Support
 

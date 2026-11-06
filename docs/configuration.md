@@ -30,6 +30,8 @@ user = "postgres"
 password = "postgres"
 dbname = "geodata"
 pool_size = 4
+sslmode = "prefer"  # disable | prefer | require | verify-ca | verify-full
+# sslrootcert = "/etc/ssl/certs/db-ca.pem"  # required for verify-ca
 
 [updates]
 debounce_ms = 200
@@ -39,6 +41,12 @@ worker_concurrency = 8
 host = "0.0.0.0"
 port = 3000
 cors_origins = ["http://localhost:8080"]
+max_age_secs = 300  # Cache-Control max-age for tiles; 0 sends no-cache
+
+[serve.cache]
+enabled = true
+max_size_mb = 64
+# ttl_secs = 3600
 
 [metrics]
 enabled = true
@@ -73,6 +81,7 @@ properties = ["name", "type", "height"]
 filter = "type != 'demolished'"
 simplify_tolerance = 0.00001
 generate_label_points = true
+label_point_method = "point_on_surface"  # or "centroid"; label_point_column uses your own
 generate_boundary_lines = true
 
 # Exclude heavy properties at low zooms
@@ -310,7 +319,7 @@ Requires `ogr2ogr` from [GDAL](https://gdal.org/). Exports via OGR and converts 
 
 No external dependencies. Uses tilefeed's built-in Rust MVT encoder to generate tiles directly from PostGIS queries. Supports geometry simplification and derived layers. Best for development or environments where installing external tools is impractical.
 
-Generation only visits tiles that can hold data: it computes the data extent (`ST_Extent` of every layer, in EPSG:4326), queries every tile inside it at `min_zoom`, and then descends only into the children of tiles that had features. Tile queries run concurrently, up to `pool_size`.
+Generation only visits tiles that can hold data: it computes the data extent (`ST_Extent` of every layer, in EPSG:4326), queries every tile inside it at `min_zoom`, and then descends only into the children of tiles that had features. Tile queries run concurrently, up to `pool_size`. A layer whose `min_zoom` is deeper than the source's isn't encoded above it, so at those zooms a cheap `EXISTS` check decides whether a tile still needs descending into.
 
 ```toml
 [[sources]]
