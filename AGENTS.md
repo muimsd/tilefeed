@@ -14,6 +14,23 @@ cargo check                  # fast type-check without codegen
 
 The build step compiles `proto/vector_tile.proto` via `prost-build` (see `build.rs`).
 
+### PostGIS tests
+
+`src/pg_tests.rs` runs generation (native and Tippecanoe), `watch` and
+`validate` against a real database and decodes the tiles. They skip unless
+`TILEFEED_TEST_PG` is set; CI's "PostGIS tests" job sets it, plus
+`TILEFEED_REQUIRE_PG`/`TILEFEED_REQUIRE_TIPPECANOE` so nothing skips there:
+
+```bash
+docker run -d --name tilefeed-pg -e POSTGRES_HOST_AUTH_METHOD=trust -p 55432:5432 postgis/postgis:16-3.4
+TILEFEED_TEST_PG="host=localhost port=55432 user=postgres dbname=postgres" cargo test pg_tests
+```
+
+Any change to SQL in `postgis.rs`, `updater.rs` or `sql/setup_notify.sql`
+should be covered here: unit tests can't catch a query PostgreSQL rejects.
+Each test owns a schema and unique layer names, because every listener
+receives every test's notifications.
+
 ## Verifying before you push
 
 CI runs these exact commands; a plain `cargo clippy` is weaker than the first one

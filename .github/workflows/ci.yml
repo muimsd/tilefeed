@@ -63,6 +63,36 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  postgis:
+    name: PostGIS tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          # Throwaway service: trust auth, so no credential lives in the repo
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TILEFEED_TEST_PG: "host=localhost port=5432 user=postgres dbname=postgres"
+      # Fail instead of skipping when the database or tippecanoe is missing
+      TILEFEED_REQUIRE_PG: "1"
+      TILEFEED_REQUIRE_TIPPECANOE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc and tippecanoe
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler tippecanoe
+      - name: Run PostGIS tests
+        run: cargo test pg_tests
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

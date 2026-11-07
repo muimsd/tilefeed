@@ -7,6 +7,8 @@ mod inspect;
 mod mbtiles;
 mod metrics;
 mod mvt;
+#[cfg(test)]
+mod pg_tests;
 mod pgtls;
 mod pmtiles;
 mod postgis;
