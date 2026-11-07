@@ -160,6 +160,8 @@ es.addEventListener('update_complete', (e) => {
 
 A full MapLibre integration example is available at `examples/webhook-sse/map.html`.
 
+To try it without a database, `cargo run --example webhook_sse_demo` serves the same `/events` (viewport filter, ids, replay, `ready`/`resync`) with simulated edits around Paris, Tokyo and New York, and receives its own webhooks on port 9000. Open `map.html` and zoom in on one of those cities to see only its updates arrive.
+
 ### Only the changes in view
 
 By default every client receives every event. A client can instead subscribe with what it is showing, and the server then sends only the updates that change tiles in that view:
