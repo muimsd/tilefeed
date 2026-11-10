@@ -79,7 +79,7 @@ flag rather than changing its command.
 - **CORS** — Configurable origins or wildcard (default)
 - **Tile cache** — tiles are kept in memory with their ETag, so repeat requests skip SQLite entirely. Tiles are cleared from the cache as soon as an update rewrites them (see [Tile cache](#tile-cache))
 - **Cache-Control** — `public, max-age=300` on tile responses by default; set `max_age_secs` (`0` sends `no-cache`)
-- **TileJSON 3.0.0** — Auto-generated from source config, includes derived layers (`_labels`, `_boundary`), and `bounds`/`center` once the source has tiles. Bounds come from the MBTiles `bounds` metadata (written by Tippecanoe and native generation, and widened by incremental updates); for older files without it, from the stored tiles
+- **TileJSON 3.0.0** — Auto-generated from source config, includes derived layers (`_labels`, `_boundary`). Its tile URLs use the address the client reached the server at (the `Host` header, `https` behind a proxy that sends `X-Forwarded-Proto`), or `public_url` when set, never a bind address like `0.0.0.0`. Also includes `bounds`/`center` once the source has tiles. Bounds come from the MBTiles `bounds` metadata (written by Tippecanoe and native generation, and widened by incremental updates); for older files without it, from the stored tiles
 - **Content-Encoding** — `gzip` is advertised only when the stored tile bytes are actually gzipped
 - **[Prometheus metrics](metrics.md)** — Request counts, bytes served, and read latency per source
 

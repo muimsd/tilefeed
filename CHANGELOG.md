@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Map preview at `/`.** `tilefeed serve` now serves a MapLibre map of every source: layers styled by geometry type with toggles, feature properties on click, framed on the data, the position kept in the URL, and live updates for the current view over `/events`. Turn it off with `[serve] preview = false`. See [docs/serving.md](docs/serving.md#map-preview).
 - **TileJSON `bounds` and `center`.** Native generation now writes the MBTiles `bounds` metadata (Tippecanoe already did), incremental updates widen it to cover changed features, and TileJSON reports it. MBTiles files without the metadata get bounds from their stored tiles.
+- **`[serve] public_url`** sets the address used in TileJSON's tile URLs, for servers behind a proxy or CDN.
+
+### Fixed
+
+- **TileJSON tile URLs** were built from `[serve] host` and `port`, so with the common `host = "0.0.0.0"` (and in Docker) they pointed at an address browsers can't fetch from, and behind a proxy at the internal address. They now use the request's `Host` (and `X-Forwarded-Proto: https`), or `public_url` when set; the response carries `Vary: Host, X-Forwarded-Proto` so shared caches keep them apart.
 
 ## [0.11.1] - 2026-11-10
 
