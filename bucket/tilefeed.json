@@ -1,12 +1,12 @@
 {
-    "version": "0.12.0",
+    "version": "0.13.0",
     "description": "Dynamic vector tiles from PostGIS and GDAL files",
     "homepage": "https://github.com/muimsd/tilefeed",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/muimsd/tilefeed/releases/download/v0.12.0/tilefeed-x86_64-pc-windows-msvc.zip",
-            "hash": "128fea175bcd21d4f91edf067fb32d6fde83d2683a69f66b1479ba9f4543927e"
+            "url": "https://github.com/muimsd/tilefeed/releases/download/v0.13.0/tilefeed-x86_64-pc-windows-msvc.zip",
+            "hash": "bf7a744d4e188fbd4e719961deb6ed4128eaa605ef71091daf202d456beca24b"
         }
     },
     "bin": "tilefeed.exe",
