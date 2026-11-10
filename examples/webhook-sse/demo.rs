@@ -236,7 +236,8 @@ async fn main() {
     // ── 4. Simulated edits ──────────────────────────────────────
     println!("Simulating an edit every 3 seconds...");
     println!();
-    for cycle in 0usize.. {
+    let mut cycle = 0usize;
+    loop {
         let (source, layers) = SOURCES[cycle % SOURCES.len()];
 
         let event = if cycle % 7 == 6 {
@@ -270,6 +271,7 @@ async fn main() {
         };
         let _ = bus.send(event);
 
+        cycle += 1;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }

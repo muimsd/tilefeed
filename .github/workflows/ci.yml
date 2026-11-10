@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# No job needs to write: the token only checks out code and reads releases
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Check & Clippy
