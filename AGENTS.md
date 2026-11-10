@@ -128,7 +128,7 @@ Layers within each source are defined under `[[sources.layers]]` with: `name`, `
 Database settings live under `[database]` (`host`, `port`, `user`, `password`, `dbname`, `pool_size`, `sslmode`, `sslrootcert`).
 Incremental settings live under `[updates]` (`debounce_ms`, `worker_concurrency`).
 Publishing settings live under `[publish]` (`backend`, `destination`, `command`, `args`, `publish_on_generate`, `publish_on_update`).
-HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`, `max_age_secs`), the tile cache under `[serve.cache]` (`enabled`, `max_size_mb`, `ttl_secs`).
+HTTP serve settings live under `[serve]` (`host`, `port`, `cors_origins`, `max_age_secs`, `preview`, `public_url`), the tile cache under `[serve.cache]` (`enabled`, `max_size_mb`, `ttl_secs`).
 Metrics settings live under `[metrics]` (`enabled`, `path`, `host`, `port`).
 Webhook settings live under `[webhook]` (`urls`, `secret`, `cooldown_secs`, `timeout_ms`, `retry_count`, `on_generate`, `on_update`).
 

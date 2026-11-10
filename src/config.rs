@@ -384,6 +384,10 @@ pub struct ServeConfig {
     pub cache: TileCacheConfig,
     /// Serve a map of every source at `/` (default: true).
     pub preview: Option<bool>,
+    /// The address clients reach the server at, e.g. `https://tiles.example.com`
+    /// behind a proxy. Used for the tile URLs in TileJSON; without it they are
+    /// built from the request's `Host` (and `X-Forwarded-Proto`).
+    pub public_url: Option<String>,
 }
 
 impl Default for ServeConfig {
@@ -395,6 +399,7 @@ impl Default for ServeConfig {
             max_age_secs: None,
             cache: TileCacheConfig::default(),
             preview: None,
+            public_url: None,
         }
     }
 }
@@ -774,6 +779,18 @@ pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
 impl AppConfig {
     /// Semantic checks serde cannot express. Run by `load_config`.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(url) = &self.serve.public_url {
+            let rest = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"));
+            let valid = match rest {
+                Some(r) => !r.trim_end_matches('/').is_empty() && !r.contains(char::is_whitespace),
+                None => false,
+            };
+            if !valid {
+                anyhow::bail!("[serve] public_url must be an http:// or https:// URL, got {url:?}");
+            }
+        }
         for source in &self.sources {
             source.validate_layer_zooms()?;
         }
@@ -1048,6 +1065,23 @@ mod tests {
             .unwrap()
             .try_deserialize()
             .unwrap()
+    }
+
+    #[test]
+    fn test_public_url_must_be_http_or_https() {
+        let mut cfg = sample_config(vec![]);
+        for ok in [
+            "https://tiles.example.com",
+            "http://10.0.0.5:3000/",
+            "https://x.org/tiles",
+        ] {
+            cfg.serve.public_url = Some(ok.to_string());
+            assert!(cfg.validate().is_ok(), "{ok}");
+        }
+        for bad in ["tiles.example.com", "ftp://x", "https://", "https://a b"] {
+            cfg.serve.public_url = Some(bad.to_string());
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

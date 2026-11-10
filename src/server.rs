@@ -368,6 +368,7 @@ fn tile_response(
 async fn serve_tilejson(
     State(state): State<AppState>,
     Path(source_json): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     // This route is a single-segment catch-all, so it also collects /favicon.ico
     // and anything else a browser or scraper tries; count those rather than
@@ -395,8 +396,7 @@ async fn serve_tilejson(
     };
     metrics().tilejson_requests.with(&[&source, "ok"]).inc();
 
-    let host = state.config.serve.host.as_deref().unwrap_or("127.0.0.1");
-    let port = state.config.serve.port.unwrap_or(3000);
+    let base = tile_base_url(&state.config.serve, &headers);
 
     let mut layers: Vec<serde_json::Value> = Vec::new();
     for l in &source_config.layers {
@@ -441,7 +441,7 @@ async fn serve_tilejson(
     let mut tilejson = serde_json::json!({
         "tilejson": "3.0.0",
         "name": source_config.name,
-        "tiles": [format!("http://{}:{}/{}/{{z}}/{{x}}/{{y}}.pbf", host, port, source_config.name)],
+        "tiles": [format!("{}/{}/{{z}}/{{x}}/{{y}}.pbf", base.url, source_config.name)],
         "minzoom": source_config.min_zoom,
         "maxzoom": source_config.max_zoom,
         "vector_layers": layers,
@@ -460,11 +460,80 @@ async fn serve_tilejson(
             serde_json::json!([(w + e) / 2.0, (s + n) / 2.0, source_config.min_zoom]);
     }
 
-    (
+    let mut response = (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string_pretty(&tilejson).unwrap_or_default(),
     )
-        .into_response()
+        .into_response();
+    if base.from_request {
+        // The body depends on these headers: a shared cache must not serve
+        // one client's address to another.
+        response.headers_mut().append(
+            header::VARY,
+            header::HeaderValue::from_static("Host, X-Forwarded-Proto"),
+        );
+    }
+    response
+}
+
+struct BaseUrl {
+    /// Scheme and authority, no trailing slash
+    url: String,
+    /// Built from request headers (so the response must `Vary` on them)
+    from_request: bool,
+}
+
+/// Where clients reach this server, for the tile URLs in TileJSON.
+///
+/// `[serve] public_url` when set. Otherwise the request's `Host`, the address
+/// the client actually used (a bind address like `0.0.0.0` is not one a
+/// browser can fetch from), with `https` when a proxy says so through
+/// `X-Forwarded-Proto`. Without a usable `Host`, the configured host and
+/// port, with a wildcard bind address read as loopback.
+fn tile_base_url(serve: &ServeConfig, headers: &HeaderMap) -> BaseUrl {
+    if let Some(url) = &serve.public_url {
+        return BaseUrl {
+            url: url.trim_end_matches('/').to_string(),
+            from_request: false,
+        };
+    }
+    let header = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    let host = header(header::HOST).filter(|h| is_host_and_port(h));
+    if let Some(host) = host {
+        let scheme = match headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("https") => "https",
+            _ => "http",
+        };
+        return BaseUrl {
+            url: format!("{scheme}://{host}"),
+            from_request: true,
+        };
+    }
+    let host = match serve.host.as_deref().unwrap_or("127.0.0.1") {
+        "0.0.0.0" | "" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "[::1]".to_string(),
+        h if h.contains(':') && !h.starts_with('[') => format!("[{h}]"),
+        h => h.to_string(),
+    };
+    BaseUrl {
+        url: format!("http://{}:{}", host, serve.port.unwrap_or(3000)),
+        from_request: false,
+    }
+}
+
+/// A plausible `Host` header value: a DNS name or IP literal, optional port.
+/// Anything else (it is client-supplied) falls back to the configured address.
+fn is_host_and_port(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
 }
 
 /// The map preview: every source on a MapLibre map, refreshed live over
@@ -1692,6 +1761,101 @@ mod tests {
         assert!((center[1].as_f64().unwrap() - 48.85).abs() < 1e-9);
         assert_eq!(center[2], 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// TileJSON's tile URL and `Vary` header for a request with `headers`.
+    async fn tilejson_url(config: AppConfig, headers: &[(&str, &str)]) -> (String, String) {
+        let app = make_app(config, HashMap::new());
+        let mut req = Request::builder().uri("/test_source.json");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let response = send_request(app, req.body(Body::empty()).unwrap()).await;
+        let vary: Vec<&str> = response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        let vary = vary.join(", ");
+        let json: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        (json["tiles"][0].as_str().unwrap().to_string(), vary)
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_tile_url_uses_the_address_the_client_reached() {
+        // A wildcard bind address is not one a browser can fetch from
+        let mut config = make_test_config();
+        config.serve.host = Some("0.0.0.0".to_string());
+        let (url, vary) = tilejson_url(config, &[("host", "tiles.example.com:8080")]).await;
+        assert_eq!(
+            url,
+            "http://tiles.example.com:8080/test_source/{z}/{x}/{y}.pbf"
+        );
+        assert!(vary.contains("Host, X-Forwarded-Proto"), "{vary}");
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_tile_url_is_https_behind_a_tls_proxy() {
+        let (url, _) = tilejson_url(
+            make_test_config(),
+            &[
+                ("host", "tiles.example.com"),
+                ("x-forwarded-proto", "HTTPS, http"),
+            ],
+        )
+        .await;
+        assert_eq!(url, "https://tiles.example.com/test_source/{z}/{x}/{y}.pbf");
+        // Anything but https stays http
+        let (url, _) = tilejson_url(
+            make_test_config(),
+            &[
+                ("host", "tiles.example.com"),
+                ("x-forwarded-proto", "javascript"),
+            ],
+        )
+        .await;
+        assert!(url.starts_with("http://tiles.example.com/"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_tile_url_prefers_public_url() {
+        let mut config = make_test_config();
+        config.serve.public_url = Some("https://cdn.example.com/tiles/".to_string());
+        let (url, vary) = tilejson_url(config, &[("host", "internal:3000")]).await;
+        assert_eq!(
+            url,
+            "https://cdn.example.com/tiles/test_source/{z}/{x}/{y}.pbf"
+        );
+        assert!(
+            !vary.contains("Host"),
+            "public_url doesn't depend on the request: {vary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_tile_url_without_a_usable_host_uses_the_config() {
+        let mut config = make_test_config();
+        config.serve.host = Some("0.0.0.0".to_string());
+        config.serve.port = Some(8081);
+        let (url, vary) = tilejson_url(config.clone(), &[]).await;
+        assert_eq!(url, "http://127.0.0.1:8081/test_source/{z}/{x}/{y}.pbf");
+        assert!(!vary.contains("Host"), "{vary}");
+        // A Host that isn't a host name is not echoed back
+        let (url, _) = tilejson_url(config, &[("host", "evil.example/\"><script>")]).await;
+        assert_eq!(url, "http://127.0.0.1:8081/test_source/{z}/{x}/{y}.pbf");
+    }
+
+    #[test]
+    fn test_tile_base_url_brackets_ipv6_bind_addresses() {
+        let headers = HeaderMap::new();
+        let mut serve = ServeConfig {
+            host: Some("::".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tile_base_url(&serve, &headers).url, "http://[::1]:3000");
+        serve.host = Some("fd00::5".to_string());
+        assert_eq!(tile_base_url(&serve, &headers).url, "http://[fd00::5]:3000");
     }
 
     #[tokio::test]

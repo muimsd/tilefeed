@@ -43,6 +43,7 @@ port = 3000
 cors_origins = ["http://localhost:8080"]
 max_age_secs = 300  # Cache-Control max-age for tiles; 0 sends no-cache
 preview = true      # map of every source at / (default)
+# public_url = "https://tiles.example.com"  # behind a proxy or CDN: the URL clients use
 
 [serve.cache]
 enabled = true
@@ -159,6 +160,7 @@ sslrootcert = "/etc/ssl/certs/provider-ca.pem"
 | `port` | int | 3000 | HTTP server port |
 | `cors_origins` | string[] | `["*"]` | Allowed CORS origins. Omit or empty for wildcard. |
 | `max_age_secs` | int | 300 | `Cache-Control: max-age` for tiles. `0` sends `no-cache` (clients revalidate with the ETag). |
+| `public_url` | string | unset | The address clients reach the server at, e.g. `https://tiles.example.com` behind a proxy or CDN, used for the tile URLs in TileJSON. Unset, they come from the request's `Host` header, with `https` when the proxy sends `X-Forwarded-Proto: https`. |
 | `preview` | bool | true | Serve a [map preview](serving.md#map-preview) of every source at `/`. `false` makes `/` return 404. |
 
 ### `[serve.cache]`
