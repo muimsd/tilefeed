@@ -305,6 +305,7 @@ impl MbtilesStore {
     }
 
     /// Read a metadata value by name
+    #[cfg(test)]
     pub fn get_metadata(&self, name: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn

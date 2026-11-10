@@ -649,6 +649,7 @@ impl SourceConfig {
     }
 
     /// Find the parent layer that owns a derived layer (e.g. "parks" for "parks_labels")
+    #[cfg(test)]
     pub fn find_parent_layer_for_derived(&self, derived_name: &str) -> Option<&LayerConfig> {
         self.layers.iter().find(|l| {
             (l.generate_label_points && format!("{}_labels", l.name) == derived_name)
@@ -657,6 +658,7 @@ impl SourceConfig {
     }
 
     /// Get all effective layer names including derived layers
+    #[cfg(test)]
     pub fn all_layer_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for layer in &self.layers {

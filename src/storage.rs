@@ -206,6 +206,86 @@ struct MapboxUploadResponse {
     id: String,
 }
 
+async fn publish_to_mapbox(source_path: &str, tileset_id: &str, token: &str) -> Result<()> {
+    // The tileset_id format is "username.tileset-name"
+    let username = tileset_id
+        .split('.')
+        .next()
+        .context("mapbox_tileset_id must be in the format 'username.tileset-name'")?;
+
+    let client = reqwest::Client::new();
+
+    // Step 1: Get temporary S3 credentials from Mapbox
+    let creds: MapboxCredentials = client
+        .post(format!(
+            "https://api.mapbox.com/uploads/v1/{}/credentials?access_token={}",
+            username, token
+        ))
+        .send()
+        .await
+        .context("Failed to request Mapbox upload credentials")?
+        .error_for_status()
+        .context("Mapbox credentials request returned an error")?
+        .json()
+        .await
+        .context("Failed to parse Mapbox credentials response")?;
+
+    info!(
+        "Obtained Mapbox staging credentials for bucket: {}",
+        creds.bucket
+    );
+
+    // Step 2: Upload MBTiles to Mapbox's staging S3 bucket using AWS CLI
+    let staging_url = format!("s3://{}/{}", creds.bucket, creds.key);
+    let mut cmd = Command::new("aws");
+    cmd.arg("s3")
+        .arg("cp")
+        .arg(source_path)
+        .arg(&staging_url)
+        .env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
+        .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key)
+        .env("AWS_SESSION_TOKEN", &creds.session_token);
+
+    let output = cmd
+        .output()
+        .await
+        .context("Failed to run aws CLI for Mapbox staging upload. Is aws installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Mapbox staging upload failed: {}", stderr.trim());
+    }
+
+    info!("Uploaded MBTiles to Mapbox staging: {}", staging_url);
+
+    // Step 3: Create the upload on Mapbox
+    let upload_resp: MapboxUploadResponse = client
+        .post(format!(
+            "https://api.mapbox.com/uploads/v1/{}?access_token={}",
+            username, token
+        ))
+        .json(&serde_json::json!({
+            "url": creds.url,
+            "tileset": tileset_id,
+            "name": tileset_id,
+        }))
+        .send()
+        .await
+        .context("Failed to create Mapbox upload")?
+        .error_for_status()
+        .context("Mapbox upload creation returned an error")?
+        .json()
+        .await
+        .context("Failed to parse Mapbox upload response")?;
+
+    info!(
+        "Created Mapbox upload (id: {}) for tileset {}",
+        upload_resp.id, tileset_id
+    );
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,84 +431,4 @@ mod tests {
             _ => panic!("Expected S3 variant"),
         }
     }
-}
-
-async fn publish_to_mapbox(source_path: &str, tileset_id: &str, token: &str) -> Result<()> {
-    // The tileset_id format is "username.tileset-name"
-    let username = tileset_id
-        .split('.')
-        .next()
-        .context("mapbox_tileset_id must be in the format 'username.tileset-name'")?;
-
-    let client = reqwest::Client::new();
-
-    // Step 1: Get temporary S3 credentials from Mapbox
-    let creds: MapboxCredentials = client
-        .post(format!(
-            "https://api.mapbox.com/uploads/v1/{}/credentials?access_token={}",
-            username, token
-        ))
-        .send()
-        .await
-        .context("Failed to request Mapbox upload credentials")?
-        .error_for_status()
-        .context("Mapbox credentials request returned an error")?
-        .json()
-        .await
-        .context("Failed to parse Mapbox credentials response")?;
-
-    info!(
-        "Obtained Mapbox staging credentials for bucket: {}",
-        creds.bucket
-    );
-
-    // Step 2: Upload MBTiles to Mapbox's staging S3 bucket using AWS CLI
-    let staging_url = format!("s3://{}/{}", creds.bucket, creds.key);
-    let mut cmd = Command::new("aws");
-    cmd.arg("s3")
-        .arg("cp")
-        .arg(source_path)
-        .arg(&staging_url)
-        .env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
-        .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key)
-        .env("AWS_SESSION_TOKEN", &creds.session_token);
-
-    let output = cmd
-        .output()
-        .await
-        .context("Failed to run aws CLI for Mapbox staging upload. Is aws installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Mapbox staging upload failed: {}", stderr.trim());
-    }
-
-    info!("Uploaded MBTiles to Mapbox staging: {}", staging_url);
-
-    // Step 3: Create the upload on Mapbox
-    let upload_resp: MapboxUploadResponse = client
-        .post(format!(
-            "https://api.mapbox.com/uploads/v1/{}?access_token={}",
-            username, token
-        ))
-        .json(&serde_json::json!({
-            "url": creds.url,
-            "tileset": tileset_id,
-            "name": tileset_id,
-        }))
-        .send()
-        .await
-        .context("Failed to create Mapbox upload")?
-        .error_for_status()
-        .context("Mapbox upload creation returned an error")?
-        .json()
-        .await
-        .context("Failed to parse Mapbox upload response")?;
-
-    info!(
-        "Created Mapbox upload (id: {}) for tileset {}",
-        upload_resp.id, tileset_id
-    );
-
-    Ok(())
 }

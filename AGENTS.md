@@ -37,7 +37,7 @@ CI runs these exact commands; a plain `cargo clippy` is weaker than the first on
 and will let warnings through that fail the build:
 
 ```bash
-cargo clippy -- -D warnings -A dead_code   # what CI runs — warnings are errors
+cargo clippy --all-targets -- -D warnings  # what CI runs — warnings (dead code too) are errors
 cargo fmt -- --check
 cargo test
 ```
@@ -85,7 +85,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 ### Key modules
 
 - **`main.rs`** — CLI (clap), wires up all components, graceful shutdown (SIGTERM/Ctrl+C)
-- **`postgis.rs`** — PostGIS reader using `deadpool-postgres` connection pool. Exports GeoJSON, queries features by bounds or ID. Supports filter expressions, multiple geometry columns, connection retry, and layer validation.
+- **`postgis.rs`** — PostGIS reader using `deadpool-postgres` connection pool. Exports GeoJSON, queries features by bounds or ID. Supports filter expressions, multiple geometry columns, and layer validation.
 - **`pgtls.rs`** — rustls connector for PostgreSQL (`sslmode`/`sslrootcert`, libpq semantics). Shared by the pool and the LISTEN connection; both are built from `DatabaseConfig::pg_config()`, never from a connection string. tokio-postgres calls `make_tls_connect` for every connection (hostname `""` for Unix sockets, even with TLS disabled), so the connector must never fail on construction — `PgTls` substitutes a placeholder name and `pg_config()` disables TLS for socket hosts.
 - **`mbtiles.rs`** — SQLite MBTiles store with WAL mode. Auto-materializes Tippecanoe's `tiles` view into a writable table on open. Includes inspect/diff query methods.
 - **`mvt.rs`** — Native MVT/protobuf encoder with geometry simplification (Douglas-Peucker via `geo` crate) and per-zoom property filtering. Uses `prost` with generated code from `vector_tile.proto`.
