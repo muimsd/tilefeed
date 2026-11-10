@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-10
+
 ### Changed
 
 - **The webhook + SSE demo** (`cargo run --example webhook_sse_demo`) now runs tilefeed's own event bus and viewport filter, so its `/events` matches `tilefeed serve`: `bbox`/`zoom`/`source`, event ids, `since` replay, `ready` and `resync`. It simulates edits in three cities, sends CORS headers so `map.html` opened from disk can connect, and answers tile requests with empty tiles instead of 404s.
@@ -123,7 +125,8 @@ Initial release.
 - CI with tests on all platforms, clippy, formatting checks, and release builds
 - Local-parks example with end-to-end walkthrough
 
-[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/muimsd/tilefeed/releases/tag/v0.11.1
 [0.11.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.11.0
 [0.10.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.10.0
 [0.9.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.9.0
