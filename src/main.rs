@@ -364,6 +364,11 @@ async fn watch_updates(
     publisher: Option<Arc<storage::StoragePublisher>>,
     event_tx: events::EventSender,
 ) -> Result<()> {
+    if !config.updates.listen_enabled() {
+        anyhow::bail!(
+            "[updates] listen = false leaves `watch` nothing to do; use `serve`, or remove the setting"
+        );
+    }
     let stores = open_stores(&config)?;
 
     info!(
@@ -430,15 +435,20 @@ async fn serve_and_watch(
         ))
     });
 
-    let mut listener_task = tokio::spawn(start_listener(
-        config.clone(),
-        stores.clone(),
-        updater::UpdateOutputs {
-            publisher: publisher.clone(),
-            event_tx: Some(event_tx.clone()),
-            cache: tile_cache.clone(),
-        },
-    ));
+    let mut listener_task = if config.updates.listen_enabled() {
+        tokio::spawn(start_listener(
+            config.clone(),
+            stores.clone(),
+            updater::UpdateOutputs {
+                publisher: publisher.clone(),
+                event_tx: Some(event_tx.clone()),
+                cache: tile_cache.clone(),
+            },
+        ))
+    } else {
+        info!("[updates] listen = false: serving without watching for changes");
+        tokio::spawn(std::future::pending::<Result<()>>())
+    };
     // Built before spawning: a routing or `[metrics] path` problem must stop
     // startup here, not from inside a background task.
     let server = server::build_server(&config, stores, Some(event_tx), tile_cache)?;
