@@ -3,6 +3,8 @@ use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
 use tracing::info;
 
+use crate::tiles::TileCoord;
+
 /// Build a `file:` URI with `immutable=1` for reading a database on read-only
 /// media. Only the characters SQLite's URI parser treats specially are escaped.
 fn immutable_uri(path: &str) -> String {
@@ -230,6 +232,94 @@ impl MbtilesStore {
         Ok(())
     }
 
+    /// The `bounds` metadata, if present and well-formed.
+    fn metadata_bounds(&self) -> Result<Option<[f64; 4]>> {
+        let Some(meta) = self.get_metadata("bounds")? else {
+            return Ok(None);
+        };
+        let parts: Vec<f64> = meta
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        Ok(match parts[..] {
+            [w, s, e, n] if [w, s, e, n].iter().all(|v| v.is_finite()) && w <= e && s <= n => {
+                Some([w, s, e, n])
+            }
+            _ => None,
+        })
+    }
+
+    /// Grow the `bounds` metadata to cover `boxes` (`[w, s, e, n]`), so it
+    /// keeps up with incremental updates. Never shrinks it: a deleted feature
+    /// leaves the box as it was, as a regeneration would only fix later. A
+    /// store without `bounds` metadata is left without (`bounds()` then reads
+    /// the tiles, which are already current).
+    pub fn widen_bounds(&self, boxes: impl IntoIterator<Item = [f64; 4]>) -> Result<()> {
+        let Some(old) = self.metadata_bounds()? else {
+            return Ok(());
+        };
+        let mut new = old;
+        for [w, s, e, n] in boxes {
+            new = [new[0].min(w), new[1].min(s), new[2].max(e), new[3].max(n)];
+        }
+        if new != old {
+            self.set_metadata(
+                "bounds",
+                &format!("{},{},{},{}", new[0], new[1], new[2], new[3]),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The area the tiles cover, `[west, south, east, north]` in degrees.
+    /// Tippecanoe and native generation record it as `bounds` metadata.
+    /// Without it (files from older versions) the extent of the tiles at the
+    /// deepest stored zoom up to 10 is used: close enough to frame a map, and
+    /// a much smaller scan than the deepest zoom. `None` when empty.
+    pub fn bounds(&self) -> Result<Option<[f64; 4]>> {
+        if let Some(bounds) = self.metadata_bounds()? {
+            return Ok(Some(bounds));
+        }
+        let row: Option<(u8, u32, u32, u32, u32)> = self.conn.query_row(
+            "SELECT zoom_level, MIN(tile_column), MAX(tile_column), MIN(tile_row), MAX(tile_row)
+                 FROM tiles
+                 WHERE zoom_level = COALESCE(
+                     (SELECT MAX(zoom_level) FROM tiles WHERE zoom_level <= 10),
+                     (SELECT MIN(zoom_level) FROM tiles))",
+            [],
+            |r| {
+                let z: Option<u8> = r.get(0)?;
+                Ok(match z {
+                    Some(z) => Some((z, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    None => None,
+                })
+            },
+        )?;
+        let Some((z, x_min, x_max, tms_min, tms_max)) = row else {
+            return Ok(None);
+        };
+        // TMS rows count from the south: the highest row is the northmost.
+        let flip = |tms: u32| (1u32 << z) - 1 - tms;
+        let north_west = TileCoord {
+            z,
+            x: x_min,
+            y: flip(tms_max),
+        }
+        .bounds();
+        let south_east = TileCoord {
+            z,
+            x: x_max,
+            y: flip(tms_min),
+        }
+        .bounds();
+        Ok(Some([
+            north_west.min_lon,
+            south_east.min_lat,
+            south_east.max_lon,
+            north_west.max_lat,
+        ]))
+    }
+
     /// Get a tile's data
     pub fn get_tile(&self, z: u8, x: u32, y: u32) -> Result<Option<Vec<u8>>> {
         // MBTiles uses TMS y-coordinate (flipped)
@@ -305,7 +395,6 @@ impl MbtilesStore {
     }
 
     /// Read a metadata value by name
-    #[cfg(test)]
     pub fn get_metadata(&self, name: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -459,6 +548,70 @@ mod tests {
 
     fn cleanup(path: &str) {
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_bounds_empty_store_is_none() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        assert_eq!(store.bounds().unwrap(), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_bounds_prefers_metadata() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.put_tile(0, 0, 0, b"t").unwrap();
+        store
+            .set_metadata("bounds", "2.25,48.8, 2.45,48.9")
+            .unwrap();
+        assert_eq!(store.bounds().unwrap(), Some([2.25, 48.8, 2.45, 48.9]));
+        // Malformed or inverted metadata falls back to the tiles
+        store.set_metadata("bounds", "5,5,1,1").unwrap();
+        assert_eq!(
+            store.bounds().unwrap(),
+            Some([-180.0, -85.0511287798066, 180.0, 85.0511287798066])
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_widen_bounds_only_grows_existing_metadata() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        // Without metadata there is nothing to widen
+        store.widen_bounds([[0.0, 0.0, 1.0, 1.0]]).unwrap();
+        assert_eq!(store.get_metadata("bounds").unwrap(), None);
+
+        store.set_metadata("bounds", "2,48,3,49").unwrap();
+        store.widen_bounds([[2.5, 48.5, 2.6, 48.6]]).unwrap();
+        assert_eq!(store.bounds().unwrap(), Some([2.0, 48.0, 3.0, 49.0]));
+        store
+            .widen_bounds([[1.5, 48.2, 2.2, 48.3], [2.9, 48.9, 3.5, 49.5]])
+            .unwrap();
+        assert_eq!(store.bounds().unwrap(), Some([1.5, 48.0, 3.5, 49.5]));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_bounds_from_tiles_uses_deepest_zoom_up_to_10() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        // z1 north-west quarter, and at z2 the two tiles x=0..1, y=1 (XYZ)
+        store.put_tile(1, 0, 0, b"t").unwrap();
+        store.put_tile(2, 0, 1, b"t").unwrap();
+        store.put_tile(2, 1, 1, b"t").unwrap();
+        // A deeper zoom past 10 is ignored for the scan
+        store.put_tile(12, 0, 0, b"t").unwrap();
+        let [w, s, e, n] = store.bounds().unwrap().unwrap();
+        assert_eq!((w, e), (-180.0, 0.0));
+        let row1 = TileCoord { z: 2, x: 0, y: 1 }.bounds();
+        assert!(
+            (s - row1.min_lat).abs() < 1e-9 && (n - row1.max_lat).abs() < 1e-9,
+            "{s} {n}"
+        );
+        cleanup(&path);
     }
 
     #[test]

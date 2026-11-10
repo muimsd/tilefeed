@@ -42,6 +42,7 @@ host = "0.0.0.0"
 port = 3000
 cors_origins = ["http://localhost:8080"]
 max_age_secs = 300  # Cache-Control max-age for tiles; 0 sends no-cache
+preview = true      # map of every source at / (default)
 
 [serve.cache]
 enabled = true
@@ -157,6 +158,7 @@ sslrootcert = "/etc/ssl/certs/provider-ca.pem"
 | `port` | int | 3000 | HTTP server port |
 | `cors_origins` | string[] | `["*"]` | Allowed CORS origins. Omit or empty for wildcard. |
 | `max_age_secs` | int | 300 | `Cache-Control: max-age` for tiles. `0` sends `no-cache` (clients revalidate with the ETag). |
+| `preview` | bool | true | Serve a [map preview](serving.md#map-preview) of every source at `/`. `false` makes `/` return 404. |
 
 ### `[serve.cache]`
 

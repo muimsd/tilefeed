@@ -11,6 +11,16 @@ tilefeed serve
 tilefeed -c myconfig.toml serve
 ```
 
+### Map preview
+
+Open `http://localhost:3000/` (the server's address) for a map of your sources:
+
+- **Every layer, styled by geometry type:** fills and outlines for polygons, lines, and points, one colour per layer. Toggle layers in the panel; click a feature to see its properties.
+- **Framed on the data:** the map opens on the source's `bounds` from TileJSON. The position is kept in the URL, so reloading or sharing the link keeps the view, and `?source=name` picks the source.
+- **Live:** it subscribes to `/events` for the current view, so editing a row in PostGIS redraws the map within the debounce window, and the panel lists the updates that arrived.
+
+It loads MapLibre GL JS from unpkg.com and has no basemap, so nothing else leaves the browser. Set `preview = false` under `[serve]` to turn it off (`/` then returns 404).
+
 ### Serving without rebuilding
 
 By default `serve` runs a full generation before it serves anything, so a restart
@@ -56,6 +66,7 @@ flag rather than changing its command.
 
 | Endpoint | Description |
 |----------|-------------|
+| `GET /` | [Map preview](#map-preview) of every source, with live updates |
 | `GET /{source}/{z}/{x}/{y}.pbf` | Serve a vector tile (MVT protobuf) |
 | `GET /{source}.json` | TileJSON 3.0.0 metadata |
 | `GET /events` | Server-Sent Events stream for live tile updates; optional `bbox`, `zoom`, `source` and `since` ([details](#only-the-changes-in-view)) |
@@ -68,7 +79,7 @@ flag rather than changing its command.
 - **CORS** — Configurable origins or wildcard (default)
 - **Tile cache** — tiles are kept in memory with their ETag, so repeat requests skip SQLite entirely. Tiles are cleared from the cache as soon as an update rewrites them (see [Tile cache](#tile-cache))
 - **Cache-Control** — `public, max-age=300` on tile responses by default; set `max_age_secs` (`0` sends `no-cache`)
-- **TileJSON 3.0.0** — Auto-generated from source config, includes derived layers (`_labels`, `_boundary`)
+- **TileJSON 3.0.0** — Auto-generated from source config, includes derived layers (`_labels`, `_boundary`), and `bounds`/`center` once the source has tiles. Bounds come from the MBTiles `bounds` metadata (written by Tippecanoe and native generation, and widened by incremental updates); for older files without it, from the stored tiles
 - **Content-Encoding** — `gzip` is advertised only when the stored tile bytes are actually gzipped
 - **[Prometheus metrics](metrics.md)** — Request counts, bytes served, and read latency per source
 

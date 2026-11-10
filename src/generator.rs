@@ -405,6 +405,15 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
         );
         return Ok(());
     };
+    // The MBTiles `bounds` metadata, as Tippecanoe writes it. TileJSON (and
+    // the map preview) read it to know where the data is.
+    store.set_metadata(
+        "bounds",
+        &format!(
+            "{},{},{},{}",
+            extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat
+        ),
+    )?;
     // A small margin so features touching the extent edge still reach the
     // neighbouring tile whose border they touch, as a full scan would.
     let extent = expand_bounds(&extent, EXTENT_MARGIN_DEG);

@@ -41,6 +41,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY with debounced batching
 - [TLS to PostgreSQL](docs/configuration.md#database) (`sslmode`, `sslrootcert`) for managed databases such as Supabase, Neon, RDS and Cloud SQL
 - Built-in HTTP tile server with ETag caching, CORS, configurable `Cache-Control`, and [TileJSON 3.0.0](docs/serving.md)
+- [Map preview](docs/serving.md#map-preview) at `/`: every source on a MapLibre map, framed on the data, with feature popups and live updates as rows change
 - [In-memory tile cache](docs/serving.md#tile-cache) for `serve`, cleared tile by tile as updates land, and per source when another process writes the MBTiles
 - [Derived geometry layers](docs/derived-layers.md): auto-generated label points (point on surface, centroid, or your own point column) and boundary lines from polygons
 - Native generator that only visits tiles inside the data's extent, descending the quadtree below non-empty tiles
@@ -229,7 +230,7 @@ See [full configuration reference](docs/configuration.md) for all options.
 ### 3. Run
 
 ```bash
-# Full rebuild + serve + watch
+# Full rebuild + serve + watch, then open http://localhost:3000/ for the map preview
 tilefeed serve
 
 # Or step by step:

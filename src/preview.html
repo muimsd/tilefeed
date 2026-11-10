@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tilefeed preview</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085;
+    --border: #e3e6eb; --map: #eef1f4; --ok: #12a150; --warn: #d97706; --off: #98a2b3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1a1e26; --text: #e6e9ef; --muted: #98a2b3;
+      --border: #2a303b; --map: #161a21; --ok: #34d399; --warn: #fbbf24; --off: #667085;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #map { position: absolute; inset: 0; background: var(--map); }
+  .panel { position: absolute; top: 12px; left: 12px; width: 280px; max-height: calc(100% - 24px);
+    overflow: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 4px 16px rgb(0 0 0 / 0.12); padding: 12px 14px; z-index: 1; }
+  h1 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    margin: 14px 0 6px; font-weight: 600; }
+  select { width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font: inherit; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500;
+    color: var(--muted); margin-left: auto; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--off); }
+  .live.ok .dot { background: var(--ok); } .live.warn .dot { background: var(--warn); }
+  label.layer { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer;
+    overflow-wrap: anywhere; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .zoomrange { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  #events { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+  #events li { padding: 4px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+  #events li:first-child { border-top: 0; }
+  #events time { color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); font-size: 12px; }
+  .error { color: #d92d20; }
+  .maplibregl-popup-content { background: var(--panel); color: var(--text); max-width: 320px;
+    max-height: 260px; overflow: auto; }
+  .maplibregl-popup-tip { display: none; }
+  .maplibregl-popup-close-button { color: var(--muted); font-size: 16px; padding: 0 6px; }
+  .maplibregl-popup-close-button:hover { color: var(--text); background: transparent; }
+  .popup h3 { font-size: 12px; margin: 0 0 6px; }
+  .popup table { border-collapse: collapse; font-size: 12px; }
+  .popup td { padding: 2px 8px 2px 0; vertical-align: top; overflow-wrap: anywhere; }
+  .popup td:first-child { color: var(--muted); white-space: nowrap; }
+  @media (max-width: 600px) {
+    .panel { top: auto; bottom: 12px; left: 12px; right: 12px; width: auto; max-height: 45%; }
+    .maplibregl-ctrl-scale { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<aside class="panel">
+  <h1>tilefeed <span class="live" id="live"><span class="dot"></span><span id="live-text">connecting</span></span></h1>
+  <select id="source" aria-label="Source"></select>
+  <div class="meta" id="meta"></div>
+  <h2>Layers</h2>
+  <div id="layers"><div class="empty">Loading…</div></div>
+  <h2>Updates in view</h2>
+  <ul id="events"><li class="empty">None yet. Edit a feature in this view to see it arrive.</li></ul>
+</aside>
+<script>
+'use strict';
+const SOURCES = __TILEFEED_SOURCES__;
+const PALETTE = ['#2563eb', '#dc2626', '#16a34a', '#9333ea', '#ea580c', '#0891b2', '#db2777', '#65a30d'];
+const $ = (id) => document.getElementById(id);
+
+function fail(message) {
+  $('layers').innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'error';
+  div.textContent = message;
+  $('layers').appendChild(div);
+}
+
+if (typeof maplibregl === 'undefined') {
+  fail('MapLibre GL JS could not be loaded from unpkg.com. The preview needs internet access for it.');
+  throw new Error('maplibregl missing');
+}
+if (SOURCES.length === 0) {
+  fail('No sources are configured.');
+  throw new Error('no sources');
+}
+
+const params = new URLSearchParams(location.search);
+let current = SOURCES.find((s) => s.name === params.get('source')) || SOURCES[0];
+for (const s of SOURCES) {
+  const opt = document.createElement('option');
+  opt.value = s.name;
+  opt.textContent = s.name;
+  $('source').appendChild(opt);
+}
+$('source').value = current.name;
+
+// Read before the map exists: with `hash: true` it writes its own position
+// into the URL at once. A position given in the URL (a reload, a shared
+// link) wins over framing the data.
+const startedWithPosition = /^#\d/.test(location.hash);
+const map = new maplibregl.Map({
+  container: 'map',
+  style: { version: 8, sources: {}, layers: [
+    { id: 'background', type: 'background', paint: { 'background-color': getComputedStyle(document.documentElement).getPropertyValue('--map').trim() || '#eef1f4' } },
+  ] },
+  center: [0, 20],
+  zoom: 1,
+  hash: true,
+  attributionControl: false,
+});
+map.addControl(new maplibregl.NavigationControl(), 'top-right');
+map.addControl(new maplibregl.ScaleControl(), 'bottom-right');
+
+let layerIds = [];
+
+function tilesUrl(name, bust) {
+  return `${location.origin}/${encodeURIComponent(name)}/{z}/{x}/{y}.pbf${bust ? `?_t=${Date.now()}` : ''}`;
+}
+
+const isPolygon = ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false];
+const isLine = ['match', ['geometry-type'], ['LineString', 'MultiLineString'], true, false];
+const isPoint = ['match', ['geometry-type'], ['Point', 'MultiPoint'], true, false];
+
+async function showSource(source, fit) {
+  for (const id of layerIds) map.removeLayer(id);
+  layerIds = [];
+  if (map.getSource('tf')) map.removeSource('tf');
+  $('layers').innerHTML = '<div class="empty">Loading…</div>';
+
+  let tilejson;
+  try {
+    const res = await fetch(`${location.origin}/${encodeURIComponent(source.name)}.json`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    tilejson = await res.json();
+  } catch (e) {
+    fail(`Could not load ${source.name}.json: ${e.message}`);
+    return;
+  }
+
+  map.addSource('tf', {
+    type: 'vector',
+    tiles: [tilesUrl(source.name, false)],
+    minzoom: tilejson.minzoom,
+    maxzoom: tilejson.maxzoom,
+  });
+
+  const layers = tilejson.vector_layers || [];
+  $('layers').innerHTML = '';
+  if (layers.length === 0) $('layers').innerHTML = '<div class="empty">No layers.</div>';
+  layers.forEach((vl, i) => {
+    const color = PALETTE[i % PALETTE.length];
+    const ids = [`${vl.id}::fill`, `${vl.id}::line`, `${vl.id}::circle`];
+    const common = { source: 'tf', 'source-layer': vl.id };
+    map.addLayer({ ...common, id: ids[0], type: 'fill', filter: isPolygon,
+      paint: { 'fill-color': color, 'fill-opacity': 0.25 } });
+    map.addLayer({ ...common, id: ids[1], type: 'line', filter: ['any', isPolygon, isLine],
+      paint: { 'line-color': color, 'line-width': 1.5 } });
+    map.addLayer({ ...common, id: ids[2], type: 'circle', filter: isPoint,
+      paint: { 'circle-color': color, 'circle-radius': 4, 'circle-stroke-width': 1, 'circle-stroke-color': '#fff' } });
+    layerIds.push(...ids);
+
+    const row = document.createElement('label');
+    row.className = 'layer';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = true;
+    box.addEventListener('change', () => {
+      for (const id of ids) map.setLayoutProperty(id, 'visibility', box.checked ? 'visible' : 'none');
+    });
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = color;
+    const name = document.createElement('span');
+    name.textContent = vl.id;
+    const zooms = document.createElement('span');
+    zooms.className = 'zoomrange';
+    zooms.textContent = `z${vl.minzoom}–${vl.maxzoom}`;
+    row.append(box, swatch, name, zooms);
+    $('layers').appendChild(row);
+  });
+
+  $('meta').textContent = `z${tilejson.minzoom}–${tilejson.maxzoom}` +
+    (tilejson.bounds ? '' : ' · no data yet');
+  if (fit && tilejson.bounds) {
+    const [w, s, e, n] = tilejson.bounds;
+    map.fitBounds([[w, s], [e, n]], { padding: framePadding(), maxZoom: tilejson.maxzoom, animate: false });
+  }
+}
+
+// Keep the data clear of the panel: beside it on wide screens, above it on phones.
+function framePadding() {
+  const panel = document.querySelector('.panel').getBoundingClientRect();
+  const pad = { top: 40, right: 40, bottom: 40, left: 40 };
+  if (window.innerWidth > 600) pad.left += panel.right;
+  else pad.bottom += window.innerHeight - panel.top;
+  return pad;
+}
+
+let popup = null;
+
+function refreshTiles() {
+  // An open popup shows the old properties; close it rather than mislead.
+  if (popup) popup.remove();
+  const src = map.getSource('tf');
+  if (src) src.setTiles([tilesUrl(current.name, true)]);
+}
+
+// ── Click a feature to see its properties ──────────────────────
+map.on('click', (e) => {
+  const features = map.queryRenderedFeatures(e.point, { layers: layerIds });
+  if (features.length === 0) return;
+  const f = features[0];
+  const root = document.createElement('div');
+  root.className = 'popup';
+  const title = document.createElement('h3');
+  title.textContent = f.sourceLayer + (f.id !== undefined ? ` #${f.id}` : '');
+  const table = document.createElement('table');
+  for (const [k, v] of Object.entries(f.properties)) {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = k;
+    tr.insertCell().textContent = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  }
+  root.append(title, table);
+  if (popup) popup.remove();
+  popup = new maplibregl.Popup({ maxWidth: '320px' }).setLngLat(e.lngLat).setDOMContent(root).addTo(map);
+});
+map.on('mousemove', (e) => {
+  const hit = layerIds.length && map.queryRenderedFeatures(e.point, { layers: layerIds }).length;
+  map.getCanvas().style.cursor = hit ? 'pointer' : '';
+});
+
+// ── Live updates: only the ones that change this view ──────────
+function setLive(state, text) {
+  $('live').className = `live ${state}`;
+  $('live-text').textContent = text;
+}
+
+function logEvent(text) {
+  const list = $('events');
+  if (list.firstElementChild && list.firstElementChild.classList.contains('empty')) list.innerHTML = '';
+  const li = document.createElement('li');
+  const time = document.createElement('time');
+  time.textContent = new Date().toLocaleTimeString();
+  li.append(time, document.createTextNode(` ${text}`));
+  list.prepend(li);
+  while (list.children.length > 8) list.lastElementChild.remove();
+}
+
+let es = null;
+let lastEventId = null;
+let retryTimer = null;
+
+function eventsUrl() {
+  const b = map.getBounds();
+  const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].map((v) => v.toFixed(5)).join(',');
+  const since = lastEventId ? `&since=${lastEventId}` : '';
+  return `${location.origin}/events?bbox=${bbox}&zoom=${map.getZoom().toFixed(2)}` +
+    `&source=${encodeURIComponent(current.name)}${since}`;
+}
+
+function connect() {
+  clearTimeout(retryTimer);
+  if (es) es.close();
+  const mine = es = new EventSource(eventsUrl());
+  es.onopen = () => setLive('ok', 'live');
+  es.addEventListener('ready', (e) => { lastEventId = e.lastEventId; });
+  es.addEventListener('resync', () => {
+    lastEventId = null;
+    logEvent('Missed updates, reloaded all tiles');
+    refreshTiles();
+  });
+  es.addEventListener('update_complete', (e) => {
+    lastEventId = e.lastEventId;
+    const d = JSON.parse(e.data);
+    logEvent(`${d.layers_affected.join(', ')}: ${d.tiles_updated} tiles`);
+    refreshTiles();
+  });
+  es.addEventListener('generate_complete', (e) => {
+    lastEventId = e.lastEventId;
+    logEvent('Regenerated');
+    refreshTiles();
+  });
+  es.onerror = () => {
+    if (mine !== es) return; // replaced by a newer viewport
+    setLive('warn', 'reconnecting');
+    es.close();
+    retryTimer = setTimeout(connect, 3000);
+  };
+}
+
+let moveTimer = null;
+map.on('moveend', () => {
+  clearTimeout(moveTimer);
+  moveTimer = setTimeout(connect, 300);
+});
+
+$('source').addEventListener('change', async () => {
+  current = SOURCES.find((s) => s.name === $('source').value);
+  const url = new URL(location.href);
+  url.searchParams.set('source', current.name);
+  history.replaceState(null, '', url);
+  lastEventId = null;
+  $('events').innerHTML = '<li class="empty">None yet.</li>';
+  await showSource(current, true);
+  connect();
+});
+
+map.on('load', async () => {
+  await showSource(current, !startedWithPosition);
+  connect();
+});
+</script>
+</body>
+</html>

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Map preview at `/`.** `tilefeed serve` now serves a MapLibre map of every source: layers styled by geometry type with toggles, feature properties on click, framed on the data, the position kept in the URL, and live updates for the current view over `/events`. Turn it off with `[serve] preview = false`. See [docs/serving.md](docs/serving.md#map-preview).
+- **TileJSON `bounds` and `center`.** Native generation now writes the MBTiles `bounds` metadata (Tippecanoe already did), incremental updates widen it to cover changed features, and TileJSON reports it. MBTiles files without the metadata get bounds from their stored tiles.
+
 ## [0.11.1] - 2026-11-10
 
 ### Changed

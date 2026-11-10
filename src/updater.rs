@@ -374,6 +374,8 @@ async fn update_source(
                 Some(tile_data) => store.put_tile(coord.z, coord.x, coord.y, tile_data)?,
             }
         }
+        // Keep `bounds` covering the data, for TileJSON and the map preview
+        store.widen_bounds(areas.iter().map(|a| a.bbox))?;
         Ok(())
     })();
 
