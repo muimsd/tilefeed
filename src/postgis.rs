@@ -127,11 +127,12 @@ impl PostgisReader {
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
         let props_sql = properties_sql(layer, schema);
+        let geom_4326 = layer.col_4326(geom_col);
 
         let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
-                ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
+                ST_AsGeoJSON({geom_4326})::json as geometry,
                 {props_sql} as properties
             FROM "{schema}"."{table}"
             WHERE "{geom_col}" IS NOT NULL"#,
@@ -197,19 +198,21 @@ impl PostgisReader {
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
         let props_sql = properties_sql(layer, schema);
+        let geom_4326 = layer.col_4326(geom_col);
 
         // Affected tiles must cover the label point too, which a
         // label_point_column may place outside the geometry.
         let bounds_geom = match layer.active_label_column() {
             Some(label_col) => format!(
-                r#"ST_Envelope(ST_Collect(ST_Transform("{geom_col}", 4326), ST_Transform(COALESCE("{label_col}", "{geom_col}"), 4326)))"#
+                "ST_Envelope(ST_Collect({geom_4326}, {}))",
+                layer.to_4326(&format!(r#"COALESCE("{label_col}", "{geom_col}")"#))
             ),
-            None => format!(r#"ST_Transform(ST_Envelope("{geom_col}"), 4326)"#),
+            None => format!("ST_Envelope({geom_4326})"),
         };
         let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
-                ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
+                ST_AsGeoJSON({geom_4326})::json as geometry,
                 {props_sql} as properties,
                 ST_XMin({bounds_geom}) as xmin,
                 ST_YMin({bounds_geom}) as ymin,
@@ -266,9 +269,11 @@ impl PostgisReader {
         // extent, so it widens the extent too.
         let extent_geom = match layer.active_label_column() {
             Some(label_col) => format!(
-                r#"ST_Collect(ST_Transform("{geom_col}", 4326), ST_Transform(COALESCE("{label_col}", "{geom_col}"), 4326))"#
+                "ST_Collect({}, {})",
+                layer.col_4326(geom_col),
+                layer.to_4326(&format!(r#"COALESCE("{label_col}", "{geom_col}")"#))
             ),
-            None => format!(r#"ST_Transform("{geom_col}", 4326)"#),
+            None => layer.col_4326(geom_col),
         };
         let mut inner = format!(
             r#"SELECT ST_Extent({extent_geom}) AS e
@@ -316,7 +321,8 @@ impl PostgisReader {
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
         let hits = |col: &str| {
             format!(
-                r#"("{col}" IS NOT NULL AND ST_Intersects(ST_Transform("{col}", 4326), ST_MakeEnvelope($1, $2, $3, $4, 4326)))"#
+                r#"("{col}" IS NOT NULL AND ST_Intersects({}, ST_MakeEnvelope($1, $2, $3, $4, 4326)))"#,
+                layer.col_4326(col)
             )
         };
         let mut predicate = hits(geom_col);
@@ -357,16 +363,17 @@ impl PostgisReader {
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
         let props_sql = properties_sql(layer, schema);
+        let geom_4326 = layer.col_4326(geom_col);
 
         let mut query = format!(
             r#"SELECT
                 "{id_col}" as feature_id,
-                ST_AsGeoJSON(ST_Transform("{geom_col}", 4326))::json as geometry,
+                ST_AsGeoJSON({geom_4326})::json as geometry,
                 {props_sql} as properties
             FROM "{schema}"."{table}"
             WHERE "{geom_col}" IS NOT NULL
               AND ST_Intersects(
-                  ST_Transform("{geom_col}", 4326),
+                  {geom_4326},
                   ST_MakeEnvelope($1, $2, $3, $4, 4326)
               )"#,
             table = layer.table,
@@ -425,11 +432,12 @@ impl PostgisReader {
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
         let props_sql = properties_sql(layer, schema);
+        let geom_4326 = layer.col_4326(geom_col);
 
         let geom_transform = match derived_type {
             DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
             DerivedGeomType::BoundaryLine => {
-                format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
+                format!("ST_Boundary({geom_4326})")
             }
         };
         let src_col = layer.derived_source_column(derived_type, geom_col);
@@ -511,14 +519,16 @@ impl PostgisReader {
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
         let props_sql = properties_sql(layer, schema);
+        let geom_4326 = layer.col_4326(geom_col);
 
         let geom_transform = match derived_type {
             DerivedGeomType::LabelPoint => layer.label_point_sql(geom_col),
             DerivedGeomType::BoundaryLine => {
-                format!("ST_Boundary(ST_Transform(\"{geom_col}\", 4326))")
+                format!("ST_Boundary({geom_4326})")
             }
         };
         let src_col = layer.derived_source_column(derived_type, geom_col);
+        let src_4326 = layer.col_4326(src_col);
 
         let mut query = format!(
             r#"SELECT
@@ -528,7 +538,7 @@ impl PostgisReader {
             FROM "{schema}"."{table}"
             WHERE "{src_col}" IS NOT NULL
               AND ST_Intersects(
-                  ST_Transform("{src_col}", 4326),
+                  {src_4326},
                   ST_MakeEnvelope($1, $2, $3, $4, 4326)
               )"#,
             table = layer.table,
@@ -640,6 +650,22 @@ impl PostgisReader {
                     "Geometry column \"{}\" does not exist in \"{}\".\"{}\"",
                     geom_col, schema, layer.table
                 ));
+                continue;
+            }
+            // Geometries without an SRID can't be transformed to 4326
+            // unless the layer says what they are.
+            if layer.srid.is_none() {
+                let sql = format!(
+                    r#"SELECT EXISTS(SELECT 1 FROM "{schema}"."{table}" WHERE "{geom_col}" IS NOT NULL AND ST_SRID("{geom_col}") = 0)"#,
+                    table = layer.table,
+                );
+                let unknown_srid: bool = client.query_one(&sql, &[]).await?.get(0);
+                if unknown_srid {
+                    issues.push(format!(
+                        "Geometry column \"{}\" in \"{}\".\"{}\" has geometries without an SRID (0): set `srid` on the layer to the SRID they are in",
+                        geom_col, schema, layer.table
+                    ));
+                }
             }
         }
 

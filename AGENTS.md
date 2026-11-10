@@ -117,6 +117,7 @@ The config defines one or more `[[sources]]`, each producing an independent MBTi
 - **Native generation walks the quadtree, never the world**: `generate_with_native` starts from the data extent (`get_layer_extent`, union over layers) at `min_zoom` and only expands children of non-empty tiles. Any new per-tile query must keep "child non-empty ⇒ parent non-empty" true (same predicate at every zoom), or pruning will drop tiles. A layer with a deeper `min_zoom` isn't encoded above it, so there it is probed with `layer_has_features_in_bounds` (an `EXISTS`) to decide expansion — never seed a whole extent at a deeper zoom, that is the world scan again.
 - **Tile cache invalidation follows every MBTiles write**: any new code path that writes tiles while `serve` runs must call `TileCache::invalidate` (exact tiles) or `clear_source` *after* committing, through the shared store connection (a separate connection is treated as an outside writer and clears the whole source). A cache miss returns the generation via `TileCache::lookup` before the store read, so a read that straddles the commit can't re-cache the old tile.
 - **Update events say where they changed**: emit `UpdateComplete` with `.with_areas(...)` (bbox + the layer's zoom range per changed geometry, old and new). Without areas the viewport filter has to send the event to every client. Areas may only ever be widened when merged or compacted — narrowing one makes a client miss a visible change.
+- **Geometry reaches EPSG:4326 only through `LayerConfig::to_4326` / `col_4326`**: never write `ST_Transform(col, 4326)` directly. It applies the layer's `srid` to geometries stored with SRID 0 (only to those: a stored SRID always wins), which a bare `ST_Transform` rejects.
 - **Server tests build the production router**: `build_router()` is what both `start_server` and the tests use. Tests must never declare their own route patterns — a test harness that did exactly that hid a startup panic through two releases.
 
 ### Config (`config.toml`)
@@ -132,4 +133,4 @@ Webhook settings live under `[webhook]` (`urls`, `secret`, `cooldown_secs`, `tim
 
 ### Database setup
 
-`sql/setup_notify.sql` installs a PostgreSQL trigger function (`notify_tile_update`) that sends JSON payloads on INSERT/UPDATE/DELETE. Each table needs its own trigger with the layer name as argument.
+`sql/setup_notify.sql` installs a PostgreSQL trigger function (`notify_tile_update`) that sends JSON payloads on INSERT/UPDATE/DELETE. Each table needs its own trigger with the layer name as argument, plus the layer's `srid` as an optional second argument when its geometries have SRID 0 (without it an SRID-0 row notifies without `old_bounds`; the write still succeeds).

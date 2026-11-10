@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The webhook + SSE demo** (`cargo run --example webhook_sse_demo`) now runs tilefeed's own event bus and viewport filter, so its `/events` matches `tilefeed serve`: `bbox`/`zoom`/`source`, event ids, `since` replay, `ready` and `resync`. It simulates edits in three cities, sends CORS headers so `map.html` opened from disk can connect, and answers tile requests with empty tiles instead of 404s.
 
+### Fixed
+
+- **`srid` was ignored.** Layers whose geometries have no SRID (0) failed everywhere with `ST_Transform: Input geometry has unknown (0) SRID`, and so did every UPDATE or DELETE on their table, because the notify trigger hit the same error. `srid` now sets the SRID of geometries stored without one; geometries with an SRID are still transformed from their own, so an `srid = 4326` copied from the examples changes nothing for them. The trigger takes the SRID as an optional second argument (`notify_tile_update('layer', '3857')`); without it, an SRID-0 row's write succeeds and the notification just carries no old bounds. Re-run `sql/setup_notify.sql` to update the function. `tilefeed validate` reports SRID-0 geometries on a layer without `srid`.
+
 ## [0.11.0] - 2026-11-06
 
 ### Added
