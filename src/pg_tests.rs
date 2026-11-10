@@ -324,6 +324,17 @@ filter = "area > 2"
     };
 
     db.generate().await;
+    // The filtered extent is recorded as MBTiles `bounds`, as Tippecanoe does.
+    let [w, s, e, n] = db.store(0).bounds().unwrap().expect("bounds metadata");
+    let expect = [
+        PARIS.0 - 0.002,
+        PARIS.1 - 0.002,
+        PARIS.0 + 0.002,
+        PARIS.1 + 0.002,
+    ];
+    for (got, want) in [w, s, e, n].iter().zip(expect) {
+        assert!((got - want).abs() < 1e-9, "bounds {:?}", [w, s, e, n]);
+    }
     let layers = layers_at(&db.store(0), PARIS.0, PARIS.1, 12);
     let features = &layers["it_nl_parks"];
     assert_eq!(features.len(), 1, "{features:?}");
@@ -554,6 +565,13 @@ table = "parks"
     };
     assert!(covers(PARIS) && covers(TOKYO), "areas {areas:?}");
     let store = db.store(0);
+    // `bounds` grew from Paris to cover Tokyo as well
+    let [w, s, e, n] = store.bounds().unwrap().unwrap();
+    assert!(
+        w <= PARIS.0 && e >= TOKYO.0 && s <= TOKYO.1 && n >= PARIS.1,
+        "bounds {:?}",
+        [w, s, e, n]
+    );
     for z in 10..=12 {
         let tokyo = layers_at(&store, TOKYO.0, TOKYO.1, z);
         assert_eq!(tokyo["it_w_parks"][0]["name"], "Yoyogi", "z{z}");

@@ -125,6 +125,7 @@ fn build_router(config: &AppConfig, state: AppState) -> Result<Router> {
     let app = Router::new()
         .route("/{source}/{z}/{x}/{y_pbf}", get(serve_tile))
         .route("/{source_json}", get(serve_tilejson))
+        .route("/", get(serve_preview))
         .route("/health", get(health_check))
         .route("/events", get(sse_handler))
         .layer(cors);
@@ -437,7 +438,7 @@ async fn serve_tilejson(
         }
     }
 
-    let tilejson = serde_json::json!({
+    let mut tilejson = serde_json::json!({
         "tilejson": "3.0.0",
         "name": source_config.name,
         "tiles": [format!("http://{}:{}/{}/{{z}}/{{x}}/{{y}}.pbf", host, port, source_config.name)],
@@ -445,6 +446,19 @@ async fn serve_tilejson(
         "maxzoom": source_config.max_zoom,
         "vector_layers": layers,
     });
+    // Where the data is, so a client (the preview at `/`) can frame it.
+    let bounds = match state.stores.get(&source) {
+        Some(store) => store.lock().await.bounds().unwrap_or_else(|e| {
+            warn!("Cannot read bounds of source '{}': {:#}", source, e);
+            None
+        }),
+        None => None,
+    };
+    if let Some([w, s, e, n]) = bounds {
+        tilejson["bounds"] = serde_json::json!([w, s, e, n]);
+        tilejson["center"] =
+            serde_json::json!([(w + e) / 2.0, (s + n) / 2.0, source_config.min_zoom]);
+    }
 
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -452,6 +466,37 @@ async fn serve_tilejson(
     )
         .into_response()
 }
+
+/// The map preview: every source on a MapLibre map, refreshed live over
+/// SSE. The page is static except for the source list spliced in here.
+async fn serve_preview(State(state): State<AppState>) -> Response {
+    if !state.config.serve.preview_enabled() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+    let sources: Vec<serde_json::Value> = state
+        .config
+        .sources
+        .iter()
+        .map(
+            |s| serde_json::json!({ "name": s.name, "minzoom": s.min_zoom, "maxzoom": s.max_zoom }),
+        )
+        .collect();
+    // Inside a <script>, "</" could close the tag early; JSON allows "<\/".
+    let sources = serde_json::to_string(&sources)
+        .unwrap_or_else(|_| "[]".to_string())
+        .replace("</", "<\\/");
+    let page = PREVIEW_HTML.replace("__TILEFEED_SOURCES__", &sources);
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        page,
+    )
+        .into_response()
+}
+
+const PREVIEW_HTML: &str = include_str!("preview.html");
 
 async fn health_check() -> &'static str {
     "ok"
@@ -1617,6 +1662,91 @@ mod tests {
             assert_eq!(layer["minzoom"], 10, "{}", layer["id"]);
             assert_eq!(layer["maxzoom"], 12, "{}", layer["id"]);
         }
+    }
+
+    async fn body_string(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_reports_bounds_and_center_of_the_store() {
+        let config = make_test_config();
+        let (path, store) = make_test_store();
+        store.set_metadata("bounds", "2.25,48.8,2.45,48.9").unwrap();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+        let app = make_app(config, stores);
+
+        let response = send_request(app, get("/test_source.json")).await;
+        let json: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(json["bounds"], serde_json::json!([2.25, 48.8, 2.45, 48.9]));
+        let center = json["center"].as_array().unwrap();
+        assert!((center[0].as_f64().unwrap() - 2.35).abs() < 1e-9);
+        assert!((center[1].as_f64().unwrap() - 48.85).abs() < 1e-9);
+        assert_eq!(center[2], 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_tilejson_without_tiles_has_no_bounds() {
+        let app = make_app(make_test_config(), HashMap::new());
+        let response = send_request(app, get("/test_source.json")).await;
+        let json: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(json.get("bounds").is_none());
+        assert!(json.get("center").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_preview_page_lists_the_sources() {
+        let app = make_app(make_test_config(), HashMap::new());
+        let response = send_request(app, get("/")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let page = body_string(response).await;
+        let line = page
+            .lines()
+            .find(|l| l.contains("const SOURCES = "))
+            .expect("source list missing");
+        let json = line
+            .trim()
+            .trim_start_matches("const SOURCES = ")
+            .trim_end_matches(';');
+        let sources: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            sources,
+            serde_json::json!([{"name": "test_source", "minzoom": 0, "maxzoom": 14}])
+        );
+        assert!(!page.contains("__TILEFEED_SOURCES__"));
+        assert!(page.contains("maplibre-gl@4.7.1"));
+    }
+
+    #[tokio::test]
+    async fn test_preview_escapes_a_source_name_that_closes_the_script() {
+        let mut config = make_test_config();
+        config.sources[0].name = "x</script><script>alert(1)//".to_string();
+        let app = make_app(config, HashMap::new());
+        let page = body_string(send_request(app, get("/")).await).await;
+        assert!(!page.contains("x</script>"), "unescaped source name");
+        assert!(page.contains(r#"x<\/script>"#));
+    }
+
+    #[tokio::test]
+    async fn test_preview_can_be_turned_off() {
+        let mut config = make_test_config();
+        config.serve.preview = Some(false);
+        let app = make_app(config, HashMap::new());
+        let response = send_request(app, get("/")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

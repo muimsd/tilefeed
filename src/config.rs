@@ -372,6 +372,8 @@ pub struct ServeConfig {
     /// In-memory tile cache (`[serve.cache]`).
     #[serde(default)]
     pub cache: TileCacheConfig,
+    /// Serve a map of every source at `/` (default: true).
+    pub preview: Option<bool>,
 }
 
 impl Default for ServeConfig {
@@ -382,6 +384,7 @@ impl Default for ServeConfig {
             cors_origins: None,
             max_age_secs: None,
             cache: TileCacheConfig::default(),
+            preview: None,
         }
     }
 }
@@ -425,6 +428,10 @@ impl ServeConfig {
 
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(3000)
+    }
+
+    pub fn preview_enabled(&self) -> bool {
+        self.preview.unwrap_or(true)
     }
 
     pub fn cache_control(&self) -> String {
