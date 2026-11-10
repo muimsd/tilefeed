@@ -300,6 +300,9 @@ impl LayerConfig {
 pub struct UpdateConfig {
     pub debounce_ms: Option<u64>,
     pub worker_concurrency: Option<usize>,
+    /// `false`: don't LISTEN for notifications. `serve` then only serves
+    /// what's in the MBTiles; something else rebuilds it on a schedule.
+    pub listen: Option<bool>,
 }
 
 impl Default for UpdateConfig {
@@ -307,7 +310,14 @@ impl Default for UpdateConfig {
         Self {
             debounce_ms: Some(200),
             worker_concurrency: Some(8),
+            listen: None,
         }
+    }
+}
+
+impl UpdateConfig {
+    pub fn listen_enabled(&self) -> bool {
+        self.listen.unwrap_or(true)
     }
 }
 
@@ -1377,6 +1387,16 @@ mod tests {
             .and_then(|cfg| cfg.validate().map(|_| cfg));
         let _ = std::fs::remove_dir_all(&dir);
         result
+    }
+
+    #[test]
+    fn updates_listen_defaults_on_and_can_be_turned_off() {
+        let base = config_with_layer_zooms("");
+        let cfg = parse_config(&base).unwrap();
+        assert!(cfg.updates.listen_enabled());
+        let off = format!("[updates]\nlisten = false\n{base}");
+        let cfg = parse_config(&off).unwrap();
+        assert!(!cfg.updates.listen_enabled());
     }
 
     fn config_with_layer_zooms(layer_zooms: &str) -> String {

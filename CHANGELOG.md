@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[updates] listen = false`** turns off LISTEN/NOTIFY: `serve` serves the MBTiles as they are, for sources rebuilt on a schedule instead. `watch` refuses to start with it.
+
 ## [0.12.0] - 2026-11-10
 
 ### Added

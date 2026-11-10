@@ -149,6 +149,7 @@ sslrootcert = "/etc/ssl/certs/provider-ca.pem"
 |-------|------|---------|-------------|
 | `debounce_ms` | int | 200 | Debounce window for batching notifications |
 | `worker_concurrency` | int | 8 | Max concurrent tile regeneration workers |
+| `listen` | bool | true | `false`: don't LISTEN for notifications. `serve` serves the MBTiles as they are and something else (a scheduled `generate`) keeps them fresh. `watch` refuses to start. |
 
 ### `[serve]`
 
