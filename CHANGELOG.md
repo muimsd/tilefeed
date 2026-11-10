@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-10
+
 ### Added
 
 - **Map preview at `/`.** `tilefeed serve` now serves a MapLibre map of every source: layers styled by geometry type with toggles, feature properties on click, framed on the data, the position kept in the URL, and live updates for the current view over `/events`. Turn it off with `[serve] preview = false`. See [docs/serving.md](docs/serving.md#map-preview).
 - **TileJSON `bounds` and `center`.** Native generation now writes the MBTiles `bounds` metadata (Tippecanoe already did), incremental updates widen it to cover changed features, and TileJSON reports it. MBTiles files without the metadata get bounds from their stored tiles.
+
+### Changed
+
+- **Big update batches are much faster.** An update used to look up each changed row with its own query before finding the tiles to redraw, so one statement that touched 300 rows meant 300 round trips (about 20 s against a database in another region). It now fetches the bounds of all of a layer's changed rows in one query.
 
 ## [0.11.1] - 2026-11-10
 
@@ -130,7 +136,8 @@ Initial release.
 - CI with tests on all platforms, clippy, formatting checks, and release builds
 - Local-parks example with end-to-end walkthrough
 
-[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.12.0
 [0.11.1]: https://github.com/muimsd/tilefeed/releases/tag/v0.11.1
 [0.11.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.11.0
 [0.10.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.10.0
