@@ -245,7 +245,6 @@ impl PostgisReader {
                     geometry,
                     properties,
                     bounds,
-                    layer_name: layer.name.clone(),
                 }))
             }
             None => Ok(None),
@@ -410,7 +409,6 @@ impl PostgisReader {
                 geometry,
                 properties,
                 bounds: bounds.clone(),
-                layer_name: layer.name.clone(),
             });
         }
 
@@ -560,11 +558,6 @@ impl PostgisReader {
             )
             .await?;
 
-        let derived_layer_name = match derived_type {
-            DerivedGeomType::LabelPoint => format!("{}_labels", layer.name),
-            DerivedGeomType::BoundaryLine => format!("{}_boundary", layer.name),
-        };
-
         let mut features = Vec::with_capacity(rows.len());
         for row in &rows {
             let feature_id: i64 = row
@@ -580,37 +573,10 @@ impl PostgisReader {
                 geometry,
                 properties,
                 bounds: bounds.clone(),
-                layer_name: derived_layer_name.clone(),
             });
         }
 
         Ok(features)
-    }
-
-    /// Connect with retry and exponential backoff
-    pub async fn connect_with_retry(config: &DatabaseConfig, max_retries: u32) -> Result<Self> {
-        let mut attempt = 0;
-        loop {
-            match Self::connect(config).await {
-                Ok(reader) => return Ok(reader),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= max_retries {
-                        return Err(
-                            e.context(format!("Failed to connect after {} attempts", max_retries))
-                        );
-                    }
-                    let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(5)));
-                    tracing::warn!(
-                        "PostGIS connection attempt {} failed: {}. Retrying in {:?}...",
-                        attempt,
-                        e,
-                        delay
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
     }
 
     /// Check if a layer's table and columns exist in the database
@@ -737,7 +703,6 @@ pub struct FeatureData {
     pub geometry: JsonValue,
     pub properties: JsonValue,
     pub bounds: Bounds,
-    pub layer_name: String,
 }
 
 #[cfg(test)]

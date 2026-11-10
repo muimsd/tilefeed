@@ -216,6 +216,284 @@ fn parse_notification(payload: &str) -> Result<UpdateEvent> {
     })
 }
 
+/// Handle a batch of update events: group by source, deduplicate affected tiles, regenerate
+async fn handle_batch_update(
+    config: &AppConfig,
+    reader: &PostgisReader,
+    stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
+    outputs: &UpdateOutputs,
+    events: &[UpdateEvent],
+) -> Result<()> {
+    // Group events by source name
+    let mut events_by_source: HashMap<String, Vec<&UpdateEvent>> = HashMap::new();
+
+    for event in events {
+        match config.find_source_for_layer(&event.layer_name) {
+            Some(source) => {
+                metrics().notifications.with(&["routed"]).inc();
+                events_by_source
+                    .entry(source.name.clone())
+                    .or_default()
+                    .push(event);
+            }
+            None => {
+                metrics().notifications.with(&["unknown_layer"]).inc();
+                warn!("Unknown layer '{}', not in any source", event.layer_name);
+            }
+        }
+    }
+
+    // Process each affected source independently
+    for (source_name, source_events) in &events_by_source {
+        let source = config
+            .sources
+            .iter()
+            .find(|s| &s.name == source_name)
+            .unwrap();
+
+        let store = match stores.get(source_name) {
+            Some(s) => s,
+            None => {
+                error!("No MBTiles store for source '{}'", source_name);
+                continue;
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let result = update_source(config, reader, source, store, outputs, source_events).await;
+
+        metrics()
+            .update_duration
+            .with(&[source_name])
+            .observe_since(started);
+        metrics().update_batches.with(&[source_name]).inc();
+        if result.is_err() {
+            metrics().update_errors.with(&[source_name]).inc();
+        }
+        result?;
+    }
+
+    Ok(())
+}
+
+/// Update a single source's MBTiles with affected tiles
+async fn update_source(
+    config: &AppConfig,
+    reader: &PostgisReader,
+    source: &crate::config::SourceConfig,
+    mbtiles: &Arc<Mutex<MbtilesStore>>,
+    outputs: &UpdateOutputs,
+    events: &[&UpdateEvent],
+) -> Result<()> {
+    let publisher = outputs.publisher.as_ref();
+    let event_tx = outputs.event_tx.as_ref();
+    let cache = outputs.cache.as_ref();
+    let mut all_affected: Vec<TileCoord> = Vec::new();
+    let mut areas: Vec<crate::events::ChangedArea> = Vec::new();
+
+    for event in events {
+        let layer = match source.find_layer(&event.layer_name) {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
+        let mut record = |bounds: &Bounds| {
+            all_affected.extend(affected_tiles(source, layer, bounds));
+            areas.push(crate::events::ChangedArea::new(bounds, min_zoom, max_zoom));
+        };
+
+        if let Some(feat) = reader.get_feature(layer, event.feature_id).await? {
+            record(&feat.bounds);
+        }
+
+        if let Some(ref old_bounds) = event.old_bounds {
+            record(old_bounds);
+        }
+    }
+
+    // Deduplicate
+    all_affected.sort_by_key(|t| (t.z, t.x, t.y));
+    all_affected.dedup();
+
+    if all_affected.is_empty() {
+        info!("No affected tiles for source '{}'", source.name);
+        return Ok(());
+    }
+
+    info!(
+        "Regenerating {} unique tiles for source '{}'",
+        all_affected.len(),
+        source.name
+    );
+
+    // Regenerate tiles concurrently (bounded concurrency)
+    let worker_count = config.updates.worker_concurrency.unwrap_or(8).max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_count));
+    let mut handles = Vec::new();
+
+    for tile_coord in all_affected.clone() {
+        let sem = semaphore.clone();
+        let src = source.clone();
+        let rdr = reader.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            regenerate_single_tile(&src, &rdr, &tile_coord).await
+        });
+        handles.push((tile_coord, handle));
+    }
+
+    // Collect results and write to MBTiles
+    let mut encoded: Vec<(TileCoord, Option<Vec<u8>>)> = Vec::new();
+    for (coord, handle) in handles {
+        match handle.await {
+            Ok(Ok(data)) => encoded.push((coord, data)),
+            Ok(Err(e)) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Failed to regenerate tile {:?}: {}", coord, e);
+            }
+            Err(e) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Task panicked for tile {:?}: {}", coord, e);
+            }
+        }
+    }
+
+    let written = encoded.iter().filter(|(_, d)| d.is_some()).count();
+    let deleted = encoded.len() - written;
+
+    // Write to MBTiles under lock (no .await while holding)
+    let store = mbtiles.lock().await;
+    store.begin_transaction()?;
+
+    let write_result: Result<()> = (|| {
+        for (coord, data) in &encoded {
+            match data {
+                None => store.delete_tile(coord.z, coord.x, coord.y)?,
+                Some(tile_data) => store.put_tile(coord.z, coord.x, coord.y, tile_data)?,
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = store.rollback_transaction();
+        return Err(e);
+    }
+
+    store.commit_transaction()?;
+    drop(store);
+
+    // Clear the old versions of exactly these tiles from the server's cache.
+    // After the commit, so a request that misses reads the new tile; the
+    // cache's generation check drops any read that started before it.
+    if let Some(cache) = cache {
+        let cleared = cache.invalidate(&source.name, encoded.iter().map(|(c, _)| (c.z, c.x, c.y)));
+        if cleared > 0 {
+            info!(
+                "Cleared {} cached tile(s) for source '{}'",
+                cleared, source.name
+            );
+        }
+    }
+
+    metrics()
+        .tiles_written
+        .with(&[&source.name])
+        .add(written as u64);
+    metrics()
+        .tiles_deleted
+        .with(&[&source.name])
+        .add(deleted as u64);
+
+    if let Some(publisher) = publisher {
+        if config.publish.publish_on_update_enabled() {
+            publisher
+                .publish_mbtiles(&source.mbtiles_path, "incremental-update")
+                .await?;
+        }
+    }
+
+    info!(
+        "Batch update complete for source '{}' ({} tiles)",
+        source.name,
+        all_affected.len()
+    );
+
+    // Emit event for webhooks and SSE
+    if let Some(event_tx) = event_tx {
+        let zooms: std::collections::HashSet<u8> = all_affected.iter().map(|t| t.z).collect();
+        let layers: Vec<String> = events
+            .iter()
+            .map(|e| e.layer_name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let _ = event_tx.send(
+            crate::events::TileEvent::update_complete(
+                source.name.clone(),
+                all_affected.len(),
+                &zooms,
+                source.max_zoom,
+                layers,
+            )
+            .with_areas(areas),
+        );
+    }
+
+    Ok(())
+}
+
+/// Tiles a change to `layer` within `bounds` can alter: only those at the zooms
+/// the layer (and its derived layers) is encoded at.
+fn affected_tiles(
+    source: &crate::config::SourceConfig,
+    layer: &crate::config::LayerConfig,
+    bounds: &Bounds,
+) -> Vec<TileCoord> {
+    let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
+    tiles_for_bounds(bounds, min_zoom, max_zoom)
+}
+
+async fn regenerate_single_tile(
+    source: &crate::config::SourceConfig,
+    reader: &PostgisReader,
+    tile_coord: &TileCoord,
+) -> Result<Option<Vec<u8>>> {
+    let bounds = tile_coord.bounds();
+    let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
+    let mut layer_configs: HashMap<String, &crate::config::LayerConfig> = HashMap::new();
+
+    // Only layers whose zoom range covers this tile; the rest stay out of it.
+    for tl in source.tile_layers_at_zoom(tile_coord.z) {
+        let features = match tl.derived {
+            None => {
+                layer_configs.insert(tl.layer.name.clone(), tl.layer);
+                reader.get_features_in_bounds(tl.layer, &bounds).await?
+            }
+            Some(derived) => {
+                reader
+                    .get_derived_features_in_bounds(tl.layer, derived, &bounds)
+                    .await?
+            }
+        };
+        if !features.is_empty() {
+            features_by_layer.insert(tl.name, features);
+        }
+    }
+
+    if features_by_layer.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(mvt::encode_tile_with_config(
+            tile_coord,
+            &features_by_layer,
+            &layer_configs,
+        )?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,292 +711,5 @@ mod tests {
                 "{payload}"
             );
         }
-    }
-}
-
-/// Handle a batch of update events: group by source, deduplicate affected tiles, regenerate
-async fn handle_batch_update(
-    config: &AppConfig,
-    reader: &PostgisReader,
-    stores: &HashMap<String, Arc<Mutex<MbtilesStore>>>,
-    outputs: &UpdateOutputs,
-    events: &[UpdateEvent],
-) -> Result<()> {
-    // Group events by source name
-    let mut events_by_source: HashMap<String, Vec<&UpdateEvent>> = HashMap::new();
-
-    for event in events {
-        match config.find_source_for_layer(&event.layer_name) {
-            Some(source) => {
-                metrics().notifications.with(&["routed"]).inc();
-                events_by_source
-                    .entry(source.name.clone())
-                    .or_default()
-                    .push(event);
-            }
-            None => {
-                metrics().notifications.with(&["unknown_layer"]).inc();
-                warn!("Unknown layer '{}', not in any source", event.layer_name);
-            }
-        }
-    }
-
-    // Process each affected source independently
-    for (source_name, source_events) in &events_by_source {
-        let source = config
-            .sources
-            .iter()
-            .find(|s| &s.name == source_name)
-            .unwrap();
-
-        let store = match stores.get(source_name) {
-            Some(s) => s,
-            None => {
-                error!("No MBTiles store for source '{}'", source_name);
-                continue;
-            }
-        };
-
-        let started = std::time::Instant::now();
-        let result = update_source(config, reader, source, store, outputs, source_events).await;
-
-        metrics()
-            .update_duration
-            .with(&[source_name])
-            .observe_since(started);
-        metrics().update_batches.with(&[source_name]).inc();
-        if result.is_err() {
-            metrics().update_errors.with(&[source_name]).inc();
-        }
-        result?;
-    }
-
-    Ok(())
-}
-
-/// Update a single source's MBTiles with affected tiles
-async fn update_source(
-    config: &AppConfig,
-    reader: &PostgisReader,
-    source: &crate::config::SourceConfig,
-    mbtiles: &Arc<Mutex<MbtilesStore>>,
-    outputs: &UpdateOutputs,
-    events: &[&UpdateEvent],
-) -> Result<()> {
-    let publisher = outputs.publisher.as_ref();
-    let event_tx = outputs.event_tx.as_ref();
-    let cache = outputs.cache.as_ref();
-    let mut all_affected: Vec<TileCoord> = Vec::new();
-    let mut areas: Vec<crate::events::ChangedArea> = Vec::new();
-
-    for event in events {
-        let layer = match source.find_layer(&event.layer_name) {
-            Some(l) => l,
-            None => continue,
-        };
-
-        let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
-        let mut record = |bounds: &Bounds| {
-            all_affected.extend(affected_tiles(source, layer, bounds));
-            areas.push(crate::events::ChangedArea {
-                bbox: [
-                    bounds.min_lon,
-                    bounds.min_lat,
-                    bounds.max_lon,
-                    bounds.max_lat,
-                ],
-                min_zoom,
-                max_zoom,
-            });
-        };
-
-        if let Some(feat) = reader.get_feature(layer, event.feature_id).await? {
-            record(&feat.bounds);
-        }
-
-        if let Some(ref old_bounds) = event.old_bounds {
-            record(old_bounds);
-        }
-    }
-
-    // Deduplicate
-    all_affected.sort_by_key(|t| (t.z, t.x, t.y));
-    all_affected.dedup();
-
-    if all_affected.is_empty() {
-        info!("No affected tiles for source '{}'", source.name);
-        return Ok(());
-    }
-
-    info!(
-        "Regenerating {} unique tiles for source '{}'",
-        all_affected.len(),
-        source.name
-    );
-
-    // Regenerate tiles concurrently (bounded concurrency)
-    let worker_count = config.updates.worker_concurrency.unwrap_or(8).max(1);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_count));
-    let mut handles = Vec::new();
-
-    for tile_coord in all_affected.clone() {
-        let sem = semaphore.clone();
-        let src = source.clone();
-        let rdr = reader.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            regenerate_single_tile(&src, &rdr, &tile_coord).await
-        });
-        handles.push((tile_coord, handle));
-    }
-
-    // Collect results and write to MBTiles
-    let mut encoded: Vec<(TileCoord, Option<Vec<u8>>)> = Vec::new();
-    for (coord, handle) in handles {
-        match handle.await {
-            Ok(Ok(data)) => encoded.push((coord, data)),
-            Ok(Err(e)) => {
-                metrics().tile_encode_errors.with(&[&source.name]).inc();
-                error!("Failed to regenerate tile {:?}: {}", coord, e);
-            }
-            Err(e) => {
-                metrics().tile_encode_errors.with(&[&source.name]).inc();
-                error!("Task panicked for tile {:?}: {}", coord, e);
-            }
-        }
-    }
-
-    let written = encoded.iter().filter(|(_, d)| d.is_some()).count();
-    let deleted = encoded.len() - written;
-
-    // Write to MBTiles under lock (no .await while holding)
-    let store = mbtiles.lock().await;
-    store.begin_transaction()?;
-
-    let write_result: Result<()> = (|| {
-        for (coord, data) in &encoded {
-            match data {
-                None => store.delete_tile(coord.z, coord.x, coord.y)?,
-                Some(tile_data) => store.put_tile(coord.z, coord.x, coord.y, tile_data)?,
-            }
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = store.rollback_transaction();
-        return Err(e);
-    }
-
-    store.commit_transaction()?;
-    drop(store);
-
-    // Clear the old versions of exactly these tiles from the server's cache.
-    // After the commit, so a request that misses reads the new tile; the
-    // cache's generation check drops any read that started before it.
-    if let Some(cache) = cache {
-        let cleared = cache.invalidate(&source.name, encoded.iter().map(|(c, _)| (c.z, c.x, c.y)));
-        if cleared > 0 {
-            info!(
-                "Cleared {} cached tile(s) for source '{}'",
-                cleared, source.name
-            );
-        }
-    }
-
-    metrics()
-        .tiles_written
-        .with(&[&source.name])
-        .add(written as u64);
-    metrics()
-        .tiles_deleted
-        .with(&[&source.name])
-        .add(deleted as u64);
-
-    if let Some(publisher) = publisher {
-        if config.publish.publish_on_update_enabled() {
-            publisher
-                .publish_mbtiles(&source.mbtiles_path, "incremental-update")
-                .await?;
-        }
-    }
-
-    info!(
-        "Batch update complete for source '{}' ({} tiles)",
-        source.name,
-        all_affected.len()
-    );
-
-    // Emit event for webhooks and SSE
-    if let Some(event_tx) = event_tx {
-        let zooms: std::collections::HashSet<u8> = all_affected.iter().map(|t| t.z).collect();
-        let layers: Vec<String> = events
-            .iter()
-            .map(|e| e.layer_name.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let _ = event_tx.send(
-            crate::events::TileEvent::update_complete(
-                source.name.clone(),
-                all_affected.len(),
-                &zooms,
-                source.max_zoom,
-                layers,
-            )
-            .with_areas(areas),
-        );
-    }
-
-    Ok(())
-}
-
-/// Tiles a change to `layer` within `bounds` can alter: only those at the zooms
-/// the layer (and its derived layers) is encoded at.
-fn affected_tiles(
-    source: &crate::config::SourceConfig,
-    layer: &crate::config::LayerConfig,
-    bounds: &Bounds,
-) -> Vec<TileCoord> {
-    let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
-    tiles_for_bounds(bounds, min_zoom, max_zoom)
-}
-
-async fn regenerate_single_tile(
-    source: &crate::config::SourceConfig,
-    reader: &PostgisReader,
-    tile_coord: &TileCoord,
-) -> Result<Option<Vec<u8>>> {
-    let bounds = tile_coord.bounds();
-    let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
-    let mut layer_configs: HashMap<String, &crate::config::LayerConfig> = HashMap::new();
-
-    // Only layers whose zoom range covers this tile; the rest stay out of it.
-    for tl in source.tile_layers_at_zoom(tile_coord.z) {
-        let features = match tl.derived {
-            None => {
-                layer_configs.insert(tl.layer.name.clone(), tl.layer);
-                reader.get_features_in_bounds(tl.layer, &bounds).await?
-            }
-            Some(derived) => {
-                reader
-                    .get_derived_features_in_bounds(tl.layer, derived, &bounds)
-                    .await?
-            }
-        };
-        if !features.is_empty() {
-            features_by_layer.insert(tl.name, features);
-        }
-    }
-
-    if features_by_layer.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(mvt::encode_tile_with_config(
-            tile_coord,
-            &features_by_layer,
-            &layer_configs,
-        )?))
     }
 }

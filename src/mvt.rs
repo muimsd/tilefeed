@@ -29,6 +29,7 @@ pub fn is_gzipped(data: &[u8]) -> bool {
 }
 
 /// Encode a set of features into a gzipped MVT tile
+#[cfg(test)]
 pub fn encode_tile(
     tile_coord: &TileCoord,
     features_by_layer: &HashMap<String, Vec<FeatureData>>,
@@ -637,7 +638,6 @@ mod tests {
                 max_lon: 180.0,
                 max_lat: 85.0,
             },
-            layer_name: "test_layer".to_string(),
         };
 
         let mut features_by_layer = HashMap::new();
@@ -681,7 +681,6 @@ mod tests {
                 max_lon: 1.0,
                 max_lat: 52.0,
             },
-            layer_name: "cities".to_string(),
         };
 
         let mut features_by_layer = HashMap::new();
@@ -788,7 +787,6 @@ mod tests {
                 max_lon: 1.0,
                 max_lat: 1.0,
             },
-            layer_name: "layer".to_string(),
         };
 
         let cfg = LayerConfig {
@@ -842,7 +840,6 @@ mod tests {
                 max_lon: 180.0,
                 max_lat: 85.0,
             },
-            layer_name: "test".to_string(),
         }
     }
 
@@ -966,7 +963,6 @@ mod tests {
                 max_lon: 1.0,
                 max_lat: 1.0,
             },
-            layer_name: "layer_a".to_string(),
         };
         let feature_b = FeatureData {
             id: 2,
@@ -978,7 +974,6 @@ mod tests {
                 max_lon: 2.0,
                 max_lat: 2.0,
             },
-            layer_name: "layer_b".to_string(),
         };
 
         let mut features_by_layer = HashMap::new();

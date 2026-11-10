@@ -461,6 +461,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         Ok(Self { inner, header, len })
     }
 
+    #[cfg(test)]
     pub fn header(&self) -> &Header {
         &self.header
     }
