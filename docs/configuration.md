@@ -211,7 +211,7 @@ See [Metrics](metrics.md) for the full metric reference.
 | `table` | string | yes | Source table name |
 | `geometry_column` | string | no | Geometry column (default: `"geom"`) |
 | `id_column` | string | no | Feature ID column |
-| `srid` | int | no | SRID (default: 4326) |
+| `srid` | int | no | SRID of geometries stored without one (SRID 0, as `shp2pgsql` without `-s` or an OGR_FDW source with no recognized projection leaves them). Geometries with an SRID are always transformed from their own, whatever this says. Pass the same value as the trigger's second argument (see `sql/setup_notify.sql`). `tilefeed validate` reports SRID-0 geometries on a layer without it |
 | `properties` | string[] | no | Properties to include in tiles. Omit it to include every column except geometry and geography columns |
 | `filter` | string | no | SQL WHERE clause to filter features |
 | `simplify_tolerance` | float | no | Douglas-Peucker tolerance in degrees (scaled per zoom) |

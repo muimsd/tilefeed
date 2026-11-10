@@ -136,16 +136,33 @@ impl LayerConfig {
 
     pub fn label_point_sql(&self, geom_col: &str) -> String {
         if let Some(col) = &self.label_point_column {
-            return format!("ST_Transform(\"{col}\", 4326)");
+            return self.col_4326(col);
         }
+        let geom = self.col_4326(geom_col);
         match self.label_point_method {
-            LabelPointMethod::PointOnSurface => {
-                format!("ST_PointOnSurface(ST_Transform(\"{geom_col}\", 4326))")
-            }
-            LabelPointMethod::Centroid => {
-                format!("ST_Centroid(ST_Transform(\"{geom_col}\", 4326))")
-            }
+            LabelPointMethod::PointOnSurface => format!("ST_PointOnSurface({geom})"),
+            LabelPointMethod::Centroid => format!("ST_Centroid({geom})"),
         }
+    }
+
+    /// The geometry expression `expr` in EPSG:4326. Geometries stored with
+    /// an SRID are transformed from it; ones stored without (SRID 0, as
+    /// OGR_FDW and `shp2pgsql` without `-s` leave them) are read as `srid`
+    /// when the layer sets one. Without `srid` PostGIS rejects those
+    /// ("unknown (0) SRID"). `srid` never overrides a stored SRID, so a
+    /// copied `srid = 4326` can't misread a table in another projection.
+    pub fn to_4326(&self, expr: &str) -> String {
+        match self.srid {
+            Some(srid) => format!(
+                "ST_Transform(CASE WHEN ST_SRID({expr}) = 0 THEN ST_SetSRID({expr}, {srid}) ELSE {expr} END, 4326)"
+            ),
+            None => format!("ST_Transform({expr}, 4326)"),
+        }
+    }
+
+    /// `to_4326` of the column `col`.
+    pub fn col_4326(&self, col: &str) -> String {
+        self.to_4326(&format!("\"{col}\""))
     }
 }
 
@@ -1022,6 +1039,25 @@ mod tests {
             l.label_point_sql("geom"),
             "ST_PointOnSurface(ST_Transform(\"geom\", 4326))"
         );
+    }
+
+    #[test]
+    fn test_to_4326_without_srid_transforms_the_stored_srid() {
+        let layer = parse_layer("");
+        assert_eq!(layer.col_4326("geom"), r#"ST_Transform("geom", 4326)"#);
+    }
+
+    #[test]
+    fn test_to_4326_with_srid_only_assigns_it_to_srid_zero() {
+        let layer = parse_layer("srid = 3857");
+        assert_eq!(
+            layer.col_4326("geom"),
+            r#"ST_Transform(CASE WHEN ST_SRID("geom") = 0 THEN ST_SetSRID("geom", 3857) ELSE "geom" END, 4326)"#
+        );
+        // Label points go through the same conversion
+        assert!(layer
+            .label_point_sql("geom")
+            .contains("ST_SetSRID(\"geom\", 3857)"));
     }
 
     #[test]

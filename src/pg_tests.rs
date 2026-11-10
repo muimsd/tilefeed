@@ -442,11 +442,49 @@ properties = ["name"]
     assert_eq!(keys(&layers["it_tc_listed"]), BTreeSet::from(["name"]));
 }
 
-/// The `areas` of the next update to `source`. Other tests' notifications
-/// reach every listener too, but name layers it doesn't know.
-async fn next_update(
-    rx: &mut tokio::sync::broadcast::Receiver<crate::events::Sequenced>,
+type EventRx = tokio::sync::broadcast::Receiver<crate::events::Sequenced>;
+
+/// Run the production listener on the test config's first source.
+async fn start_watch(db: &TestDb) -> (EventRx, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let mut stores = HashMap::new();
+    stores.insert(
+        db.config.sources[0].name.clone(),
+        Arc::new(Mutex::new(db.store(0))),
+    );
+    let bus = create_event_bus();
+    let rx = bus.subscribe();
+    let listener = tokio::spawn(start_listener(
+        Arc::new(db.config.clone()),
+        stores,
+        UpdateOutputs {
+            event_tx: Some(bus),
+            ..Default::default()
+        },
+    ));
+    (rx, listener)
+}
+
+/// LISTEN is set up asynchronously: repeat `touch` (a write that fires the
+/// trigger) until the listener is there to see it.
+async fn first_update(
+    db: &TestDb,
+    rx: &mut EventRx,
+    touch: &str,
 ) -> Vec<crate::events::ChangedArea> {
+    let source = db.config.sources[0].name.clone();
+    loop {
+        db.exec(touch).await;
+        if let Ok(areas) =
+            tokio::time::timeout(Duration::from_secs(2), next_update(rx, &source)).await
+        {
+            return areas;
+        }
+    }
+}
+
+/// The `areas` of the next update to `want`. Other tests' notifications
+/// reach every listener too, but name layers it doesn't know.
+async fn next_update(rx: &mut EventRx, want: &str) -> Vec<crate::events::ChangedArea> {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(20), rx.recv())
             .await
@@ -454,7 +492,7 @@ async fn next_update(
             .expect("event bus closed")
             .event;
         if let TileEvent::UpdateComplete { source, areas, .. } = event {
-            if source == "it_watch" {
+            if source == want {
                 return areas;
             }
         }
@@ -493,29 +531,13 @@ table = "parks"
     };
 
     db.generate().await;
-    let mut stores = HashMap::new();
-    stores.insert("it_watch".to_string(), Arc::new(Mutex::new(db.store(0))));
-    let bus = create_event_bus();
-    let mut rx = bus.subscribe();
-    let listener = tokio::spawn(start_listener(
-        Arc::new(db.config.clone()),
-        stores,
-        UpdateOutputs {
-            event_tx: Some(bus.clone()),
-            ..Default::default()
-        },
-    ));
-
-    // LISTEN is set up asynchronously: keep touching the row until the
-    // listener is there to see it.
-    let areas = loop {
-        db.exec("UPDATE parks SET name = 'Luxembourg' WHERE id = 1")
-            .await;
-        match tokio::time::timeout(Duration::from_secs(2), next_update(&mut rx)).await {
-            Ok(areas) => break areas,
-            Err(_) => continue,
-        }
-    };
+    let (mut rx, listener) = start_watch(&db).await;
+    let areas = first_update(
+        &db,
+        &mut rx,
+        "UPDATE parks SET name = 'Luxembourg' WHERE id = 1",
+    )
+    .await;
     assert!(!areas.is_empty());
 
     // Move the park to Tokyo and rename it: both places are redrawn.
@@ -524,7 +546,7 @@ table = "parks"
         square(TOKYO.0, TOKYO.1, 0.002)
     ))
     .await;
-    let areas = next_update(&mut rx).await;
+    let areas = next_update(&mut rx, "it_watch").await;
     let covers = |(lon, lat): (f64, f64)| {
         areas
             .iter()
@@ -547,14 +569,14 @@ table = "parks"
         square(PARIS.0, PARIS.1, 0.001)
     ))
     .await;
-    next_update(&mut rx).await;
+    next_update(&mut rx, "it_watch").await;
     assert_eq!(
         layers_at(&store, PARIS.0, PARIS.1, 12)["it_w_parks"][0]["name"],
         "Tuileries"
     );
 
     db.exec("DELETE FROM parks WHERE id = 1").await;
-    next_update(&mut rx).await;
+    next_update(&mut rx, "it_watch").await;
     let tokyo = layers_at(&store, TOKYO.0, TOKYO.1, 12);
     assert!(
         tokyo.get("it_w_parks").is_none_or(|f| f.is_empty()),
@@ -605,4 +627,134 @@ properties = ["name", "missing"]
     .await;
     let issues = reader.validate_layer(layer).await.unwrap();
     assert_eq!(issues.len(), 1, "{issues:?}");
+}
+
+/// Paris in EPSG:3857 metres, stored with SRID 0 the way OGR_FDW and
+/// `shp2pgsql` without `-s` leave geometries.
+fn srid0_square(lon: f64, lat: f64, d: f64) -> String {
+    format!("ST_SetSRID(ST_Transform({}, 3857), 0)", square(lon, lat, d))
+}
+
+#[tokio::test]
+async fn srid_zero_geometries_are_read_as_the_layer_srid() {
+    let Some(db) = TestDb::new(
+        "it_srid0",
+        &format!(
+            "CREATE TABLE parcels (id serial PRIMARY KEY, name text, geom geometry);
+             INSERT INTO parcels (name, geom) VALUES ('Luxembourg', {});
+             CREATE TRIGGER tile_update_trigger AFTER INSERT OR UPDATE OR DELETE ON parcels
+                FOR EACH ROW EXECUTE FUNCTION public.notify_tile_update('it_s0_parcels', '3857');",
+            srid0_square(PARIS.0, PARIS.1, 0.002)
+        ),
+        r#"
+[[sources]]
+name = "it_srid0"
+mbtiles_path = "{dir}/out.mbtiles"
+min_zoom = 10
+max_zoom = 12
+generation_backend = "native"
+
+[[sources.layers]]
+name = "it_s0_parcels"
+schema = "it_srid0"
+table = "parcels"
+srid = 3857
+generate_label_points = true
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+
+    // The metres were reprojected: the parcel lands in Paris's tiles.
+    db.generate().await;
+    let store = db.store(0);
+    for z in 10..=12 {
+        let layers = layers_at(&store, PARIS.0, PARIS.1, z);
+        assert_eq!(layers["it_s0_parcels"][0]["name"], "Luxembourg", "z{z}");
+        assert_eq!(layers["it_s0_parcels_labels"].len(), 1, "z{z}");
+    }
+
+    // The trigger's second argument gives the old position, so a move
+    // clears the old tiles as well as drawing the new ones.
+    let (mut rx, listener) = start_watch(&db).await;
+    first_update(
+        &db,
+        &mut rx,
+        "UPDATE parcels SET name = 'Luxembourg' WHERE id = 1",
+    )
+    .await;
+    db.exec(&format!(
+        "UPDATE parcels SET name = 'Yoyogi', geom = {} WHERE id = 1",
+        srid0_square(TOKYO.0, TOKYO.1, 0.002)
+    ))
+    .await;
+    next_update(&mut rx, "it_srid0").await;
+    let tokyo = layers_at(&store, TOKYO.0, TOKYO.1, 12);
+    assert_eq!(tokyo["it_s0_parcels"][0]["name"], "Yoyogi");
+    let paris = layers_at(&store, PARIS.0, PARIS.1, 12);
+    assert!(
+        paris.get("it_s0_parcels").is_none_or(|f| f.is_empty()),
+        "parcel left behind in Paris: {paris:?}"
+    );
+    listener.abort();
+
+    // `srid` only applies to geometries without one: a row stored with
+    // EPSG:4326 next to the SRID-0 ones is still read as 4326.
+    db.exec(&format!(
+        "INSERT INTO parcels (name, geom) VALUES ('Tuileries', {})",
+        square(PARIS.0, PARIS.1, 0.001)
+    ))
+    .await;
+    db.generate().await;
+    let paris = layers_at(&db.store(0), PARIS.0, PARIS.1, 12);
+    assert_eq!(paris["it_s0_parcels"][0]["name"], "Tuileries");
+}
+
+#[tokio::test]
+async fn srid_zero_without_layer_srid_is_reported_and_writes_still_succeed() {
+    let Some(db) = TestDb::new(
+        "it_srid0_unset",
+        &format!(
+            "CREATE TABLE parcels (id serial PRIMARY KEY, geom geometry);
+             INSERT INTO parcels (geom) VALUES ({});
+             CREATE TRIGGER tile_update_trigger AFTER INSERT OR UPDATE OR DELETE ON parcels
+                FOR EACH ROW EXECUTE FUNCTION public.notify_tile_update('it_s0u_parcels');",
+            srid0_square(PARIS.0, PARIS.1, 0.002)
+        ),
+        r#"
+[[sources]]
+name = "it_srid0_unset"
+mbtiles_path = "{dir}/out.mbtiles"
+min_zoom = 10
+max_zoom = 12
+generation_backend = "native"
+
+[[sources.layers]]
+name = "it_s0u_parcels"
+schema = "it_srid0_unset"
+table = "parcels"
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let issues = db
+        .reader()
+        .await
+        .validate_layer(&db.config.sources[0].layers[0])
+        .await
+        .unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.contains("without an SRID") && i.contains("`srid`")),
+        "{issues:?}"
+    );
+    // The trigger can't place the old geometry, but must not fail the write.
+    db.exec("UPDATE parcels SET geom = geom WHERE id = 1; DELETE FROM parcels WHERE id = 1")
+        .await;
 }

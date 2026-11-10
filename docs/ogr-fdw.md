@@ -83,6 +83,7 @@ properties = ["owner", "area_sqm", "land_use"]
 
 ## Considerations
 
+- **Geometries without an SRID.** When a source has no recognized projection, the foreign table's geometries may have SRID 0, which PostGIS can't transform. Check with `SELECT DISTINCT ST_SRID(geom) FROM parcels` (or run `tilefeed validate`), and if it's 0, set the layer's `srid` to the projection the coordinates are actually in. On a synced local table, pass the same SRID as the trigger's second argument, `notify_tile_update('parcels', '4326')`, so moved and deleted features clear their old tiles.
 - **Edits to the underlying file don't notify.** Triggers on a foreign table only fire for writes made through PostgreSQL (an `INSERT`/`UPDATE`/`DELETE` on the foreign table, if the FDW server is writable). Changes made to the file or remote database directly are invisible to PostgreSQL, so for those use `tilefeed generate` on a schedule (cron) instead of `tilefeed watch`.
 - **Performance depends on the remote source.** OGR_FDW can push down simple filters, but complex spatial queries may pull entire datasets over the network. For large remote sources, keep a local copy. A materialized view is simplest, but PostgreSQL can't put triggers on one, so it only suits scheduled `generate` runs:
   ```sql
