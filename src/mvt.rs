@@ -632,12 +632,6 @@ mod tests {
                 "coordinates": [0.0, 0.0]
             }),
             properties: json!({"name": "test"}),
-            bounds: crate::postgis::Bounds {
-                min_lon: -180.0,
-                min_lat: -85.0,
-                max_lon: 180.0,
-                max_lat: 85.0,
-            },
         };
 
         let mut features_by_layer = HashMap::new();
@@ -675,12 +669,6 @@ mod tests {
                 "coordinates": [0.0, 51.5]
             }),
             properties: json!({"name": "London", "population": 9000000, "capital": true}),
-            bounds: crate::postgis::Bounds {
-                min_lon: -1.0,
-                min_lat: 51.0,
-                max_lon: 1.0,
-                max_lat: 52.0,
-            },
         };
 
         let mut features_by_layer = HashMap::new();
@@ -781,12 +769,6 @@ mod tests {
             id: 1,
             geometry: json!({"type": "Point", "coordinates": [0.0, 0.0]}),
             properties: json!({"name": "test", "description": "long text", "metadata": "extra"}),
-            bounds: crate::postgis::Bounds {
-                min_lon: -1.0,
-                min_lat: -1.0,
-                max_lon: 1.0,
-                max_lat: 1.0,
-            },
         };
 
         let cfg = LayerConfig {
@@ -834,12 +816,6 @@ mod tests {
             id: 1,
             geometry: geom,
             properties: json!({}),
-            bounds: crate::postgis::Bounds {
-                min_lon: -180.0,
-                min_lat: -85.0,
-                max_lon: 180.0,
-                max_lat: 85.0,
-            },
         }
     }
 
@@ -957,23 +933,11 @@ mod tests {
             id: 1,
             geometry: json!({"type": "Point", "coordinates": [0.0, 0.0]}),
             properties: json!({"name": "a"}),
-            bounds: crate::postgis::Bounds {
-                min_lon: -1.0,
-                min_lat: -1.0,
-                max_lon: 1.0,
-                max_lat: 1.0,
-            },
         };
         let feature_b = FeatureData {
             id: 2,
             geometry: json!({"type": "Point", "coordinates": [1.0, 1.0]}),
             properties: json!({"type": "b"}),
-            bounds: crate::postgis::Bounds {
-                min_lon: 0.0,
-                min_lat: 0.0,
-                max_lon: 2.0,
-                max_lat: 2.0,
-            },
         };
 
         let mut features_by_layer = HashMap::new();

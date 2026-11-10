@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde_json::Value as JsonValue;
@@ -186,18 +188,22 @@ impl PostgisReader {
         Ok(())
     }
 
-    /// Get a single feature's geometry as GeoJSON and its bounding box
-    pub async fn get_feature(
+    /// The current bounds of the given features, in one query: what an update
+    /// needs to find the tiles a change touches. Features that are gone, have
+    /// no geometry or fail the layer's filter are left out.
+    pub async fn get_feature_bounds(
         &self,
         layer: &LayerConfig,
-        feature_id: i64,
-    ) -> Result<Option<FeatureData>> {
+        feature_ids: &[i64],
+    ) -> Result<HashMap<i64, Bounds>> {
+        if feature_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let client = self.pool.get().await?;
         let schema = layer.schema.as_deref().unwrap_or("public");
         let geom_col = layer.geometry_column.as_deref().unwrap_or("geom");
         let id_col = layer.id_column.as_deref().unwrap_or("id");
 
-        let props_sql = properties_sql(layer, schema);
         let geom_4326 = layer.col_4326(geom_col);
 
         // Affected tiles must cover the label point too, which a
@@ -211,15 +217,13 @@ impl PostgisReader {
         };
         let mut query = format!(
             r#"SELECT
-                "{id_col}" as feature_id,
-                ST_AsGeoJSON({geom_4326})::json as geometry,
-                {props_sql} as properties,
+                "{id_col}"::bigint as feature_id,
                 ST_XMin({bounds_geom}) as xmin,
                 ST_YMin({bounds_geom}) as ymin,
                 ST_XMax({bounds_geom}) as xmax,
                 ST_YMax({bounds_geom}) as ymax
             FROM "{schema}"."{table}"
-            WHERE "{id_col}" = $1::bigint AND "{geom_col}" IS NOT NULL"#,
+            WHERE "{id_col}" = ANY($1::bigint[]) AND "{geom_col}" IS NOT NULL"#,
             table = layer.table,
         );
 
@@ -227,28 +231,21 @@ impl PostgisReader {
             query.push_str(&format!(" AND ({})", filter));
         }
 
-        let row = client.query_opt(&query, &[&feature_id]).await?;
-
-        match row {
-            Some(row) => {
-                let geometry: JsonValue = row.get("geometry");
-                let properties: JsonValue = row.get("properties");
-                let bounds = Bounds {
-                    min_lon: row.get("xmin"),
-                    min_lat: row.get("ymin"),
-                    max_lon: row.get("xmax"),
-                    max_lat: row.get("ymax"),
-                };
-
-                Ok(Some(FeatureData {
-                    id: feature_id,
-                    geometry,
-                    properties,
-                    bounds,
-                }))
-            }
-            None => Ok(None),
-        }
+        let rows = client.query(&query, &[&feature_ids]).await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("feature_id"),
+                    Bounds {
+                        min_lon: row.get("xmin"),
+                        min_lat: row.get("ymin"),
+                        max_lon: row.get("xmax"),
+                        max_lat: row.get("ymax"),
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Maximum number of pooled connections (upper bound for useful query concurrency).
@@ -408,7 +405,6 @@ impl PostgisReader {
                 id: feature_id,
                 geometry,
                 properties,
-                bounds: bounds.clone(),
             });
         }
 
@@ -572,7 +568,6 @@ impl PostgisReader {
                 id: feature_id,
                 geometry,
                 properties,
-                bounds: bounds.clone(),
             });
         }
 
@@ -702,7 +697,6 @@ pub struct FeatureData {
     pub id: i64,
     pub geometry: JsonValue,
     pub properties: JsonValue,
-    pub bounds: Bounds,
 }
 
 #[cfg(test)]

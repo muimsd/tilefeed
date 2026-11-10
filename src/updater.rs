@@ -291,6 +291,25 @@ async fn update_source(
     let mut all_affected: Vec<TileCoord> = Vec::new();
     let mut areas: Vec<crate::events::ChangedArea> = Vec::new();
 
+    // Current bounds of every changed feature, one query per layer: a batch
+    // of hundreds of rows would otherwise be hundreds of round trips.
+    let mut ids_by_layer: HashMap<&str, Vec<i64>> = HashMap::new();
+    for event in events {
+        if source.find_layer(&event.layer_name).is_some() {
+            ids_by_layer
+                .entry(event.layer_name.as_str())
+                .or_default()
+                .push(event.feature_id);
+        }
+    }
+    let mut current: HashMap<&str, HashMap<i64, Bounds>> = HashMap::new();
+    for (layer_name, mut ids) in ids_by_layer {
+        ids.sort_unstable();
+        ids.dedup();
+        let layer = source.find_layer(layer_name).unwrap();
+        current.insert(layer_name, reader.get_feature_bounds(layer, &ids).await?);
+    }
+
     for event in events {
         let layer = match source.find_layer(&event.layer_name) {
             Some(l) => l,
@@ -303,8 +322,11 @@ async fn update_source(
             areas.push(crate::events::ChangedArea::new(bounds, min_zoom, max_zoom));
         };
 
-        if let Some(feat) = reader.get_feature(layer, event.feature_id).await? {
-            record(&feat.bounds);
+        if let Some(bounds) = current
+            .get(event.layer_name.as_str())
+            .and_then(|b| b.get(&event.feature_id))
+        {
+            record(bounds);
         }
 
         if let Some(ref old_bounds) = event.old_bounds {
