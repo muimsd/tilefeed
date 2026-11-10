@@ -207,9 +207,9 @@ struct MapboxUploadResponse {
 }
 
 async fn publish_to_mapbox(source_path: &str, tileset_id: &str, token: &str) -> Result<()> {
-    // The tileset_id format is "account.tileset-name"; the account name
-    // (Mapbox calls it the username) is public, part of every tileset URL.
-    let account = tileset_id
+    // The tileset_id format is "owner.tileset-name". The owner (Mapbox calls
+    // it the username) is public: it is part of every tileset's URL.
+    let owner = tileset_id
         .split('.')
         .next()
         .context("mapbox_tileset_id must be in the format 'username.tileset-name'")?;
@@ -220,7 +220,7 @@ async fn publish_to_mapbox(source_path: &str, tileset_id: &str, token: &str) -> 
     let creds: MapboxCredentials = client
         .post(format!(
             "https://api.mapbox.com/uploads/v1/{}/credentials?access_token={}",
-            account, token
+            owner, token
         ))
         .send()
         .await
@@ -263,7 +263,7 @@ async fn publish_to_mapbox(source_path: &str, tileset_id: &str, token: &str) -> 
     let upload_resp: MapboxUploadResponse = client
         .post(format!(
             "https://api.mapbox.com/uploads/v1/{}?access_token={}",
-            account, token
+            owner, token
         ))
         .json(&serde_json::json!({
             "url": creds.url,
