@@ -604,6 +604,70 @@ table = "parks"
     listener.abort();
 }
 
+/// One statement that changes many rows arrives as one batch; every row's new
+/// place is found (in one query per layer) and redrawn.
+#[tokio::test]
+async fn watch_redraws_every_row_of_a_multi_row_update() {
+    let Some(db) = TestDb::new(
+        "it_batch",
+        &format!(
+            "CREATE TABLE parks (id serial PRIMARY KEY, name text, open boolean NOT NULL DEFAULT true,
+                geom geometry(Polygon, 4326));
+             INSERT INTO parks (name, geom)
+                SELECT 'park ' || i, ST_Translate({}, (i % 10) * 0.001, (i / 10) * 0.001)
+                FROM generate_series(0, 49) AS i;
+             CREATE TRIGGER tile_update_trigger AFTER INSERT OR UPDATE OR DELETE ON parks
+                FOR EACH ROW EXECUTE FUNCTION public.notify_tile_update('it_b_parks');",
+            square(PARIS.0, PARIS.1, 0.0005)
+        ),
+        r#"
+[[sources]]
+name = "it_batch"
+mbtiles_path = "{dir}/out.mbtiles"
+min_zoom = 12
+max_zoom = 12
+generation_backend = "native"
+
+[[sources.layers]]
+name = "it_b_parks"
+schema = "it_batch"
+table = "parks"
+filter = "open"
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+
+    db.generate().await;
+    let (mut rx, listener) = start_watch(&db).await;
+    first_update(&db, &mut rx, "UPDATE parks SET name = name WHERE id = 1").await;
+
+    // Move all 50 to Tokyo in one statement; close one of them on the way.
+    db.exec(&format!(
+        "UPDATE parks SET geom = ST_Translate(geom, {dx}, {dy}), open = (id <> 7)",
+        dx = TOKYO.0 - PARIS.0,
+        dy = TOKYO.1 - PARIS.1
+    ))
+    .await;
+    next_update(&mut rx, "it_batch").await;
+    let store = db.store(0);
+    let tokyo = layers_at(&store, TOKYO.0, TOKYO.1, 12);
+    assert_eq!(
+        tokyo["it_b_parks"].len(),
+        49,
+        "the closed park is filtered out"
+    );
+    let paris = layers_at(&store, PARIS.0, PARIS.1, 12);
+    assert!(
+        paris.get("it_b_parks").is_none_or(|f| f.is_empty()),
+        "parks left behind in Paris: {paris:?}"
+    );
+
+    listener.abort();
+}
+
 #[tokio::test]
 async fn validate_reports_missing_columns_and_trigger() {
     let Some(db) = TestDb::new(
