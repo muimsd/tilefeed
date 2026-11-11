@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-11
+
 ### Added
 
 - **`[serve] public_url`** sets the address used in TileJSON's tile URLs, for servers behind a proxy or CDN.
@@ -150,7 +152,8 @@ Initial release.
 - CI with tests on all platforms, clippy, formatting checks, and release builds
 - Local-parks example with end-to-end walkthrough
 
-[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/muimsd/tilefeed/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/muimsd/tilefeed/releases/tag/v0.13.1
 [0.13.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.13.0
 [0.12.0]: https://github.com/muimsd/tilefeed/releases/tag/v0.12.0
 [0.11.1]: https://github.com/muimsd/tilefeed/releases/tag/v0.11.1
