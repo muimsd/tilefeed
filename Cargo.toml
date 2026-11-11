@@ -1,6 +1,6 @@
 [package]
 name = "tilefeed"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 description = "Dynamic vector tiles from PostGIS and GDAL files"
 license = "MIT"
