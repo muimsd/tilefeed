@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod diff;
 mod events;
+mod filewatch;
 mod generator;
 mod inspect;
 mod mbtiles;
@@ -124,6 +125,14 @@ impl Commands {
         }
     }
 
+    /// Commands that keep running and apply changes.
+    fn watches(&self) -> bool {
+        matches!(
+            self,
+            Commands::Watch | Commands::Run { .. } | Commands::Serve { .. }
+        )
+    }
+
     /// Whether Tippecanoe/GDAL must be present. `validate` is a dry run of
     /// generation, so it reports a missing toolchain rather than passing and
     /// leaving the next `generate` to fail.
@@ -186,7 +195,24 @@ async fn main() -> Result<()> {
                     app_config.tippecanoe_bin.as_deref(),
                     app_config.ogr2ogr_bin.as_deref(),
                 )?;
+            } else if cli.command.watches() {
+                // Sources with watch_files regenerate while running.
+                let watched: Vec<config::SourceConfig> = app_config
+                    .sources
+                    .iter()
+                    .filter(|s| !s.watch_files.is_empty())
+                    .cloned()
+                    .collect();
+                generator::check_required_tools(
+                    &watched,
+                    app_config.tippecanoe_bin.as_deref(),
+                    app_config.ogr2ogr_bin.as_deref(),
+                )?;
             }
+
+            // Before any startup generation, so a watched file changed while
+            // it runs is regenerated afterwards.
+            let baseline = filewatch::Baseline::capture(&app_config);
 
             match cli.command {
                 Commands::Generate => {
@@ -196,7 +222,7 @@ async fn main() -> Result<()> {
                     info!("Tile generation complete");
                 }
                 Commands::Watch => {
-                    watch_updates(app_config, publisher, event_tx).await?;
+                    watch_updates(app_config, publisher, event_tx, baseline).await?;
                 }
                 Commands::Run { skip_generate } => {
                     if skip_generate {
@@ -207,7 +233,7 @@ async fn main() -> Result<()> {
                         publish_after_generate(&app_config, publisher.as_deref()).await?;
                         info!("Tile generation complete, starting incremental watcher...");
                     }
-                    watch_updates(app_config, publisher, event_tx).await?;
+                    watch_updates(app_config, publisher, event_tx, baseline).await?;
                 }
                 Commands::Serve { skip_generate } => {
                     if skip_generate {
@@ -218,7 +244,7 @@ async fn main() -> Result<()> {
                         publish_after_generate(&app_config, publisher.as_deref()).await?;
                         info!("Tile generation complete, starting server and watcher...");
                     }
-                    serve_and_watch(app_config, publisher, event_tx).await?;
+                    serve_and_watch(app_config, publisher, event_tx, baseline).await?;
                 }
                 Commands::Validate => {
                     let valid = validate::validate_config(&app_config).await?;
@@ -252,14 +278,7 @@ async fn generate_all_sources(
         )
         .await;
 
-        metrics::metrics()
-            .generate_duration
-            .with(&[&source.name])
-            .observe_since(start);
-        metrics::metrics()
-            .generate_total
-            .with(&[&source.name, metrics::result_label(&result)])
-            .inc();
+        generator::record_generation(&source.name, start, &result);
         result?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -364,8 +383,9 @@ async fn watch_updates(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
     event_tx: events::EventSender,
+    baseline: filewatch::Baseline,
 ) -> Result<()> {
-    if !config.updates.listen_enabled() {
+    if !config.updates.listen_enabled() && !config.watches_files() {
         anyhow::bail!(
             "[updates] listen = false leaves `watch` nothing to do; use `serve`, or remove the setting"
         );
@@ -380,19 +400,24 @@ async fn watch_updates(
 
     let metrics_task = spawn_metrics_exporter(&config, false);
 
-    let mut listener_task = tokio::spawn(start_listener(
-        config.clone(),
-        stores,
-        updater::UpdateOutputs {
-            publisher: publisher.clone(),
-            event_tx: Some(event_tx),
-            cache: None,
-        },
-    ));
+    let outputs = updater::UpdateOutputs {
+        publisher: publisher.clone(),
+        event_tx: Some(event_tx),
+        cache: None,
+    };
+    let mut file_watch = watch_files(&config, &stores, &outputs, baseline)?;
+    let mut listener_task = if config.updates.listen_enabled() {
+        tokio::spawn(start_listener(config.clone(), stores, outputs))
+    } else {
+        tokio::spawn(std::future::pending::<Result<()>>())
+    };
 
     tokio::select! {
         result = &mut listener_task => {
             result??;
+        }
+        result = &mut file_watch => {
+            file_watch_stopped(result)?;
         }
         _ = shutdown_signal() => {
             listener_task.abort();
@@ -400,6 +425,8 @@ async fn watch_updates(
             info!("Incremental watcher shut down");
         }
     }
+
+    file_watch.abort();
 
     if let Some(task) = metrics_task {
         task.abort();
@@ -412,6 +439,7 @@ async fn serve_and_watch(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
     event_tx: events::EventSender,
+    baseline: filewatch::Baseline,
 ) -> Result<()> {
     let stores = open_stores(&config)?;
 
@@ -436,22 +464,22 @@ async fn serve_and_watch(
         ))
     });
 
+    let outputs = updater::UpdateOutputs {
+        publisher: publisher.clone(),
+        event_tx: Some(event_tx.clone()),
+        cache: tile_cache.clone(),
+    };
+    let mut file_watch = watch_files(&config, &stores, &outputs, baseline)?;
     let mut listener_task = if config.updates.listen_enabled() {
-        tokio::spawn(start_listener(
-            config.clone(),
-            stores.clone(),
-            updater::UpdateOutputs {
-                publisher: publisher.clone(),
-                event_tx: Some(event_tx.clone()),
-                cache: tile_cache.clone(),
-            },
-        ))
+        tokio::spawn(start_listener(config.clone(), stores.clone(), outputs))
     } else {
-        info!("[updates] listen = false: serving without watching for changes");
+        if config.watches_files() {
+            info!("[updates] listen = false: watching only the sources' watch_files");
+        } else {
+            info!("[updates] listen = false: serving without watching for changes");
+        }
         tokio::spawn(std::future::pending::<Result<()>>())
     };
-    // Built before spawning: a routing or `[metrics] path` problem must stop
-    // startup here, not from inside a background task.
     // Lazy, like the watcher: with --skip-generate, stored tiles are served
     // even while PostgreSQL is unreachable, and rendering starts once it is.
     let renderer = if config.sources.iter().any(|s| s.renders_on_demand()) {
@@ -460,6 +488,8 @@ async fn serve_and_watch(
     } else {
         None
     };
+    // Built before spawning: a routing or `[metrics] path` problem must stop
+    // startup here, not from inside a background task.
     let server = server::build_server(&config, stores, Some(event_tx), tile_cache, renderer)?;
     let mut server_task = tokio::spawn(server.run());
 
@@ -470,6 +500,9 @@ async fn serve_and_watch(
         result = &mut server_task => {
             result??;
         }
+        result = &mut file_watch => {
+            file_watch_stopped(result)?;
+        }
         _ = shutdown_signal() => {
             listener_task.abort();
             server_task.abort();
@@ -479,11 +512,32 @@ async fn serve_and_watch(
         }
     }
 
+    file_watch.abort();
     if let Some(task) = metrics_task {
         task.abort();
     }
 
     Ok(())
+}
+
+/// The task polling `watch_files`; one that never ends when no source has
+/// any, so callers can always `select!` on it.
+fn watch_files(
+    config: &Arc<config::AppConfig>,
+    stores: &HashMap<String, Arc<Mutex<mbtiles::MbtilesStore>>>,
+    outputs: &updater::UpdateOutputs,
+    baseline: filewatch::Baseline,
+) -> Result<tokio::task::JoinHandle<()>> {
+    Ok(
+        filewatch::spawn(config.clone(), stores.clone(), outputs.clone(), baseline)?
+            .unwrap_or_else(|| tokio::spawn(std::future::pending())),
+    )
+}
+
+/// The file watcher only ends by panicking: stop rather than run on without it.
+fn file_watch_stopped(result: Result<(), tokio::task::JoinError>) -> Result<()> {
+    result.context("file watcher failed")?;
+    anyhow::bail!("file watcher stopped")
 }
 
 async fn shutdown_signal() {

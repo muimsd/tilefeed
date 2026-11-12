@@ -829,6 +829,7 @@ mod tests {
                 min_zoom: 0,
                 max_zoom: 14,
                 generation_backend: GenerationBackend::default(),
+                watch_files: vec![],
                 layers: vec![LayerConfig {
                     name: "buildings".to_string(),
                     schema: None,

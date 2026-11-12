@@ -99,6 +99,16 @@ pub async fn render_tile(
     )?))
 }
 
+/// Record a source's full generation (at startup or after a watched file
+/// changed) in the generation metrics.
+pub fn record_generation(source: &str, started: std::time::Instant, result: &Result<()>) {
+    let m = crate::metrics::metrics();
+    m.generate_duration.with(&[source]).observe_since(started);
+    m.generate_total
+        .with(&[source, crate::metrics::result_label(result)])
+        .inc();
+}
+
 /// Check if a required external binary is available on PATH or at the given path
 pub fn check_binary(name: &str, custom_path: Option<&str>) -> Result<()> {
     let bin = custom_path.unwrap_or(name);
@@ -609,6 +619,7 @@ mod tests {
             min_zoom: 0,
             max_zoom: 4,
             generation_backend: backend,
+            watch_files: vec![],
             layers: vec![],
             tippecanoe: TippecanoeConfig::default(),
         }

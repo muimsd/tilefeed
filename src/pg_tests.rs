@@ -968,3 +968,102 @@ table = "parks"
 
     listener.abort();
 }
+
+/// A change to a watched file regenerates the source and swaps the result
+/// into the open store, as `serve` holds it, and announces it as a
+/// generation. The data changes without a trigger, as behind OGR_FDW.
+#[tokio::test]
+async fn watched_file_change_regenerates_the_source() {
+    let Some(db) = TestDb::new(
+        "it_watch_files",
+        &format!(
+            "CREATE TABLE parks (id int PRIMARY KEY, name text, geom geometry(Polygon, 4326));
+             INSERT INTO parks VALUES (1, 'Luxembourg', {});",
+            square(PARIS.0, PARIS.1, 0.002)
+        ),
+        r#"
+[[sources]]
+name = "it_watch_files"
+mbtiles_path = "{dir}/out.mbtiles"
+min_zoom = 10
+max_zoom = 12
+generation_backend = "native"
+watch_files = ["{dir}/data"]
+
+[[sources.layers]]
+name = "it_wf_parks"
+schema = "it_watch_files"
+table = "parks"
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+    let data = db.dir.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("parks.shp"), b"v1").unwrap();
+
+    let mut config = db.config.clone();
+    config.updates.file_poll_secs = Some(1);
+    let config = Arc::new(config);
+    let baseline = crate::filewatch::Baseline::capture(&config);
+    db.generate().await;
+    let store = Arc::new(Mutex::new(db.store(0)));
+    let mut stores = HashMap::new();
+    stores.insert("it_watch_files".to_string(), store.clone());
+    let bus = create_event_bus();
+    let mut rx = bus.subscribe();
+    let watcher = crate::filewatch::spawn(
+        config,
+        stores,
+        UpdateOutputs {
+            event_tx: Some(bus),
+            ..Default::default()
+        },
+        baseline,
+    )
+    .unwrap()
+    .expect("a source watches files");
+
+    let name_in_paris = |store: &MbtilesStore| {
+        layers_at(store, PARIS.0, PARIS.1, 12)
+            .get("it_wf_parks")
+            .map(|f| f[0]["name"].clone())
+    };
+    assert_eq!(
+        name_in_paris(&*store.lock().await).as_deref(),
+        Some("Luxembourg")
+    );
+
+    // The data moves to Tokyo with no notification; then the file changes.
+    db.exec(&format!(
+        "UPDATE parks SET name = 'Yoyogi', geom = {} WHERE id = 1",
+        square(TOKYO.0, TOKYO.1, 0.002)
+    ))
+    .await;
+    std::fs::write(data.join("parks.dbf"), b"v2").unwrap();
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("no regeneration within 30s")
+            .unwrap()
+            .event;
+        if matches!(event, TileEvent::GenerateComplete { ref source, .. } if source == "it_watch_files")
+        {
+            break;
+        }
+    }
+    {
+        let store = store.lock().await;
+        assert_eq!(name_in_paris(&store), None, "old tiles must be gone");
+        assert_eq!(
+            layers_at(&store, TOKYO.0, TOKYO.1, 12)["it_wf_parks"][0]["name"],
+            "Yoyogi"
+        );
+    }
+    // The scratch file is cleaned up
+    assert!(!db.dir.join("out.mbtiles.regen").exists());
+    watcher.abort();
+}
