@@ -95,6 +95,9 @@ pub enum GenerationBackend {
     Gdal,
     /// Use the built-in native Rust MVT encoder (no external dependencies)
     Native,
+    /// Generate nothing up front: `serve` renders each tile from PostGIS the
+    /// first time it is requested (with the native encoder) and stores it
+    OnDemand,
 }
 
 /// How a polygon's label point is derived.
@@ -172,7 +175,7 @@ pub struct SourceConfig {
     pub mbtiles_path: String,
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// Tile generation backend: "tippecanoe" (default), "gdal", or "native"
+    /// Tile generation backend: "tippecanoe" (default), "gdal", "native" or "on_demand"
     #[serde(default)]
     pub generation_backend: GenerationBackend,
     pub layers: Vec<LayerConfig>,
@@ -574,6 +577,12 @@ impl AppConfig {
 }
 
 impl SourceConfig {
+    /// Whether `serve` renders this source's tiles from PostGIS when they are
+    /// requested, rather than serving only what generation stored.
+    pub fn renders_on_demand(&self) -> bool {
+        matches!(self.generation_backend, GenerationBackend::OnDemand)
+    }
+
     /// Effective zoom range of a layer: its own `min_zoom`/`max_zoom`, falling back
     /// to the source's. Derived layers (`_labels`, `_boundary`) share their
     /// parent's range.

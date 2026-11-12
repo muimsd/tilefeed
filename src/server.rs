@@ -21,6 +21,7 @@ use crate::config::{AppConfig, ServeConfig};
 use crate::events::{EventSender, Subscription, TileEvent};
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::{metrics, GaugeGuard};
+use crate::ondemand::Renderer;
 use crate::viewport::{EventsQuery, Viewport};
 
 type Stores = HashMap<String, Arc<Mutex<MbtilesStore>>>;
@@ -32,6 +33,8 @@ struct AppState {
     event_tx: Option<EventSender>,
     cache: Option<Arc<TileCache>>,
     cache_control: header::HeaderValue,
+    /// Renders missing tiles of on-demand sources from PostGIS.
+    renderer: Option<Arc<Renderer>>,
 }
 
 /// Stand-in `source` label for requests naming a source that does not exist.
@@ -56,9 +59,10 @@ pub fn build_server(
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     event_tx: Option<EventSender>,
     cache: Option<Arc<TileCache>>,
+    renderer: Option<Arc<Renderer>>,
 ) -> Result<TileServer> {
     let watched = cache.clone().map(|cache| (cache, stores.clone()));
-    let state = app_state(config, stores, event_tx, cache)?;
+    let state = app_state(config, stores, event_tx, cache, renderer)?;
 
     Ok(TileServer {
         addr: crate::metrics::bind_addr(config.serve.host(), config.serve.port()),
@@ -72,6 +76,7 @@ fn app_state(
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     event_tx: Option<EventSender>,
     cache: Option<Arc<TileCache>>,
+    renderer: Option<Arc<Renderer>>,
 ) -> Result<AppState> {
     let cache_control = header::HeaderValue::from_str(&config.serve.cache_control())
         .map_err(|e| anyhow::anyhow!("Invalid Cache-Control value: {}", e))?;
@@ -81,6 +86,7 @@ fn app_state(
         event_tx,
         cache,
         cache_control,
+        renderer,
     })
 }
 
@@ -245,16 +251,11 @@ async fn serve_tile(
         return (StatusCode::NOT_FOUND, "Tile coordinates out of range").into_response();
     }
 
+    let source_config = state.config.sources.iter().find(|s| s.name == source);
+    let in_range = source_config.is_some_and(|s| (s.min_zoom..=s.max_zoom).contains(&z));
     // Only zooms the source actually has are cached, so requests outside its
     // range (overzoom probes, crawlers) cannot push real tiles out.
-    let cache = state.cache.as_ref().filter(|_| {
-        state
-            .config
-            .sources
-            .iter()
-            .find(|s| s.name == source)
-            .is_some_and(|s| (s.min_zoom..=s.max_zoom).contains(&z))
-    });
+    let cache = state.cache.as_ref().filter(|_| in_range);
 
     // On a miss the generation is taken before the store read, so an update
     // committed while we read makes the cache refuse what we read.
@@ -280,6 +281,28 @@ async fn serve_tile(
     m.tile_read_duration
         .with(&[&source])
         .observe_since(read_started);
+
+    // A tile an on-demand source has not rendered yet (or an update dropped)
+    let tile_data = match (&tile_data, &state.renderer, source_config) {
+        (None, Some(renderer), Some(src)) if in_range && src.renders_on_demand() => {
+            match renderer
+                .get_or_render(src, store, crate::tiles::TileCoord { z, x, y })
+                .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(
+                        "Failed to render tile {}/{}/{}/{}: {:#}",
+                        source, z, x, y, e
+                    );
+                    m.tile_requests.with(&[&source, "error"]).inc();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to render tile")
+                        .into_response();
+                }
+            }
+        }
+        _ => tile_data,
+    };
 
     let tile = match tile_data {
         None => CachedTile::Empty,
@@ -885,8 +908,65 @@ mod tests {
         cache: Option<Arc<TileCache>>,
     ) -> Result<Router> {
         let config = Arc::new(config);
-        let state = app_state(&config, stores, event_tx, cache)?;
+        let state = app_state(&config, stores, event_tx, cache, None)?;
         build_router(&config, state)
+    }
+
+    /// An app whose sources render on demand against a database that refuses
+    /// connections: whether a request reached PostGIS shows as a 500.
+    fn make_on_demand_app(on_demand: bool) -> (String, Router) {
+        let mut config = make_test_config();
+        config.database.host = "127.0.0.1".to_string();
+        config.database.port = 1;
+        config.database.sslmode = crate::config::SslMode::Disable;
+        if on_demand {
+            config.sources[0].generation_backend = crate::config::GenerationBackend::OnDemand;
+        }
+        let (path, store) = make_test_store();
+        // Around Paris
+        store.set_metadata("bounds", "2,48,3,49").unwrap();
+        let mut stores = HashMap::new();
+        stores.insert("test_source".to_string(), Arc::new(Mutex::new(store)));
+        let reader = crate::postgis::PostgisReader::lazy(&config.database).unwrap();
+        let config = Arc::new(config);
+        let renderer = Some(Arc::new(Renderer::new(reader)));
+        let state = app_state(&config, stores, None, None, renderer).unwrap();
+        (path, build_router(&config, state).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_on_demand_renders_only_missing_in_bounds_tiles() {
+        let (path, app) = make_on_demand_app(true);
+        let status = |uri: &'static str| {
+            let app = app.clone();
+            async move { send_request(app, get(uri)).await.status() }
+        };
+        // Stored: served as is
+        assert_eq!(status("/test_source/0/0/0.pbf").await, StatusCode::OK);
+        // Outside bounds (Tokyo at z5): empty without a query
+        assert_eq!(
+            status("/test_source/5/28/12.pbf").await,
+            StatusCode::NO_CONTENT
+        );
+        // Past the source's max_zoom: never rendered
+        assert_eq!(
+            status("/test_source/15/16594/11272.pbf").await,
+            StatusCode::NO_CONTENT
+        );
+        // Paris at z10, missing: rendered, which fails against this database
+        assert_eq!(
+            status("/test_source/10/518/352.pbf").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_other_backends_never_render() {
+        let (path, app) = make_on_demand_app(false);
+        let response = send_request(app, get("/test_source/10/518/352.pbf")).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let _ = std::fs::remove_file(path);
     }
 
     async fn send_request(app: Router, request: Request<Body>) -> Response {

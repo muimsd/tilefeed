@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Tiles on demand.** `generation_backend = "on_demand"` generates nothing up front: `serve` renders each tile from PostGIS the first time it is requested and stores it, and updates drop the tiles they touch so the next request renders the new rows. Empty tiles aren't stored, concurrent requests for one tile render it once, and two new metrics (`tilefeed_tiles_rendered_total`, `tilefeed_tile_render_duration_seconds`) count the renders. See [docs/configuration.md](docs/configuration.md#on-demand).
+
 ## [0.13.1] - 2026-11-11
 
 ### Added

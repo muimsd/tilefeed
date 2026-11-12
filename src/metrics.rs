@@ -332,6 +332,10 @@ pub struct Metrics {
     pub tile_requests: Family<Counter>,
     pub tile_bytes: Family<Counter>,
     pub tile_read_duration: Family<Histogram>,
+    /// Tiles rendered from PostGIS on request (`generation_backend = "on_demand"`).
+    /// `result` is one of: stored, empty, discarded, failure.
+    pub tiles_rendered: Family<Counter>,
+    pub tile_render_duration: Family<Histogram>,
     /// `result` is one of: ok, source_not_found.
     pub tilejson_requests: Family<Counter>,
     pub sse_clients: Family<Gauge>,
@@ -413,6 +417,18 @@ impl Metrics {
                 "Time spent reading a tile out of MBTiles, by source.",
                 &["source"],
                 || Histogram::new(FAST_BUCKETS),
+            ),
+            tiles_rendered: Family::new(
+                "tilefeed_tiles_rendered_total",
+                "Tiles rendered from PostGIS on request, by source and result.",
+                &["source", "result"],
+                Counter::default,
+            ),
+            tile_render_duration: Family::new(
+                "tilefeed_tile_render_duration_seconds",
+                "Time spent rendering a tile from PostGIS on request, by source.",
+                &["source"],
+                || Histogram::new(SLOW_BUCKETS),
             ),
             tilejson_requests: Family::new(
                 "tilefeed_tilejson_requests_total",
@@ -611,6 +627,8 @@ impl Metrics {
         self.tile_requests.encode(&mut out);
         self.tile_bytes.encode(&mut out);
         self.tile_read_duration.encode(&mut out);
+        self.tiles_rendered.encode(&mut out);
+        self.tile_render_duration.encode(&mut out);
         self.tilejson_requests.encode(&mut out);
         self.sse_clients.encode(&mut out);
         self.sse_connections.encode(&mut out);

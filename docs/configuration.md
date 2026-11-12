@@ -205,7 +205,7 @@ See [Metrics](metrics.md) for the full metric reference.
 | `mbtiles_path` | string | yes | Output MBTiles file path |
 | `min_zoom` | int | yes | Minimum zoom level |
 | `max_zoom` | int | yes | Maximum zoom level |
-| `generation_backend` | string | no | `"tippecanoe"` (default), `"gdal"`, or `"native"` |
+| `generation_backend` | string | no | `"tippecanoe"` (default), `"gdal"`, `"native"`, or `"on_demand"` (render tiles when requested, see [On demand](#on-demand)) |
 
 ### `[[sources.layers]]`
 
@@ -334,3 +334,50 @@ min_zoom = 0
 max_zoom = 8
 generation_backend = "native"
 ```
+
+### On demand
+
+Nothing is generated up front. `generate` (and the generation `serve` runs at
+startup) only writes an empty MBTiles with its metadata, including `bounds` (the
+data extent), so it takes as long as one `ST_Extent` per layer however large the
+data is. `serve` then renders each tile from PostGIS the first time it is
+requested, with the native encoder, and stores it in the MBTiles, so every tile is
+rendered once. It suits large datasets and deep zooms, where most tiles are never
+looked at.
+
+```toml
+[[sources]]
+name = "parcels"
+mbtiles_path = "./parcels.mbtiles"
+min_zoom = 10
+max_zoom = 18
+generation_backend = "on_demand"
+```
+
+- **Updates drop tiles instead of re-encoding them.** A change removes the tiles it
+  touches from the MBTiles (one ranged delete per zoom, so a large area at deep
+  zooms costs no more than a small one) and sends the usual `update_complete` event; the next
+  request renders them from the new rows. A render that overlaps an update is served
+  but not stored, so a tile drawn from the old rows can't outlive the change.
+- **Empty tiles are not stored.** Tiles outside `bounds` are answered `204` without a
+  query, and with the [tile cache](serving.md#tile-cache) enabled repeated requests
+  for empty tiles inside it are served from memory. Updates widen `bounds` as data
+  arrives, including for a source that started out empty.
+- **Concurrent requests for one tile render it once**, empty or not, and at most
+  `pool_size` renders run at a time. Rendering has a connection pool of its own, so
+  `serve` can hold up to twice `pool_size` connections (plus the LISTEN one): size
+  `pool_size` with that in mind.
+- **Rows written during startup can be missed.** As with every backend, a change
+  made between the extent query and the listener starting sends a notification
+  nobody hears. Here that matters more: if it lies outside the startup `bounds`, its
+  tiles stay empty until the row changes again or the server restarts.
+- **A restart starts over.** Startup generation replaces the file, because the data
+  may have changed while nothing was listening. `serve --skip-generate` keeps the
+  tiles already rendered (they may be stale if rows changed in the meantime); it
+  still starts without the database, serves what is stored, and renders once
+  PostgreSQL is reachable.
+- **Only `serve` renders.** `watch` and `run` keep the MBTiles consistent by dropping
+  tiles, and `export` or publishing copies only the tiles rendered so far.
+- With `[updates] listen = false` nothing drops tiles, so a rendered tile stays as it
+  was rendered until the next restart.
+

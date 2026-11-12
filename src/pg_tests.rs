@@ -457,11 +457,16 @@ type EventRx = tokio::sync::broadcast::Receiver<crate::events::Sequenced>;
 
 /// Run the production listener on the test config's first source.
 async fn start_watch(db: &TestDb) -> (EventRx, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    start_watch_on(db, Arc::new(Mutex::new(db.store(0)))).await
+}
+
+/// `start_watch` writing through `store`, shared with the caller.
+async fn start_watch_on(
+    db: &TestDb,
+    store: Arc<Mutex<MbtilesStore>>,
+) -> (EventRx, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let mut stores = HashMap::new();
-    stores.insert(
-        db.config.sources[0].name.clone(),
-        Arc::new(Mutex::new(db.store(0))),
-    );
+    stores.insert(db.config.sources[0].name.clone(), store);
     let bus = create_event_bus();
     let rx = bus.subscribe();
     let listener = tokio::spawn(start_listener(
@@ -839,4 +844,127 @@ table = "parcels"
     // The trigger can't place the old geometry, but must not fail the write.
     db.exec("UPDATE parcels SET geom = geom WHERE id = 1; DELETE FROM parcels WHERE id = 1")
         .await;
+}
+
+/// An on-demand source starts empty; tiles are rendered (and stored) when
+/// asked for, updates drop the tiles they touch so the next request renders
+/// the new data, and the first feature of an empty source creates `bounds`.
+#[tokio::test]
+async fn on_demand_renders_when_asked_and_redraws_after_updates() {
+    let Some(db) = TestDb::new(
+        "it_on_demand",
+        "CREATE TABLE parks (id int PRIMARY KEY, name text, geom geometry(Polygon, 4326));
+         CREATE TRIGGER tile_update_trigger AFTER INSERT OR UPDATE OR DELETE ON parks
+            FOR EACH ROW EXECUTE FUNCTION public.notify_tile_update('it_od_parks');",
+        r#"
+[[sources]]
+name = "it_on_demand"
+mbtiles_path = "{dir}/out.mbtiles"
+min_zoom = 10
+max_zoom = 12
+generation_backend = "on_demand"
+
+[[sources.layers]]
+name = "it_od_parks"
+schema = "it_on_demand"
+table = "parks"
+"#,
+    )
+    .await
+    else {
+        return;
+    };
+
+    db.generate().await;
+    let source = &db.config.sources[0];
+    let store = Arc::new(Mutex::new(db.store(0)));
+    {
+        let store = store.lock().await;
+        assert_eq!(store.tile_count().unwrap(), 0);
+        assert_eq!(store.metadata_bounds().unwrap(), None);
+    }
+    let renderer = crate::ondemand::Renderer::new(db.reader().await);
+    let render = |(lon, lat): (f64, f64), z: u8| {
+        let (renderer, store) = (&renderer, &store);
+        async move {
+            renderer
+                .get_or_render(source, store, tile_at(lon, lat, z))
+                .await
+                .unwrap()
+                .map(|data| decode(&data))
+        }
+    };
+    let name_at = |layers: Option<BTreeMap<String, Vec<Props>>>| {
+        layers.expect("a tile")["it_od_parks"][0]["name"].clone()
+    };
+
+    // Nothing to render yet: no data, so no bounds.
+    assert_eq!(render(PARIS, 12).await, None);
+
+    let (mut rx, listener) = start_watch_on(&db, store.clone()).await;
+    first_update(
+        &db,
+        &mut rx,
+        &format!(
+            "INSERT INTO parks VALUES (1, 'Luxembourg', {})
+             ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+            square(PARIS.0, PARIS.1, 0.002)
+        ),
+    )
+    .await;
+    assert!(store.lock().await.metadata_bounds().unwrap().is_some());
+
+    for z in 10..=12 {
+        assert_eq!(name_at(render(PARIS, z).await), "Luxembourg", "z{z}");
+    }
+    // Stored, so the next request is a plain read
+    let t = tile_at(PARIS.0, PARIS.1, 12);
+    assert!(store
+        .lock()
+        .await
+        .get_tile(t.z, t.x, t.y)
+        .unwrap()
+        .is_some());
+    // Outside the data: empty, and nothing stored
+    assert_eq!(render(TOKYO, 12).await, None);
+    assert_eq!(store.lock().await.tile_count().unwrap(), 3);
+
+    db.exec("UPDATE parks SET name = 'Jardin' WHERE id = 1")
+        .await;
+    next_update(&mut rx, "it_on_demand").await;
+    assert!(
+        store
+            .lock()
+            .await
+            .get_tile(t.z, t.x, t.y)
+            .unwrap()
+            .is_none(),
+        "the update must drop the tile it touched"
+    );
+    assert_eq!(name_at(render(PARIS, 12).await), "Jardin");
+
+    db.exec(&format!(
+        "INSERT INTO parks VALUES (2, 'Yoyogi', {})",
+        square(TOKYO.0, TOKYO.1, 0.002)
+    ))
+    .await;
+    next_update(&mut rx, "it_on_demand").await;
+    assert_eq!(name_at(render(TOKYO, 11).await), "Yoyogi");
+
+    // Concurrent requests for an empty tile inside the bounds share one
+    // render: nothing is stored for them to find, so each would query again.
+    // Bounds now span Paris to Tokyo; the Caspian Sea has no parks.
+    let empty = (50.0, 41.0);
+    let rendered = || {
+        crate::metrics::metrics()
+            .tiles_rendered
+            .with(&["it_on_demand", "empty"])
+            .get()
+    };
+    let before = rendered();
+    let results = futures_util::future::join_all((0..20).map(|_| render(empty, 12))).await;
+    assert!(results.iter().all(Option::is_none));
+    assert_eq!(rendered() - before, 1, "one render for 20 requests");
+
+    listener.abort();
 }

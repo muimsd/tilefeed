@@ -274,6 +274,30 @@ impl TileCache {
         removed
     }
 
+    /// Drop the cached tiles of a source inside any of `ranges` (XYZ): for
+    /// areas too large to list tile by tile. Returns how many were cached.
+    pub fn invalidate_ranges(&self, source: &str, ranges: &[crate::tiles::TileRange]) -> usize {
+        let mut inner = self.lock();
+        inner.bump_generation(source);
+        let keys: Vec<Key> = inner
+            .entries
+            .keys()
+            .filter(|k| &*k.source == source && ranges.iter().any(|r| r.contains(k.z, k.x, k.y)))
+            .cloned()
+            .collect();
+        for key in &keys {
+            inner.remove(key);
+        }
+        let bytes = inner.bytes;
+        drop(inner);
+        let m = metrics();
+        m.tile_cache_bytes.get().set(bytes as i64);
+        m.tile_cache_invalidations
+            .with(&[source])
+            .add(keys.len() as u64);
+        keys.len()
+    }
+
     /// Drop every cached tile of a source, e.g. after another process rewrote
     /// its MBTiles. Returns how many were cached.
     pub fn clear_source(&self, source: &str) -> usize {
@@ -435,6 +459,33 @@ mod tests {
         let gen_t = cache.generation("t");
         cache.invalidate("s", [(0, 0, 0)]);
         assert!(cache.insert("t", 0, 0, 0, tile(10), gen_t));
+    }
+
+    #[test]
+    fn test_invalidate_ranges_clears_tiles_inside_them() {
+        use crate::tiles::TileRange;
+        let cache = TileCache::new(1 << 20, None);
+        cache.insert("s", 5, 1, 1, tile(10), 0);
+        cache.insert("s", 5, 3, 3, CachedTile::Empty, 0);
+        cache.insert("s", 6, 1, 1, tile(10), 0);
+        cache.insert("t", 5, 1, 1, tile(10), 0);
+        let Lookup::Miss { generation } = cache.lookup("s", 5, 2, 2) else {
+            panic!("expected a miss");
+        };
+        let range = TileRange {
+            z: 5,
+            x_min: 0,
+            x_max: 3,
+            y_min: 0,
+            y_max: 3,
+        };
+        assert_eq!(cache.invalidate_ranges("s", &[range]), 2);
+        assert_eq!(cache.get("s", 5, 1, 1), None);
+        assert_eq!(cache.get("s", 5, 3, 3), None, "empty tiles too");
+        assert!(cache.get("s", 6, 1, 1).is_some());
+        assert!(cache.get("t", 5, 1, 1).is_some());
+        // A read in flight across the invalidation is refused
+        assert!(!cache.insert("s", 5, 2, 2, tile(10), generation));
     }
 
     #[test]

@@ -22,7 +22,81 @@ pub async fn generate_source(
         }
         GenerationBackend::Gdal => generate_with_gdal(source, reader, ogr2ogr_bin).await,
         GenerationBackend::Native => generate_with_native(source, reader).await,
+        GenerationBackend::OnDemand => prepare_on_demand(source, reader).await,
     }
+}
+
+/// "Generation" for an on-demand source: an empty MBTiles with its metadata,
+/// `bounds` included. Tiles rendered by an earlier run are dropped with the old
+/// file, since the data may have changed while nothing was listening.
+async fn prepare_on_demand(source: &SourceConfig, reader: &PostgisReader) -> Result<()> {
+    let store = MbtilesStore::create(&source.mbtiles_path)?;
+    store.write_default_metadata(
+        &source.name,
+        &format!("Rendered on demand by tilefeed for {}", source.name),
+    )?;
+    if let Some(extent) = data_extent(source, reader).await? {
+        write_bounds(&store, &extent)?;
+    }
+    info!(
+        "Source '{}' renders tiles on demand (zoom {}-{}); prepared {}",
+        source.name, source.min_zoom, source.max_zoom, source.mbtiles_path
+    );
+    Ok(())
+}
+
+/// Union of every layer's extent in EPSG:4326, or `None` when no layer has rows.
+/// Derived geometries lie within their source geometry, except points from a
+/// label_point_column, which get_layer_extent also covers.
+async fn data_extent(
+    source: &SourceConfig,
+    reader: &PostgisReader,
+) -> Result<Option<crate::postgis::Bounds>> {
+    let mut extent: Option<crate::postgis::Bounds> = None;
+    for layer in &source.layers {
+        if let Some(b) = reader.get_layer_extent(layer).await? {
+            extent = Some(match extent {
+                Some(e) => union_bounds(&e, &b),
+                None => b,
+            });
+        }
+    }
+    Ok(extent)
+}
+
+/// The MBTiles `bounds` metadata, as Tippecanoe writes it. TileJSON (and the
+/// map preview) read it to know where the data is.
+fn write_bounds(store: &MbtilesStore, extent: &crate::postgis::Bounds) -> Result<()> {
+    store.set_metadata(
+        "bounds",
+        &format!(
+            "{},{},{},{}",
+            extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat
+        ),
+    )
+}
+
+/// Encode one tile from PostGIS: every layer (and derived layer) whose zoom
+/// range covers it. `None` when the tile has no features.
+///
+/// Shared by incremental updates and on-demand rendering, so a tile looks the
+/// same however it was produced.
+pub async fn render_tile(
+    source: &SourceConfig,
+    reader: &PostgisReader,
+    tile: &TileCoord,
+) -> Result<Option<Vec<u8>>> {
+    let features = fetch_tile_features(reader, tile, &source.tile_layers_at_zoom(tile.z)).await?;
+    if features.is_empty() {
+        return Ok(None);
+    }
+    let layer_configs: HashMap<String, &LayerConfig> =
+        source.layers.iter().map(|l| (l.name.clone(), l)).collect();
+    Ok(Some(mvt::encode_tile_with_config(
+        tile,
+        &features,
+        &layer_configs,
+    )?))
 }
 
 /// Check if a required external binary is available on PATH or at the given path
@@ -385,35 +459,15 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
     let layer_configs: HashMap<String, &crate::config::LayerConfig> =
         source.layers.iter().map(|l| (l.name.clone(), l)).collect();
 
-    // Only tiles intersecting the data extent (union over layers, EPSG:4326)
-    // can hold features. Derived geometries lie within their source geometry,
-    // except points from a label_point_column, which get_layer_extent also
-    // covers.
-    let mut extent: Option<crate::postgis::Bounds> = None;
-    for layer in &source.layers {
-        if let Some(b) = reader.get_layer_extent(layer).await? {
-            extent = Some(match extent {
-                Some(e) => union_bounds(&e, &b),
-                None => b,
-            });
-        }
-    }
-    let Some(extent) = extent else {
+    // Only tiles intersecting the data extent can hold features.
+    let Some(extent) = data_extent(source, reader).await? else {
         info!(
             "Native generation complete for source '{}': no features, 0 tiles at {}",
             source.name, source.mbtiles_path
         );
         return Ok(());
     };
-    // The MBTiles `bounds` metadata, as Tippecanoe writes it. TileJSON (and
-    // the map preview) read it to know where the data is.
-    store.set_metadata(
-        "bounds",
-        &format!(
-            "{},{},{},{}",
-            extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat
-        ),
-    )?;
+    write_bounds(&store, &extent)?;
     // A small margin so features touching the extent edge still reach the
     // neighbouring tile whose border they touch, as a full scan would.
     let extent = expand_bounds(&extent, EXTENT_MARGIN_DEG);
@@ -499,7 +553,7 @@ async fn generate_with_native(source: &SourceConfig, reader: &PostgisReader) -> 
 }
 
 /// Margin (degrees, ~10 cm) added around the data extent before tiling.
-const EXTENT_MARGIN_DEG: f64 = 1e-6;
+pub const EXTENT_MARGIN_DEG: f64 = 1e-6;
 
 /// Query the given tile layers (those active at the tile's zoom) for one tile.
 async fn fetch_tile_features(

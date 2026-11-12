@@ -69,6 +69,8 @@ scrape_configs:
 | `tilefeed_tile_requests_total` | counter | `source`, `result` | Tile requests. `result`: `hit`, `empty`, `not_modified`, `not_found`, `bad_request`, `error` |
 | `tilefeed_tile_bytes_total` | counter | `source` | Bytes of tile data served |
 | `tilefeed_tile_read_duration_seconds` | histogram | `source` | Time spent reading a tile out of MBTiles |
+| `tilefeed_tiles_rendered_total` | counter | `source`, `result` | Tiles rendered from PostGIS on request ([`on_demand`](configuration.md#on-demand) sources). `result`: `stored`, `empty` (no features, or outside the source's bounds), `discarded` (an update landed mid-render, so the tile was served but not kept), `failure` |
+| `tilefeed_tile_render_duration_seconds` | histogram | `source` | Time spent rendering a tile from PostGIS on request |
 | `tilefeed_tilejson_requests_total` | counter | `source`, `result` | TileJSON requests. `result`: `ok`, `not_found`, `bad_request` |
 | `tilefeed_sse_clients` | gauge | — | SSE clients currently connected to `/events` |
 | `tilefeed_sse_connections_total` | counter | — | SSE connections opened since start |
@@ -101,7 +103,7 @@ walking `/aaa/0/0/0.pbf`, `/aab/0/0/0.pbf`, … could grow the registry without 
 | `tilefeed_notifications_total` | counter | `result` | LISTEN/NOTIFY payloads. `result`: `routed`, `unknown_layer`, `invalid_payload` |
 | `tilefeed_update_batches_total` | counter | `source` | Debounced batches applied |
 | `tilefeed_tiles_written_total` | counter | `source` | Tiles written into MBTiles |
-| `tilefeed_tiles_deleted_total` | counter | `source` | Tiles deleted (regenerated to empty) |
+| `tilefeed_tiles_deleted_total` | counter | `source` | Tiles deleted (regenerated to empty, or for an on-demand source dropped to be rendered again) |
 | `tilefeed_tile_encode_errors_total` | counter | `source` | Tiles that failed to regenerate |
 | `tilefeed_update_errors_total` | counter | `source` | Update batches that failed |
 | `tilefeed_update_duration_seconds` | histogram | `source` | Duration of an update batch |

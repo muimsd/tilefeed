@@ -55,6 +55,46 @@ pub fn tile_range_for_bounds(bounds: &Bounds, zoom: u8) -> (u32, u32, u32, u32) 
     (x_min, x_max, y_min, y_max)
 }
 
+/// An inclusive block of XYZ tiles at one zoom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileRange {
+    pub z: u8,
+    pub x_min: u32,
+    pub x_max: u32,
+    pub y_min: u32,
+    pub y_max: u32,
+}
+
+impl TileRange {
+    pub fn contains(&self, z: u8, x: u32, y: u32) -> bool {
+        z == self.z
+            && (self.x_min..=self.x_max).contains(&x)
+            && (self.y_min..=self.y_max).contains(&y)
+    }
+
+    /// How many tiles the range holds.
+    pub fn tile_count(&self) -> u64 {
+        (self.x_max - self.x_min + 1) as u64 * (self.y_max - self.y_min + 1) as u64
+    }
+}
+
+/// The tiles intersecting `bounds` at each zoom, as one range per zoom:
+/// `tiles_for_bounds` without listing them, for areas too big to enumerate.
+pub fn tile_ranges_for_bounds(bounds: &Bounds, min_zoom: u8, max_zoom: u8) -> Vec<TileRange> {
+    (min_zoom..=max_zoom)
+        .map(|z| {
+            let (x_min, x_max, y_min, y_max) = tile_range_for_bounds(bounds, z);
+            TileRange {
+                z,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            }
+        })
+        .collect()
+}
+
 /// Get all tiles that intersect the given bounding box at the specified zoom levels
 pub fn tiles_for_bounds(bounds: &Bounds, min_zoom: u8, max_zoom: u8) -> Vec<TileCoord> {
     let mut tiles = Vec::new();
@@ -157,6 +197,24 @@ mod tests {
             assert!(tb.min_lon <= b.max_lon && tb.max_lon >= b.min_lon);
             assert!(tb.min_lat <= b.max_lat && tb.max_lat >= b.min_lat);
         }
+    }
+
+    #[test]
+    fn test_tile_ranges_match_tiles_for_bounds() {
+        let b = lisbon();
+        let ranges = tile_ranges_for_bounds(&b, 8, 14);
+        let tiles = tiles_for_bounds(&b, 8, 14);
+        assert_eq!(ranges.len(), 7);
+        assert_eq!(
+            ranges.iter().map(TileRange::tile_count).sum::<u64>(),
+            tiles.len() as u64
+        );
+        for t in &tiles {
+            assert!(ranges.iter().any(|r| r.contains(t.z, t.x, t.y)), "{t:?}");
+        }
+        let r = ranges[0];
+        assert!(!r.contains(r.z + 1, r.x_min, r.y_min));
+        assert!(!r.contains(r.z, r.x_max + 1, r.y_min));
     }
 
     #[test]

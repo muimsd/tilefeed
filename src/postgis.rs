@@ -81,24 +81,11 @@ pub struct PostgisReader {
 
 impl PostgisReader {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self> {
-        let tls = crate::pgtls::make_tls_connector(config)?;
-        let manager = Manager::from_config(
-            config.pg_config(),
-            tls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
-
-        let pool_size = config.pool_size.unwrap_or(4);
-        let pool = Pool::builder(manager)
-            .max_size(pool_size)
-            .runtime(Runtime::Tokio1)
-            .build()
-            .context("Failed to build connection pool")?;
+        let reader = Self::lazy(config)?;
+        let pool_size = reader.max_connections();
 
         // Verify connectivity
-        let _client = pool.get().await.with_context(|| {
+        let _client = reader.pool.get().await.with_context(|| {
             format!(
                 "Failed to connect to PostGIS (sslmode={})",
                 config.sslmode.as_str()
@@ -110,6 +97,26 @@ impl PostgisReader {
             config.sslmode.as_str()
         );
 
+        Ok(reader)
+    }
+
+    /// A reader whose connections are made when first needed, so building it
+    /// never waits for (or fails on) an unreachable database.
+    pub fn lazy(config: &DatabaseConfig) -> Result<Self> {
+        let tls = crate::pgtls::make_tls_connector(config)?;
+        let manager = Manager::from_config(
+            config.pg_config(),
+            tls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+
+        let pool = Pool::builder(manager)
+            .max_size(config.pool_size.unwrap_or(4))
+            .runtime(Runtime::Tokio1)
+            .build()
+            .context("Failed to build connection pool")?;
         Ok(Self { pool })
     }
 

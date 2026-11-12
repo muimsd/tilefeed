@@ -12,10 +12,9 @@ use crate::config::AppConfig;
 use crate::events::EventSender;
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::metrics;
-use crate::mvt;
 use crate::postgis::{Bounds, PostgisReader};
 use crate::storage::StoragePublisher;
-use crate::tiles::{tiles_for_bounds, TileCoord};
+use crate::tiles::{tile_ranges_for_bounds, tiles_for_bounds, TileCoord, TileRange};
 
 #[derive(Debug)]
 struct UpdateEvent {
@@ -288,6 +287,7 @@ async fn update_source(
     let publisher = outputs.publisher.as_ref();
     let event_tx = outputs.event_tx.as_ref();
     let cache = outputs.cache.as_ref();
+    let on_demand = source.renders_on_demand();
     let mut all_affected: Vec<TileCoord> = Vec::new();
     let mut areas: Vec<crate::events::ChangedArea> = Vec::new();
 
@@ -318,7 +318,11 @@ async fn update_source(
 
         let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
         let mut record = |bounds: &Bounds| {
-            all_affected.extend(affected_tiles(source, layer, bounds));
+            // On-demand sources work on ranges: a big area at deep zooms is
+            // millions of tiles, almost none of them ever rendered.
+            if !on_demand {
+                all_affected.extend(affected_tiles(source, layer, bounds));
+            }
             areas.push(crate::events::ChangedArea::new(bounds, min_zoom, max_zoom));
         };
 
@@ -334,79 +338,111 @@ async fn update_source(
         }
     }
 
-    // Deduplicate
-    all_affected.sort_by_key(|t| (t.z, t.x, t.y));
-    all_affected.dedup();
-
-    if all_affected.is_empty() {
-        info!("No affected tiles for source '{}'", source.name);
-        return Ok(());
+    let affected: usize;
+    let zooms: std::collections::HashSet<u8>;
+    if on_demand {
+        let mut ranges: Vec<TileRange> = areas
+            .iter()
+            .flat_map(|a| {
+                let [w, s, e, n] = a.bbox;
+                let bounds = Bounds {
+                    min_lon: w,
+                    min_lat: s,
+                    max_lon: e,
+                    max_lat: n,
+                };
+                tile_ranges_for_bounds(&bounds, a.min_zoom, a.max_zoom)
+            })
+            .collect();
+        // An edit in place has the same old and new bounds
+        ranges.sort_by_key(|r| (r.z, r.x_min, r.x_max, r.y_min, r.y_max));
+        ranges.dedup();
+        if ranges.is_empty() {
+            info!("No affected tiles for source '{}'", source.name);
+            return Ok(());
+        }
+        // Dropping the tiles is enough: the server renders them afresh the
+        // next time they are requested.
+        let deleted = drop_tile_ranges(source, mbtiles, cache, &ranges, &areas).await?;
+        affected = ranges.iter().map(|r| r.tile_count() as usize).sum();
+        zooms = ranges.iter().map(|r| r.z).collect();
+        info!(
+            "Dropped {} rendered tile(s) for on-demand source '{}'",
+            deleted, source.name
+        );
+    } else {
+        all_affected.sort_by_key(|t| (t.z, t.x, t.y));
+        all_affected.dedup();
+        if all_affected.is_empty() {
+            info!("No affected tiles for source '{}'", source.name);
+            return Ok(());
+        }
+        let encoded = regenerate_tiles(config, reader, source, &all_affected).await;
+        write_tiles(source, mbtiles, cache, &encoded, &areas).await?;
+        affected = all_affected.len();
+        zooms = all_affected.iter().map(|t| t.z).collect();
     }
 
-    info!(
-        "Regenerating {} unique tiles for source '{}'",
-        all_affected.len(),
-        source.name
-    );
-
-    // Regenerate tiles concurrently (bounded concurrency)
-    let worker_count = config.updates.worker_concurrency.unwrap_or(8).max(1);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_count));
-    let mut handles = Vec::new();
-
-    for tile_coord in all_affected.clone() {
-        let sem = semaphore.clone();
-        let src = source.clone();
-        let rdr = reader.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            regenerate_single_tile(&src, &rdr, &tile_coord).await
-        });
-        handles.push((tile_coord, handle));
-    }
-
-    // Collect results and write to MBTiles
-    let mut encoded: Vec<(TileCoord, Option<Vec<u8>>)> = Vec::new();
-    for (coord, handle) in handles {
-        match handle.await {
-            Ok(Ok(data)) => encoded.push((coord, data)),
-            Ok(Err(e)) => {
-                metrics().tile_encode_errors.with(&[&source.name]).inc();
-                error!("Failed to regenerate tile {:?}: {}", coord, e);
-            }
-            Err(e) => {
-                metrics().tile_encode_errors.with(&[&source.name]).inc();
-                error!("Task panicked for tile {:?}: {}", coord, e);
-            }
+    if let Some(publisher) = publisher {
+        if config.publish.publish_on_update_enabled() {
+            publisher
+                .publish_mbtiles(&source.mbtiles_path, "incremental-update")
+                .await?;
         }
     }
 
+    info!(
+        "Batch update complete for source '{}' ({} tiles)",
+        source.name, affected
+    );
+
+    // Emit event for webhooks and SSE
+    if let Some(event_tx) = event_tx {
+        let layers: Vec<String> = events
+            .iter()
+            .map(|e| e.layer_name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let _ = event_tx.send(
+            crate::events::TileEvent::update_complete(
+                source.name.clone(),
+                affected,
+                &zooms,
+                source.max_zoom,
+                layers,
+            )
+            .with_areas(areas),
+        );
+    }
+
+    Ok(())
+}
+
+/// Write re-encoded tiles (deleting those now empty) and widen `bounds`, in
+/// one transaction, then clear exactly those tiles from the server's cache.
+async fn write_tiles(
+    source: &crate::config::SourceConfig,
+    mbtiles: &Arc<Mutex<MbtilesStore>>,
+    cache: Option<&Arc<TileCache>>,
+    encoded: &[(TileCoord, Option<Vec<u8>>)],
+    areas: &[crate::events::ChangedArea],
+) -> Result<()> {
     let written = encoded.iter().filter(|(_, d)| d.is_some()).count();
     let deleted = encoded.len() - written;
 
     // Write to MBTiles under lock (no .await while holding)
     let store = mbtiles.lock().await;
-    store.begin_transaction()?;
-
-    let write_result: Result<()> = (|| {
-        for (coord, data) in &encoded {
+    in_transaction(&store, || {
+        for (coord, data) in encoded {
             match data {
                 None => store.delete_tile(coord.z, coord.x, coord.y)?,
                 Some(tile_data) => store.put_tile(coord.z, coord.x, coord.y, tile_data)?,
             }
         }
         // Keep `bounds` covering the data, for TileJSON and the map preview
-        store.widen_bounds(areas.iter().map(|a| a.bbox))?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = store.rollback_transaction();
-        return Err(e);
-    }
-
-    store.commit_transaction()?;
+        store.widen_bounds(areas.iter().map(|a| a.bbox), false)
+    })?;
     drop(store);
 
     // Clear the old versions of exactly these tiles from the server's cache.
@@ -430,43 +466,98 @@ async fn update_source(
         .tiles_deleted
         .with(&[&source.name])
         .add(deleted as u64);
+    Ok(())
+}
 
-    if let Some(publisher) = publisher {
-        if config.publish.publish_on_update_enabled() {
-            publisher
-                .publish_mbtiles(&source.mbtiles_path, "incremental-update")
-                .await?;
+/// Delete an on-demand source's stored tiles in `ranges` and widen (or
+/// create) its `bounds`, in one transaction, then clear the ranges from the
+/// server's cache (empty tiles included: a new feature may fill one).
+/// Returns how many stored tiles were deleted.
+async fn drop_tile_ranges(
+    source: &crate::config::SourceConfig,
+    mbtiles: &Arc<Mutex<MbtilesStore>>,
+    cache: Option<&Arc<TileCache>>,
+    ranges: &[TileRange],
+    areas: &[crate::events::ChangedArea],
+) -> Result<usize> {
+    let store = mbtiles.lock().await;
+    let mut deleted = 0;
+    in_transaction(&store, || {
+        for range in ranges {
+            deleted += store.delete_tile_range(range)?;
+        }
+        store.widen_bounds(areas.iter().map(|a| a.bbox), true)
+    })?;
+    drop(store);
+
+    if let Some(cache) = cache {
+        cache.invalidate_ranges(&source.name, ranges);
+    }
+    metrics()
+        .tiles_deleted
+        .with(&[&source.name])
+        .add(deleted as u64);
+    Ok(deleted)
+}
+
+/// Run `f` in a transaction: committed if it succeeds, rolled back if not.
+fn in_transaction(store: &MbtilesStore, f: impl FnOnce() -> Result<()>) -> Result<()> {
+    store.begin_transaction()?;
+    if let Err(e) = f() {
+        let _ = store.rollback_transaction();
+        return Err(e);
+    }
+    store.commit_transaction()
+}
+
+/// Re-encode `tiles` from PostGIS, concurrently. Tiles that fail are logged,
+/// counted and left out, so they keep their previous contents.
+async fn regenerate_tiles(
+    config: &AppConfig,
+    reader: &PostgisReader,
+    source: &crate::config::SourceConfig,
+    tiles: &[TileCoord],
+) -> Vec<(TileCoord, Option<Vec<u8>>)> {
+    info!(
+        "Regenerating {} unique tiles for source '{}'",
+        tiles.len(),
+        source.name
+    );
+
+    // Regenerate tiles concurrently (bounded concurrency)
+    let worker_count = config.updates.worker_concurrency.unwrap_or(8).max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_count));
+    let mut handles = Vec::new();
+
+    for tile_coord in tiles.iter().copied() {
+        let sem = semaphore.clone();
+        let src = source.clone();
+        let rdr = reader.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            crate::generator::render_tile(&src, &rdr, &tile_coord).await
+        });
+        handles.push((tile_coord, handle));
+    }
+
+    // Collect the results; failed tiles are logged and left as they were
+    let mut encoded: Vec<(TileCoord, Option<Vec<u8>>)> = Vec::new();
+    for (coord, handle) in handles {
+        match handle.await {
+            Ok(Ok(data)) => encoded.push((coord, data)),
+            Ok(Err(e)) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Failed to regenerate tile {:?}: {}", coord, e);
+            }
+            Err(e) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Task panicked for tile {:?}: {}", coord, e);
+            }
         }
     }
 
-    info!(
-        "Batch update complete for source '{}' ({} tiles)",
-        source.name,
-        all_affected.len()
-    );
-
-    // Emit event for webhooks and SSE
-    if let Some(event_tx) = event_tx {
-        let zooms: std::collections::HashSet<u8> = all_affected.iter().map(|t| t.z).collect();
-        let layers: Vec<String> = events
-            .iter()
-            .map(|e| e.layer_name.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let _ = event_tx.send(
-            crate::events::TileEvent::update_complete(
-                source.name.clone(),
-                all_affected.len(),
-                &zooms,
-                source.max_zoom,
-                layers,
-            )
-            .with_areas(areas),
-        );
-    }
-
-    Ok(())
+    encoded
 }
 
 /// Tiles a change to `layer` within `bounds` can alter: only those at the zooms
@@ -478,44 +569,6 @@ fn affected_tiles(
 ) -> Vec<TileCoord> {
     let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
     tiles_for_bounds(bounds, min_zoom, max_zoom)
-}
-
-async fn regenerate_single_tile(
-    source: &crate::config::SourceConfig,
-    reader: &PostgisReader,
-    tile_coord: &TileCoord,
-) -> Result<Option<Vec<u8>>> {
-    let bounds = tile_coord.bounds();
-    let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
-    let mut layer_configs: HashMap<String, &crate::config::LayerConfig> = HashMap::new();
-
-    // Only layers whose zoom range covers this tile; the rest stay out of it.
-    for tl in source.tile_layers_at_zoom(tile_coord.z) {
-        let features = match tl.derived {
-            None => {
-                layer_configs.insert(tl.layer.name.clone(), tl.layer);
-                reader.get_features_in_bounds(tl.layer, &bounds).await?
-            }
-            Some(derived) => {
-                reader
-                    .get_derived_features_in_bounds(tl.layer, derived, &bounds)
-                    .await?
-            }
-        };
-        if !features.is_empty() {
-            features_by_layer.insert(tl.name, features);
-        }
-    }
-
-    if features_by_layer.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(mvt::encode_tile_with_config(
-            tile_coord,
-            &features_by_layer,
-            &layer_configs,
-        )?))
-    }
 }
 
 #[cfg(test)]
