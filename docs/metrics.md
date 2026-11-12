@@ -103,7 +103,7 @@ walking `/aaa/0/0/0.pbf`, `/aab/0/0/0.pbf`, … could grow the registry without 
 | `tilefeed_notifications_total` | counter | `result` | LISTEN/NOTIFY payloads. `result`: `routed`, `unknown_layer`, `invalid_payload` |
 | `tilefeed_update_batches_total` | counter | `source` | Debounced batches applied |
 | `tilefeed_tiles_written_total` | counter | `source` | Tiles written into MBTiles |
-| `tilefeed_tiles_deleted_total` | counter | `source` | Tiles deleted (regenerated to empty) |
+| `tilefeed_tiles_deleted_total` | counter | `source` | Tiles deleted (regenerated to empty, or for an on-demand source dropped to be rendered again) |
 | `tilefeed_tile_encode_errors_total` | counter | `source` | Tiles that failed to regenerate |
 | `tilefeed_update_errors_total` | counter | `source` | Update batches that failed |
 | `tilefeed_update_duration_seconds` | histogram | `source` | Duration of an update batch |

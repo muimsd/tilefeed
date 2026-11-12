@@ -398,6 +398,23 @@ impl MbtilesStore {
     }
 
     /// Write default metadata for vector tiles
+    /// Delete every stored tile in `range` (XYZ), returning how many there were.
+    pub fn delete_tile_range(&self, range: &crate::tiles::TileRange) -> Result<usize> {
+        // MBTiles rows are TMS: the flip reverses the y range
+        let flip = |y: u32| (1u32 << range.z) - 1 - y;
+        Ok(self.conn.execute(
+            "DELETE FROM tiles WHERE zoom_level = ?1
+                 AND tile_column BETWEEN ?2 AND ?3 AND tile_row BETWEEN ?4 AND ?5",
+            params![
+                range.z as i32,
+                range.x_min as i32,
+                range.x_max as i32,
+                flip(range.y_max) as i32,
+                flip(range.y_min) as i32
+            ],
+        )?)
+    }
+
     pub fn write_default_metadata(&self, name: &str, description: &str) -> Result<()> {
         self.set_metadata("name", name)?;
         self.set_metadata("format", "pbf")?;
@@ -646,6 +663,36 @@ mod tests {
             store.metadata_bounds().unwrap(),
             Some([2.0, 48.5, 2.6, 49.0])
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_delete_tile_range_takes_xyz_rows() {
+        use crate::tiles::TileRange;
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        for x in 0..4 {
+            for y in 0..4 {
+                store.put_tile(2, x, y, b"t").unwrap();
+            }
+        }
+        store.put_tile(3, 1, 1, b"t").unwrap();
+        let range = TileRange {
+            z: 2,
+            x_min: 1,
+            x_max: 2,
+            y_min: 0,
+            y_max: 1,
+        };
+        assert_eq!(store.delete_tile_range(&range).unwrap(), 4);
+        for x in 0..4 {
+            for y in 0..4 {
+                let gone = range.contains(2, x, y);
+                assert_eq!(store.get_tile(2, x, y).unwrap().is_none(), gone, "{x},{y}");
+            }
+        }
+        assert!(store.get_tile(3, 1, 1).unwrap().is_some());
+        assert_eq!(store.delete_tile_range(&range).unwrap(), 0);
         cleanup(&path);
     }
 

@@ -7,42 +7,67 @@
 //! grow the file without bound by walking empty tiles at deep zooms): tiles
 //! outside the source's `bounds` are answered without a query, and the tile
 //! cache, when enabled, absorbs repeated requests for empty ones inside them.
+//!
+//! A rendered tile is written without `TileCache::invalidate`: it only gets
+//! here on a cache miss, and the handler caches it under the generation it
+//! looked up before reading, which any update since then has moved on.
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OnceCell, Semaphore};
 
-use crate::config::{AppConfig, SourceConfig};
+use crate::config::SourceConfig;
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::metrics;
 use crate::postgis::PostgisReader;
 use crate::tiles::TileCoord;
 
 type TileKey = (String, u8, u32, u32);
+/// The outcome of one render, shared by every request that waited for it.
+type Shared = Arc<OnceCell<Option<Vec<u8>>>>;
 
 pub struct Renderer {
     reader: PostgisReader,
-    /// Bounds concurrent renders by the pool size, so a burst of requests
-    /// queues here instead of starving the updater of connections.
+    /// Bounds concurrent renders by the pool size. The renderer has a pool of
+    /// its own (`pool_size` connections, opened as needed), so renders can't
+    /// take the connections incremental updates use.
     permits: Semaphore,
-    /// One lock per tile being rendered: concurrent requests for the same
-    /// tile wait for the first one and then find its result in the store.
-    in_flight: std::sync::Mutex<HashMap<TileKey, Arc<Mutex<()>>>>,
+    /// The tiles being rendered: concurrent requests for one tile share one
+    /// render, empty or not, instead of each querying PostGIS in turn.
+    in_flight: std::sync::Mutex<HashMap<TileKey, Shared>>,
+}
+
+/// A request's claim on an in-flight render; the last one out removes the
+/// entry, also when a client disconnects and its request is dropped mid-wait.
+struct Claim<'a> {
+    in_flight: &'a std::sync::Mutex<HashMap<TileKey, Shared>>,
+    key: TileKey,
+    shared: Shared,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        // Held only by the map and this claim: nobody else is waiting.
+        if Arc::strong_count(&self.shared) == 2
+            && in_flight
+                .get(&self.key)
+                .is_some_and(|s| Arc::ptr_eq(s, &self.shared))
+        {
+            in_flight.remove(&self.key);
+        }
+    }
 }
 
 impl Renderer {
-    /// A renderer, if any source renders on demand.
-    pub fn for_config(config: &AppConfig, reader: PostgisReader) -> Option<Self> {
-        if !config.sources.iter().any(|s| s.renders_on_demand()) {
-            return None;
-        }
+    pub fn new(reader: PostgisReader) -> Self {
         let permits = Semaphore::new(reader.max_connections().max(1));
-        Some(Self {
+        Self {
             reader,
             permits,
             in_flight: Default::default(),
-        })
+        }
     }
 
     /// The tile at `tile`, rendering and storing it if the store lacks it.
@@ -54,26 +79,24 @@ impl Renderer {
         tile: TileCoord,
     ) -> Result<Option<Vec<u8>>> {
         let key = (source.name.clone(), tile.z, tile.x, tile.y);
-        let lock = self
+        let shared = self
             .in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(key.clone())
             .or_default()
             .clone();
-        let result = {
-            let _rendering = lock.lock().await;
-            self.render_unless_stored(source, store, tile).await
+        let claim = Claim {
+            in_flight: &self.in_flight,
+            key,
+            shared,
         };
-        // The last request out removes the entry; one that arrives after this
-        // gets a fresh lock, and finds the stored tile when it checks.
-        {
-            let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            if Arc::strong_count(&lock) == 2 {
-                in_flight.remove(&key);
-            }
-        }
-        result
+        // A failed render leaves the cell empty: the next waiter tries again.
+        let data = claim
+            .shared
+            .get_or_try_init(|| self.render_unless_stored(source, store, tile))
+            .await?;
+        Ok(data.clone())
     }
 
     async fn render_unless_stored(

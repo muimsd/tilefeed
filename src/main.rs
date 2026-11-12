@@ -456,7 +456,7 @@ async fn serve_and_watch(
     // even while PostgreSQL is unreachable, and rendering starts once it is.
     let renderer = if config.sources.iter().any(|s| s.renders_on_demand()) {
         let reader = postgis::PostgisReader::lazy(&config.database)?;
-        ondemand::Renderer::for_config(&config, reader).map(Arc::new)
+        Some(Arc::new(ondemand::Renderer::new(reader)))
     } else {
         None
     };

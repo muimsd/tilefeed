@@ -883,8 +883,7 @@ table = "parks"
         assert_eq!(store.tile_count().unwrap(), 0);
         assert_eq!(store.metadata_bounds().unwrap(), None);
     }
-    let renderer = crate::ondemand::Renderer::for_config(&db.config, db.reader().await)
-        .expect("an on-demand source");
+    let renderer = crate::ondemand::Renderer::new(db.reader().await);
     let render = |(lon, lat): (f64, f64), z: u8| {
         let (renderer, store) = (&renderer, &store);
         async move {
@@ -951,6 +950,21 @@ table = "parks"
     .await;
     next_update(&mut rx, "it_on_demand").await;
     assert_eq!(name_at(render(TOKYO, 11).await), "Yoyogi");
+
+    // Concurrent requests for an empty tile inside the bounds share one
+    // render: nothing is stored for them to find, so each would query again.
+    // Bounds now span Paris to Tokyo; the Caspian Sea has no parks.
+    let empty = (50.0, 41.0);
+    let rendered = || {
+        crate::metrics::metrics()
+            .tiles_rendered
+            .with(&["it_on_demand", "empty"])
+            .get()
+    };
+    let before = rendered();
+    let results = futures_util::future::join_all((0..20).map(|_| render(empty, 12))).await;
+    assert!(results.iter().all(Option::is_none));
+    assert_eq!(rendered() - before, 1, "one render for 20 requests");
 
     listener.abort();
 }

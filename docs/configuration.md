@@ -355,15 +355,22 @@ generation_backend = "on_demand"
 ```
 
 - **Updates drop tiles instead of re-encoding them.** A change removes the tiles it
-  touches from the MBTiles and sends the usual `update_complete` event; the next
+  touches from the MBTiles (one ranged delete per zoom, so a large area at deep
+  zooms costs no more than a small one) and sends the usual `update_complete` event; the next
   request renders them from the new rows. A render that overlaps an update is served
   but not stored, so a tile drawn from the old rows can't outlive the change.
 - **Empty tiles are not stored.** Tiles outside `bounds` are answered `204` without a
   query, and with the [tile cache](serving.md#tile-cache) enabled repeated requests
   for empty tiles inside it are served from memory. Updates widen `bounds` as data
   arrives, including for a source that started out empty.
-- **Concurrent requests for one tile render it once**, and at most `pool_size`
-  renders run at a time.
+- **Concurrent requests for one tile render it once**, empty or not, and at most
+  `pool_size` renders run at a time. Rendering has a connection pool of its own, so
+  `serve` can hold up to twice `pool_size` connections (plus the LISTEN one): size
+  `pool_size` with that in mind.
+- **Rows written during startup can be missed.** As with every backend, a change
+  made between the extent query and the listener starting sends a notification
+  nobody hears. Here that matters more: if it lies outside the startup `bounds`, its
+  tiles stay empty until the row changes again or the server restarts.
 - **A restart starts over.** Startup generation replaces the file, because the data
   may have changed while nothing was listening. `serve --skip-generate` keeps the
   tiles already rendered (they may be stale if rows changed in the meantime); it
