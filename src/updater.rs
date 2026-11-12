@@ -341,7 +341,7 @@ async fn update_source(
     let affected: usize;
     let zooms: std::collections::HashSet<u8>;
     if on_demand {
-        let ranges: Vec<TileRange> = areas
+        let mut ranges: Vec<TileRange> = areas
             .iter()
             .flat_map(|a| {
                 let [w, s, e, n] = a.bbox;
@@ -354,6 +354,9 @@ async fn update_source(
                 tile_ranges_for_bounds(&bounds, a.min_zoom, a.max_zoom)
             })
             .collect();
+        // An edit in place has the same old and new bounds
+        ranges.sort_by_key(|r| (r.z, r.x_min, r.x_max, r.y_min, r.y_max));
+        ranges.dedup();
         if ranges.is_empty() {
             info!("No affected tiles for source '{}'", source.name);
             return Ok(());
