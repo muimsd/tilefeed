@@ -21,6 +21,7 @@ use crate::config::{AppConfig, ServeConfig};
 use crate::events::{EventSender, Subscription, TileEvent};
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::{metrics, GaugeGuard};
+use crate::ondemand::Renderer;
 use crate::viewport::{EventsQuery, Viewport};
 
 type Stores = HashMap<String, Arc<Mutex<MbtilesStore>>>;
@@ -32,6 +33,8 @@ struct AppState {
     event_tx: Option<EventSender>,
     cache: Option<Arc<TileCache>>,
     cache_control: header::HeaderValue,
+    /// Renders missing tiles of on-demand sources from PostGIS.
+    renderer: Option<Arc<Renderer>>,
 }
 
 /// Stand-in `source` label for requests naming a source that does not exist.
@@ -56,9 +59,11 @@ pub fn build_server(
     stores: HashMap<String, Arc<Mutex<MbtilesStore>>>,
     event_tx: Option<EventSender>,
     cache: Option<Arc<TileCache>>,
+    renderer: Option<Arc<Renderer>>,
 ) -> Result<TileServer> {
     let watched = cache.clone().map(|cache| (cache, stores.clone()));
-    let state = app_state(config, stores, event_tx, cache)?;
+    let mut state = app_state(config, stores, event_tx, cache)?;
+    state.renderer = renderer;
 
     Ok(TileServer {
         addr: crate::metrics::bind_addr(config.serve.host(), config.serve.port()),
@@ -81,6 +86,7 @@ fn app_state(
         event_tx,
         cache,
         cache_control,
+        renderer: None,
     })
 }
 
@@ -245,16 +251,11 @@ async fn serve_tile(
         return (StatusCode::NOT_FOUND, "Tile coordinates out of range").into_response();
     }
 
+    let source_config = state.config.sources.iter().find(|s| s.name == source);
+    let in_range = source_config.is_some_and(|s| (s.min_zoom..=s.max_zoom).contains(&z));
     // Only zooms the source actually has are cached, so requests outside its
     // range (overzoom probes, crawlers) cannot push real tiles out.
-    let cache = state.cache.as_ref().filter(|_| {
-        state
-            .config
-            .sources
-            .iter()
-            .find(|s| s.name == source)
-            .is_some_and(|s| (s.min_zoom..=s.max_zoom).contains(&z))
-    });
+    let cache = state.cache.as_ref().filter(|_| in_range);
 
     // On a miss the generation is taken before the store read, so an update
     // committed while we read makes the cache refuse what we read.
@@ -280,6 +281,28 @@ async fn serve_tile(
     m.tile_read_duration
         .with(&[&source])
         .observe_since(read_started);
+
+    // A tile an on-demand source has not rendered yet (or an update dropped)
+    let tile_data = match (&tile_data, &state.renderer, source_config) {
+        (None, Some(renderer), Some(src)) if in_range && src.renders_on_demand() => {
+            match renderer
+                .get_or_render(src, store, crate::tiles::TileCoord { z, x, y })
+                .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(
+                        "Failed to render tile {}/{}/{}/{}: {:#}",
+                        source, z, x, y, e
+                    );
+                    m.tile_requests.with(&[&source, "error"]).inc();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to render tile")
+                        .into_response();
+                }
+            }
+        }
+        _ => tile_data,
+    };
 
     let tile = match tile_data {
         None => CachedTile::Empty,

@@ -12,7 +12,6 @@ use crate::config::AppConfig;
 use crate::events::EventSender;
 use crate::mbtiles::MbtilesStore;
 use crate::metrics::metrics;
-use crate::mvt;
 use crate::postgis::{Bounds, PostgisReader};
 use crate::storage::StoragePublisher;
 use crate::tiles::{tiles_for_bounds, TileCoord};
@@ -343,44 +342,18 @@ async fn update_source(
         return Ok(());
     }
 
-    info!(
-        "Regenerating {} unique tiles for source '{}'",
-        all_affected.len(),
-        source.name
-    );
-
-    // Regenerate tiles concurrently (bounded concurrency)
-    let worker_count = config.updates.worker_concurrency.unwrap_or(8).max(1);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_count));
-    let mut handles = Vec::new();
-
-    for tile_coord in all_affected.clone() {
-        let sem = semaphore.clone();
-        let src = source.clone();
-        let rdr = reader.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            regenerate_single_tile(&src, &rdr, &tile_coord).await
-        });
-        handles.push((tile_coord, handle));
-    }
-
-    // Collect results and write to MBTiles
-    let mut encoded: Vec<(TileCoord, Option<Vec<u8>>)> = Vec::new();
-    for (coord, handle) in handles {
-        match handle.await {
-            Ok(Ok(data)) => encoded.push((coord, data)),
-            Ok(Err(e)) => {
-                metrics().tile_encode_errors.with(&[&source.name]).inc();
-                error!("Failed to regenerate tile {:?}: {}", coord, e);
-            }
-            Err(e) => {
-                metrics().tile_encode_errors.with(&[&source.name]).inc();
-                error!("Task panicked for tile {:?}: {}", coord, e);
-            }
-        }
-    }
+    let encoded: Vec<(TileCoord, Option<Vec<u8>>)> = if source.renders_on_demand() {
+        // Dropping the tiles is enough: the server renders them afresh the
+        // next time they are requested, and tiles nobody looks at cost nothing.
+        info!(
+            "Dropping {} affected tiles for on-demand source '{}'",
+            all_affected.len(),
+            source.name
+        );
+        all_affected.iter().map(|c| (*c, None)).collect()
+    } else {
+        regenerate_tiles(config, reader, source, &all_affected).await
+    };
 
     let written = encoded.iter().filter(|(_, d)| d.is_some()).count();
     let deleted = encoded.len() - written;
@@ -397,7 +370,7 @@ async fn update_source(
             }
         }
         // Keep `bounds` covering the data, for TileJSON and the map preview
-        store.widen_bounds(areas.iter().map(|a| a.bbox))?;
+        store.widen_bounds(areas.iter().map(|a| a.bbox), source.renders_on_demand())?;
         Ok(())
     })();
 
@@ -469,6 +442,56 @@ async fn update_source(
     Ok(())
 }
 
+/// Re-encode `tiles` from PostGIS, concurrently. Tiles that fail are logged,
+/// counted and left out, so they keep their previous contents.
+async fn regenerate_tiles(
+    config: &AppConfig,
+    reader: &PostgisReader,
+    source: &crate::config::SourceConfig,
+    tiles: &[TileCoord],
+) -> Vec<(TileCoord, Option<Vec<u8>>)> {
+    info!(
+        "Regenerating {} unique tiles for source '{}'",
+        tiles.len(),
+        source.name
+    );
+
+    // Regenerate tiles concurrently (bounded concurrency)
+    let worker_count = config.updates.worker_concurrency.unwrap_or(8).max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_count));
+    let mut handles = Vec::new();
+
+    for tile_coord in tiles.iter().copied() {
+        let sem = semaphore.clone();
+        let src = source.clone();
+        let rdr = reader.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            crate::generator::render_tile(&src, &rdr, &tile_coord).await
+        });
+        handles.push((tile_coord, handle));
+    }
+
+    // Collect the results; failed tiles are logged and left as they were
+    let mut encoded: Vec<(TileCoord, Option<Vec<u8>>)> = Vec::new();
+    for (coord, handle) in handles {
+        match handle.await {
+            Ok(Ok(data)) => encoded.push((coord, data)),
+            Ok(Err(e)) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Failed to regenerate tile {:?}: {}", coord, e);
+            }
+            Err(e) => {
+                metrics().tile_encode_errors.with(&[&source.name]).inc();
+                error!("Task panicked for tile {:?}: {}", coord, e);
+            }
+        }
+    }
+
+    encoded
+}
+
 /// Tiles a change to `layer` within `bounds` can alter: only those at the zooms
 /// the layer (and its derived layers) is encoded at.
 fn affected_tiles(
@@ -478,44 +501,6 @@ fn affected_tiles(
 ) -> Vec<TileCoord> {
     let (min_zoom, max_zoom) = source.layer_zoom_range(layer);
     tiles_for_bounds(bounds, min_zoom, max_zoom)
-}
-
-async fn regenerate_single_tile(
-    source: &crate::config::SourceConfig,
-    reader: &PostgisReader,
-    tile_coord: &TileCoord,
-) -> Result<Option<Vec<u8>>> {
-    let bounds = tile_coord.bounds();
-    let mut features_by_layer: HashMap<String, Vec<crate::postgis::FeatureData>> = HashMap::new();
-    let mut layer_configs: HashMap<String, &crate::config::LayerConfig> = HashMap::new();
-
-    // Only layers whose zoom range covers this tile; the rest stay out of it.
-    for tl in source.tile_layers_at_zoom(tile_coord.z) {
-        let features = match tl.derived {
-            None => {
-                layer_configs.insert(tl.layer.name.clone(), tl.layer);
-                reader.get_features_in_bounds(tl.layer, &bounds).await?
-            }
-            Some(derived) => {
-                reader
-                    .get_derived_features_in_bounds(tl.layer, derived, &bounds)
-                    .await?
-            }
-        };
-        if !features.is_empty() {
-            features_by_layer.insert(tl.name, features);
-        }
-    }
-
-    if features_by_layer.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(mvt::encode_tile_with_config(
-            tile_coord,
-            &features_by_layer,
-            &layer_configs,
-        )?))
-    }
 }
 
 #[cfg(test)]

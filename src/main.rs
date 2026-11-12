@@ -7,6 +7,7 @@ mod inspect;
 mod mbtiles;
 mod metrics;
 mod mvt;
+mod ondemand;
 #[cfg(test)]
 mod pg_tests;
 mod pgtls;
@@ -451,7 +452,15 @@ async fn serve_and_watch(
     };
     // Built before spawning: a routing or `[metrics] path` problem must stop
     // startup here, not from inside a background task.
-    let server = server::build_server(&config, stores, Some(event_tx), tile_cache)?;
+    // Lazy, like the watcher: with --skip-generate, stored tiles are served
+    // even while PostgreSQL is unreachable, and rendering starts once it is.
+    let renderer = if config.sources.iter().any(|s| s.renders_on_demand()) {
+        let reader = postgis::PostgisReader::lazy(&config.database)?;
+        ondemand::Renderer::for_config(&config, reader).map(Arc::new)
+    } else {
+        None
+    };
+    let server = server::build_server(&config, stores, Some(event_tx), tile_cache, renderer)?;
     let mut server_task = tokio::spawn(server.run());
 
     tokio::select! {

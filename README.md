@@ -36,6 +36,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 
 - Cross-platform: Linux, macOS, and Windows
 - Three generation backends: [Tippecanoe](docs/tippecanoe.md), GDAL (ogr2ogr), and native Rust MVT encoder
+- [Tiles on demand](docs/configuration.md#on-demand): `generation_backend = "on_demand"` skips generation and renders each tile from PostGIS the first time it is requested, for datasets too large to tile up front
 - Multiple sources: separate MBTiles outputs with independent layers and zoom ranges
 - [Per-layer zoom ranges](docs/configuration.md#per-layer-zoom-range) (`min_zoom`/`max_zoom`) within a source, honoured by every backend and by incremental updates
 - Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY with debounced batching
@@ -65,7 +66,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - PostgreSQL with [PostGIS](https://postgis.net/) extension
 - [Tippecanoe](https://github.com/felt/tippecanoe) — only if using `generation_backend = "tippecanoe"` (default)
 - [GDAL](https://gdal.org/) — only if using `generation_backend = "gdal"`
-- Neither needed for `generation_backend = "native"`
+- Neither needed for `generation_backend = "native"` or `"on_demand"`
 
 ### Homebrew (macOS / Linux)
 
@@ -209,6 +210,7 @@ mbtiles_path = "./basemap.mbtiles"
 min_zoom = 0
 max_zoom = 14
 # generation_backend = "native"  # no external tools needed
+# generation_backend = "on_demand"  # render tiles when requested, nothing up front
 
 [[sources.layers]]
 name = "buildings"

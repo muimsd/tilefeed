@@ -30,6 +30,11 @@ fn immutable_uri(path: &str) -> String {
 
 pub struct MbtilesStore {
     conn: Connection,
+    /// Transactions committed through this connection. An on-demand render
+    /// notes it before querying PostGIS and stores its tile only if no update
+    /// committed in the meantime, since that update may have dropped the very
+    /// tile it rendered from older data.
+    commits: std::cell::Cell<u64>,
 }
 
 impl MbtilesStore {
@@ -108,7 +113,10 @@ impl MbtilesStore {
             info!("Tiles view materialized successfully");
         }
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            commits: Default::default(),
+        })
     }
 
     /// Open an MBTiles file without writing to it.
@@ -161,7 +169,10 @@ impl MbtilesStore {
             bail!("{} is not a valid MBTiles file (no `tiles` table)", path);
         }
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            commits: Default::default(),
+        })
     }
 
     /// Stream every tile coordinate, as (zoom, column, TMS row).
@@ -220,7 +231,10 @@ impl MbtilesStore {
         )?;
 
         info!("Created new MBTiles file at {}", path);
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            commits: Default::default(),
+        })
     }
 
     /// Set metadata value
@@ -233,7 +247,7 @@ impl MbtilesStore {
     }
 
     /// The `bounds` metadata, if present and well-formed.
-    fn metadata_bounds(&self) -> Result<Option<[f64; 4]>> {
+    pub fn metadata_bounds(&self) -> Result<Option<[f64; 4]>> {
         let Some(meta) = self.get_metadata("bounds")? else {
             return Ok(None);
         };
@@ -253,10 +267,28 @@ impl MbtilesStore {
     /// keeps up with incremental updates. Never shrinks it: a deleted feature
     /// leaves the box as it was, as a regeneration would only fix later. A
     /// store without `bounds` metadata is left without (`bounds()` then reads
-    /// the tiles, which are already current).
-    pub fn widen_bounds(&self, boxes: impl IntoIterator<Item = [f64; 4]>) -> Result<()> {
-        let Some(old) = self.metadata_bounds()? else {
-            return Ok(());
+    /// the tiles, which are already current), unless `create` is set: an
+    /// on-demand source that started out empty only renders inside its
+    /// `bounds`, so its first features have to create them.
+    pub fn widen_bounds(
+        &self,
+        boxes: impl IntoIterator<Item = [f64; 4]>,
+        create: bool,
+    ) -> Result<()> {
+        let mut boxes = boxes.into_iter();
+        let old = match self.metadata_bounds()? {
+            Some(old) => old,
+            None if create => match boxes.next() {
+                Some(first) => {
+                    self.set_metadata(
+                        "bounds",
+                        &format!("{},{},{},{}", first[0], first[1], first[2], first[3]),
+                    )?;
+                    first
+                }
+                None => return Ok(()),
+            },
+            None => return Ok(()),
         };
         let mut new = old;
         for [w, s, e, n] in boxes {
@@ -385,7 +417,13 @@ impl MbtilesStore {
     /// Commit the current transaction
     pub fn commit_transaction(&self) -> Result<()> {
         self.conn.execute("COMMIT", [])?;
+        self.commits.set(self.commits.get() + 1);
         Ok(())
+    }
+
+    /// How many transactions this connection has committed. See `commits`.
+    pub fn commit_count(&self) -> u64 {
+        self.commits.get()
     }
 
     /// Rollback the current transaction
@@ -581,16 +619,47 @@ mod tests {
         let path = temp_mbtiles_path();
         let store = MbtilesStore::create(&path).unwrap();
         // Without metadata there is nothing to widen
-        store.widen_bounds([[0.0, 0.0, 1.0, 1.0]]).unwrap();
+        store.widen_bounds([[0.0, 0.0, 1.0, 1.0]], false).unwrap();
         assert_eq!(store.get_metadata("bounds").unwrap(), None);
 
         store.set_metadata("bounds", "2,48,3,49").unwrap();
-        store.widen_bounds([[2.5, 48.5, 2.6, 48.6]]).unwrap();
+        store.widen_bounds([[2.5, 48.5, 2.6, 48.6]], false).unwrap();
         assert_eq!(store.bounds().unwrap(), Some([2.0, 48.0, 3.0, 49.0]));
         store
-            .widen_bounds([[1.5, 48.2, 2.2, 48.3], [2.9, 48.9, 3.5, 49.5]])
+            .widen_bounds([[1.5, 48.2, 2.2, 48.3], [2.9, 48.9, 3.5, 49.5]], false)
             .unwrap();
         assert_eq!(store.bounds().unwrap(), Some([1.5, 48.0, 3.5, 49.5]));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_widen_bounds_can_create_missing_metadata() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.widen_bounds([], true).unwrap();
+        assert_eq!(store.get_metadata("bounds").unwrap(), None);
+
+        store
+            .widen_bounds([[2.5, 48.5, 2.6, 48.6], [2.0, 48.9, 2.1, 49.0]], true)
+            .unwrap();
+        assert_eq!(
+            store.metadata_bounds().unwrap(),
+            Some([2.0, 48.5, 2.6, 49.0])
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_commit_count_counts_committed_transactions_only() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.put_tile(0, 0, 0, b"t").unwrap();
+        store.begin_transaction().unwrap();
+        store.rollback_transaction().unwrap();
+        assert_eq!(store.commit_count(), 0);
+        store.begin_transaction().unwrap();
+        store.commit_transaction().unwrap();
+        assert_eq!(store.commit_count(), 1);
         cleanup(&path);
     }
 
