@@ -377,14 +377,30 @@ async fn update_source(
             info!("No affected tiles for source '{}'", source.name);
             return Ok(());
         }
-        let encoded = regenerate_tiles(config, reader, source, &all_affected).await;
-        write_tiles(source, mbtiles, cache, &encoded, &areas).await?;
+        // A watched-file regeneration swapping in a new file while we encode
+        // would be overwritten by tiles drawn before it: encode again.
+        let mut attempt = 1;
+        loop {
+            let replacements = mbtiles.lock().await.replacement_count();
+            let encoded = regenerate_tiles(config, reader, source, &all_affected).await;
+            let expect = (attempt < 3).then_some(replacements);
+            if write_tiles(source, mbtiles, cache, &encoded, &areas, expect).await? {
+                break;
+            }
+            attempt += 1;
+            info!(
+                "Source '{}' was regenerated while updating; encoding again",
+                source.name
+            );
+        }
         affected = all_affected.len();
         zooms = all_affected.iter().map(|t| t.z).collect();
     }
 
     if let Some(publisher) = publisher {
         if config.publish.publish_on_update_enabled() {
+            // Fold the WAL into the file, or a copy of it misses this batch
+            mbtiles.lock().await.checkpoint()?;
             publisher
                 .publish_mbtiles(&source.mbtiles_path, "incremental-update")
                 .await?;
@@ -421,18 +437,24 @@ async fn update_source(
 
 /// Write re-encoded tiles (deleting those now empty) and widen `bounds`, in
 /// one transaction, then clear exactly those tiles from the server's cache.
+/// Writes nothing and returns false if the store's contents were replaced
+/// since `replacements` (the count the tiles were encoded after).
 async fn write_tiles(
     source: &crate::config::SourceConfig,
     mbtiles: &Arc<Mutex<MbtilesStore>>,
     cache: Option<&Arc<TileCache>>,
     encoded: &[(TileCoord, Option<Vec<u8>>)],
     areas: &[crate::events::ChangedArea],
-) -> Result<()> {
+    replacements: Option<u64>,
+) -> Result<bool> {
     let written = encoded.iter().filter(|(_, d)| d.is_some()).count();
     let deleted = encoded.len() - written;
 
     // Write to MBTiles under lock (no .await while holding)
     let store = mbtiles.lock().await;
+    if replacements.is_some_and(|r| r != store.replacement_count()) {
+        return Ok(false);
+    }
     in_transaction(&store, || {
         for (coord, data) in encoded {
             match data {
@@ -466,7 +488,7 @@ async fn write_tiles(
         .tiles_deleted
         .with(&[&source.name])
         .add(deleted as u64);
-    Ok(())
+    Ok(true)
 }
 
 /// Delete an on-demand source's stored tiles in `ranges` and widen (or

@@ -10,7 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Tiles on demand.** `generation_backend = "on_demand"` generates nothing up front: `serve` renders each tile from PostGIS the first time it is requested and stores it, and updates drop the tiles they touch so the next request renders the new rows. Empty tiles aren't stored, concurrent requests for one tile render it once, and two new metrics (`tilefeed_tiles_rendered_total`, `tilefeed_tile_render_duration_seconds`) count the renders. See [docs/configuration.md](docs/configuration.md#on-demand).
-- **Watching source files.** A source's `watch_files` lists the files (or directories) its data is read from, such as a GeoPackage behind an OGR_FDW foreign table, whose edits never notify. `watch`, `run` and `serve` poll them (`[updates] file_poll_secs`, default 5) and regenerate the source once a change settles, swapping the result into the open MBTiles in one transaction, then clearing the tile cache and sending `generate_complete`. A file changed while tilefeed was stopped is caught at startup. See [docs/configuration.md](docs/configuration.md#watching-source-files).
+- **Watching source files.** A source's `watch_files` lists the files (or directories) its data is read from, such as a GeoPackage behind an OGR_FDW foreign table, whose edits never notify. `watch`, `run` and `serve` poll them (`[updates] file_poll_secs`, default 5) and regenerate the source once a change settles, swapping the result into the open MBTiles in one transaction, then clearing the tile cache and sending `generate_complete`. A file changed while tilefeed was stopped is caught at startup, and a failed regeneration is retried with backoff. See [docs/configuration.md](docs/configuration.md#watching-source-files).
+
+### Fixed
+
+- **Publishing after incremental updates** copied the `.mbtiles` without its WAL, so the published file could miss the latest batch. The WAL is now checkpointed into the file before publishing.
 
 ## [0.13.1] - 2026-11-11
 

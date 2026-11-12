@@ -125,9 +125,6 @@ impl Commands {
         }
     }
 
-    /// Whether Tippecanoe/GDAL must be present. `validate` is a dry run of
-    /// generation, so it reports a missing toolchain rather than passing and
-    /// leaving the next `generate` to fail.
     /// Commands that keep running and apply changes.
     fn watches(&self) -> bool {
         matches!(
@@ -136,6 +133,9 @@ impl Commands {
         )
     }
 
+    /// Whether Tippecanoe/GDAL must be present. `validate` is a dry run of
+    /// generation, so it reports a missing toolchain rather than passing and
+    /// leaving the next `generate` to fail.
     fn needs_generation_tools(&self) -> bool {
         self.generates() || matches!(self, Commands::Validate)
     }
@@ -210,6 +210,10 @@ async fn main() -> Result<()> {
                 )?;
             }
 
+            // Before any startup generation, so a watched file changed while
+            // it runs is regenerated afterwards.
+            let baseline = filewatch::Baseline::capture(&app_config);
+
             match cli.command {
                 Commands::Generate => {
                     let reader = postgis::PostgisReader::connect(&app_config.database).await?;
@@ -218,7 +222,7 @@ async fn main() -> Result<()> {
                     info!("Tile generation complete");
                 }
                 Commands::Watch => {
-                    watch_updates(app_config, publisher, event_tx).await?;
+                    watch_updates(app_config, publisher, event_tx, baseline).await?;
                 }
                 Commands::Run { skip_generate } => {
                     if skip_generate {
@@ -229,7 +233,7 @@ async fn main() -> Result<()> {
                         publish_after_generate(&app_config, publisher.as_deref()).await?;
                         info!("Tile generation complete, starting incremental watcher...");
                     }
-                    watch_updates(app_config, publisher, event_tx).await?;
+                    watch_updates(app_config, publisher, event_tx, baseline).await?;
                 }
                 Commands::Serve { skip_generate } => {
                     if skip_generate {
@@ -240,7 +244,7 @@ async fn main() -> Result<()> {
                         publish_after_generate(&app_config, publisher.as_deref()).await?;
                         info!("Tile generation complete, starting server and watcher...");
                     }
-                    serve_and_watch(app_config, publisher, event_tx).await?;
+                    serve_and_watch(app_config, publisher, event_tx, baseline).await?;
                 }
                 Commands::Validate => {
                     let valid = validate::validate_config(&app_config).await?;
@@ -274,14 +278,7 @@ async fn generate_all_sources(
         )
         .await;
 
-        metrics::metrics()
-            .generate_duration
-            .with(&[&source.name])
-            .observe_since(start);
-        metrics::metrics()
-            .generate_total
-            .with(&[&source.name, metrics::result_label(&result)])
-            .inc();
+        generator::record_generation(&source.name, start, &result);
         result?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -386,6 +383,7 @@ async fn watch_updates(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
     event_tx: events::EventSender,
+    baseline: filewatch::Baseline,
 ) -> Result<()> {
     if !config.updates.listen_enabled() && !config.watches_files() {
         anyhow::bail!(
@@ -407,7 +405,7 @@ async fn watch_updates(
         event_tx: Some(event_tx),
         cache: None,
     };
-    let file_watch = filewatch::spawn(config.clone(), stores.clone(), outputs.clone())?;
+    let mut file_watch = watch_files(&config, &stores, &outputs, baseline)?;
     let mut listener_task = if config.updates.listen_enabled() {
         tokio::spawn(start_listener(config.clone(), stores, outputs))
     } else {
@@ -418,6 +416,9 @@ async fn watch_updates(
         result = &mut listener_task => {
             result??;
         }
+        result = &mut file_watch => {
+            file_watch_stopped(result)?;
+        }
         _ = shutdown_signal() => {
             listener_task.abort();
             let _ = listener_task.await;
@@ -425,9 +426,7 @@ async fn watch_updates(
         }
     }
 
-    if let Some(task) = file_watch {
-        task.abort();
-    }
+    file_watch.abort();
 
     if let Some(task) = metrics_task {
         task.abort();
@@ -440,6 +439,7 @@ async fn serve_and_watch(
     config: Arc<config::AppConfig>,
     publisher: Option<Arc<storage::StoragePublisher>>,
     event_tx: events::EventSender,
+    baseline: filewatch::Baseline,
 ) -> Result<()> {
     let stores = open_stores(&config)?;
 
@@ -469,15 +469,17 @@ async fn serve_and_watch(
         event_tx: Some(event_tx.clone()),
         cache: tile_cache.clone(),
     };
-    let file_watch = filewatch::spawn(config.clone(), stores.clone(), outputs.clone())?;
+    let mut file_watch = watch_files(&config, &stores, &outputs, baseline)?;
     let mut listener_task = if config.updates.listen_enabled() {
         tokio::spawn(start_listener(config.clone(), stores.clone(), outputs))
     } else {
-        info!("[updates] listen = false: serving without watching for changes");
+        if config.watches_files() {
+            info!("[updates] listen = false: watching only the sources' watch_files");
+        } else {
+            info!("[updates] listen = false: serving without watching for changes");
+        }
         tokio::spawn(std::future::pending::<Result<()>>())
     };
-    // Built before spawning: a routing or `[metrics] path` problem must stop
-    // startup here, not from inside a background task.
     // Lazy, like the watcher: with --skip-generate, stored tiles are served
     // even while PostgreSQL is unreachable, and rendering starts once it is.
     let renderer = if config.sources.iter().any(|s| s.renders_on_demand()) {
@@ -486,6 +488,8 @@ async fn serve_and_watch(
     } else {
         None
     };
+    // Built before spawning: a routing or `[metrics] path` problem must stop
+    // startup here, not from inside a background task.
     let server = server::build_server(&config, stores, Some(event_tx), tile_cache, renderer)?;
     let mut server_task = tokio::spawn(server.run());
 
@@ -496,6 +500,9 @@ async fn serve_and_watch(
         result = &mut server_task => {
             result??;
         }
+        result = &mut file_watch => {
+            file_watch_stopped(result)?;
+        }
         _ = shutdown_signal() => {
             listener_task.abort();
             server_task.abort();
@@ -505,14 +512,32 @@ async fn serve_and_watch(
         }
     }
 
-    if let Some(task) = file_watch {
-        task.abort();
-    }
+    file_watch.abort();
     if let Some(task) = metrics_task {
         task.abort();
     }
 
     Ok(())
+}
+
+/// The task polling `watch_files`; one that never ends when no source has
+/// any, so callers can always `select!` on it.
+fn watch_files(
+    config: &Arc<config::AppConfig>,
+    stores: &HashMap<String, Arc<Mutex<mbtiles::MbtilesStore>>>,
+    outputs: &updater::UpdateOutputs,
+    baseline: filewatch::Baseline,
+) -> Result<tokio::task::JoinHandle<()>> {
+    Ok(
+        filewatch::spawn(config.clone(), stores.clone(), outputs.clone(), baseline)?
+            .unwrap_or_else(|| tokio::spawn(std::future::pending())),
+    )
+}
+
+/// The file watcher only ends by panicking: stop rather than run on without it.
+fn file_watch_stopped(result: Result<(), tokio::task::JoinError>) -> Result<()> {
+    result.context("file watcher failed")?;
+    anyhow::bail!("file watcher stopped")
 }
 
 async fn shutdown_signal() {

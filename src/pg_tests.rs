@@ -1007,6 +1007,7 @@ table = "parks"
     let mut config = db.config.clone();
     config.updates.file_poll_secs = Some(1);
     let config = Arc::new(config);
+    let baseline = crate::filewatch::Baseline::capture(&config);
     db.generate().await;
     let store = Arc::new(Mutex::new(db.store(0)));
     let mut stores = HashMap::new();
@@ -1020,6 +1021,7 @@ table = "parks"
             event_tx: Some(bus),
             ..Default::default()
         },
+        baseline,
     )
     .unwrap()
     .expect("a source watches files");

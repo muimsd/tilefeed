@@ -35,6 +35,10 @@ pub struct MbtilesStore {
     /// committed in the meantime, since that update may have dropped the very
     /// tile it rendered from older data.
     commits: std::cell::Cell<u64>,
+    /// Times `replace_contents_from` swapped in a whole new file. An
+    /// incremental update notes it before encoding and doesn't write tiles
+    /// encoded before a swap over the regenerated ones.
+    replacements: std::cell::Cell<u64>,
 }
 
 impl MbtilesStore {
@@ -116,6 +120,7 @@ impl MbtilesStore {
         Ok(Self {
             conn,
             commits: Default::default(),
+            replacements: Default::default(),
         })
     }
 
@@ -172,6 +177,7 @@ impl MbtilesStore {
         Ok(Self {
             conn,
             commits: Default::default(),
+            replacements: Default::default(),
         })
     }
 
@@ -234,6 +240,7 @@ impl MbtilesStore {
         Ok(Self {
             conn,
             commits: Default::default(),
+            replacements: Default::default(),
         })
     }
 
@@ -469,7 +476,21 @@ impl MbtilesStore {
         })();
         let detached = self.conn.execute("DETACH DATABASE regen", []);
         copied?;
+        self.replacements.set(self.replacements.get() + 1);
         detached?;
+        Ok(())
+    }
+
+    /// How many times `replace_contents_from` has swapped in a new file.
+    pub fn replacement_count(&self) -> u64 {
+        self.replacements.get()
+    }
+
+    /// Fold the WAL into the database file, so copying the `.mbtiles` alone
+    /// (as publishing does) gets every committed write.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
     }
 
@@ -761,6 +782,7 @@ mod tests {
         // Metadata the new file lacks is gone too
         assert_eq!(store.get_metadata("bounds").unwrap(), None);
         assert_eq!(store.commit_count(), 1);
+        assert_eq!(store.replacement_count(), 1);
         // Detached again: a second swap can attach the same name
         store.replace_contents_from(&regen).unwrap();
         cleanup(&path);
@@ -784,8 +806,29 @@ mod tests {
             Some(&b"kept"[..])
         );
         assert_eq!(store.commit_count(), 0);
+        assert_eq!(store.replacement_count(), 0);
         cleanup(&path);
         cleanup(&not_mbtiles);
+    }
+
+    #[test]
+    fn test_checkpoint_folds_the_wal_into_the_file() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.begin_transaction().unwrap();
+        store.put_tile(0, 0, 0, b"committed").unwrap();
+        store.commit_transaction().unwrap();
+        store.checkpoint().unwrap();
+        // A copy of the main file alone has the tile
+        let copy = temp_mbtiles_path();
+        std::fs::copy(&path, &copy).unwrap();
+        let copied = MbtilesStore::open(&copy).unwrap();
+        assert_eq!(
+            copied.get_tile(0, 0, 0).unwrap().as_deref(),
+            Some(&b"committed"[..])
+        );
+        cleanup(&path);
+        cleanup(&copy);
     }
 
     #[test]
