@@ -438,6 +438,41 @@ impl MbtilesStore {
         Ok(())
     }
 
+    /// Replace every tile and metadata row with those of the MBTiles at
+    /// `path`, in one transaction through this connection.
+    ///
+    /// Used to swap in a regenerated file while `serve` holds this one open:
+    /// readers see the old tiles until the commit and the new ones after, no
+    /// file is renamed under an open handle (which Windows refuses), and the
+    /// commit counts in `commit_count`, so an on-demand render that started
+    /// before it is not stored over the new contents.
+    pub fn replace_contents_from(&self, path: &str) -> Result<()> {
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS regen", params![path])
+            .with_context(|| format!("Failed to attach {}", path))?;
+        let copied = (|| -> Result<()> {
+            self.begin_transaction()?;
+            let result = self.conn.execute_batch(
+                "DELETE FROM main.tiles;
+                 INSERT INTO main.tiles (zoom_level, tile_column, tile_row, tile_data)
+                     SELECT zoom_level, tile_column, tile_row, tile_data FROM regen.tiles;
+                 DELETE FROM main.metadata;
+                 INSERT INTO main.metadata (name, value) SELECT name, value FROM regen.metadata;",
+            );
+            match result {
+                Ok(()) => self.commit_transaction(),
+                Err(e) => {
+                    let _ = self.rollback_transaction();
+                    Err(e.into())
+                }
+            }
+        })();
+        let detached = self.conn.execute("DETACH DATABASE regen", []);
+        copied?;
+        detached?;
+        Ok(())
+    }
+
     /// How many transactions this connection has committed. See `commits`.
     pub fn commit_count(&self) -> u64 {
         self.commits.get()
@@ -694,6 +729,63 @@ mod tests {
         assert!(store.get_tile(3, 1, 1).unwrap().is_some());
         assert_eq!(store.delete_tile_range(&range).unwrap(), 0);
         cleanup(&path);
+    }
+
+    #[test]
+    fn test_replace_contents_from_swaps_tiles_and_metadata() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.write_default_metadata("old", "old").unwrap();
+        store.set_metadata("bounds", "0,0,1,1").unwrap();
+        store.put_tile(1, 0, 0, b"old").unwrap();
+        store.put_tile(2, 1, 1, b"gone").unwrap();
+
+        let regen = temp_mbtiles_path();
+        let new = MbtilesStore::create(&regen).unwrap();
+        new.write_default_metadata("new", "new").unwrap();
+        new.put_tile(1, 0, 0, b"new").unwrap();
+        new.put_tile(3, 2, 2, b"added").unwrap();
+        drop(new);
+
+        store.replace_contents_from(&regen).unwrap();
+        assert_eq!(
+            store.get_tile(1, 0, 0).unwrap().as_deref(),
+            Some(&b"new"[..])
+        );
+        assert_eq!(store.get_tile(2, 1, 1).unwrap(), None);
+        assert_eq!(
+            store.get_tile(3, 2, 2).unwrap().as_deref(),
+            Some(&b"added"[..])
+        );
+        assert_eq!(store.get_metadata("name").unwrap().as_deref(), Some("new"));
+        // Metadata the new file lacks is gone too
+        assert_eq!(store.get_metadata("bounds").unwrap(), None);
+        assert_eq!(store.commit_count(), 1);
+        // Detached again: a second swap can attach the same name
+        store.replace_contents_from(&regen).unwrap();
+        cleanup(&path);
+        cleanup(&regen);
+    }
+
+    #[test]
+    fn test_replace_contents_from_a_bad_file_keeps_the_tiles() {
+        let path = temp_mbtiles_path();
+        let store = MbtilesStore::create(&path).unwrap();
+        store.put_tile(1, 0, 0, b"kept").unwrap();
+        let not_mbtiles = temp_mbtiles_path();
+        rusqlite::Connection::open(&not_mbtiles)
+            .unwrap()
+            .execute_batch("CREATE TABLE other (x)")
+            .unwrap();
+
+        assert!(store.replace_contents_from(&not_mbtiles).is_err());
+        assert_eq!(
+            store.get_tile(1, 0, 0).unwrap().as_deref(),
+            Some(&b"kept"[..])
+        );
+        assert_eq!(store.commit_count(), 0);
+        cleanup(&path);
+        cleanup(&not_mbtiles);
     }
 
     #[test]

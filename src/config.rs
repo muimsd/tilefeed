@@ -178,6 +178,11 @@ pub struct SourceConfig {
     /// Tile generation backend: "tippecanoe" (default), "gdal", "native" or "on_demand"
     #[serde(default)]
     pub generation_backend: GenerationBackend,
+    /// Files or directories the source's data is read from (say a GeoPackage
+    /// behind an OGR_FDW foreign table). `watch`, `run` and `serve` regenerate
+    /// the source when one changes, since such edits never notify.
+    #[serde(default)]
+    pub watch_files: Vec<String>,
     pub layers: Vec<LayerConfig>,
     #[serde(default)]
     pub tippecanoe: TippecanoeConfig,
@@ -306,6 +311,8 @@ pub struct UpdateConfig {
     /// `false`: don't LISTEN for notifications. `serve` then only serves
     /// what's in the MBTiles; something else rebuilds it on a schedule.
     pub listen: Option<bool>,
+    /// How often `watch_files` are checked for changes, in seconds (default 5).
+    pub file_poll_secs: Option<u64>,
 }
 
 impl Default for UpdateConfig {
@@ -314,6 +321,7 @@ impl Default for UpdateConfig {
             debounce_ms: Some(200),
             worker_concurrency: Some(8),
             listen: None,
+            file_poll_secs: None,
         }
     }
 }
@@ -321,6 +329,10 @@ impl Default for UpdateConfig {
 impl UpdateConfig {
     pub fn listen_enabled(&self) -> bool {
         self.listen.unwrap_or(true)
+    }
+
+    pub fn file_poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.file_poll_secs.unwrap_or(5))
     }
 }
 
@@ -499,6 +511,11 @@ impl MetricsConfig {
 }
 
 impl AppConfig {
+    /// Whether any source has `watch_files` to poll.
+    pub fn watches_files(&self) -> bool {
+        self.sources.iter().any(|s| !s.watch_files.is_empty())
+    }
+
     /// Address of the dedicated metrics listener, when `[metrics] port` names one.
     /// The host falls back to the `[serve]` host.
     pub fn metrics_addr(&self) -> Option<(String, u16)> {
@@ -802,6 +819,12 @@ impl AppConfig {
         }
         for source in &self.sources {
             source.validate_layer_zooms()?;
+            if source.watch_files.iter().any(|f| f.trim().is_empty()) {
+                anyhow::bail!("source \"{}\": watch_files has an empty path", source.name);
+            }
+        }
+        if self.updates.file_poll_secs == Some(0) {
+            anyhow::bail!("[updates] file_poll_secs must be at least 1");
         }
         check_label_point_columns(self)?;
         Ok(())
@@ -861,6 +884,7 @@ mod tests {
             min_zoom: 0,
             max_zoom: 14,
             generation_backend: GenerationBackend::default(),
+            watch_files: vec![],
             layers: layer_names.iter().map(|l| sample_layer(l)).collect(),
             tippecanoe: TippecanoeConfig::default(),
         }
@@ -1091,6 +1115,24 @@ mod tests {
             cfg.serve.public_url = Some(bad.to_string());
             assert!(cfg.validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn test_watch_files_validation() {
+        let mut cfg = sample_config(vec![sample_source("s", &["l"])]);
+        assert!(!cfg.watches_files());
+        cfg.sources[0].watch_files = vec!["/data/a.gpkg".to_string()];
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.watches_files());
+        assert_eq!(cfg.updates.file_poll_interval().as_secs(), 5);
+
+        cfg.updates.file_poll_secs = Some(0);
+        assert!(cfg.validate().is_err(), "a zero poll interval would spin");
+        cfg.updates.file_poll_secs = Some(30);
+        assert_eq!(cfg.updates.file_poll_interval().as_secs(), 30);
+
+        cfg.sources[0].watch_files.push(" ".to_string());
+        assert!(cfg.validate().is_err(), "empty path");
     }
 
     #[test]

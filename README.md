@@ -40,6 +40,7 @@ Full generation exports PostGIS layers through one of three backends (Tippecanoe
 - Multiple sources: separate MBTiles outputs with independent layers and zoom ranges
 - [Per-layer zoom ranges](docs/configuration.md#per-layer-zoom-range) (`min_zoom`/`max_zoom`) within a source, honoured by every backend and by incremental updates
 - Incremental tile regeneration using PostgreSQL LISTEN/NOTIFY with debounced batching
+- [Watching source files](docs/configuration.md#watching-source-files): a source read from a GeoPackage, shapefile or other file through OGR_FDW regenerates when the file changes (`watch_files`)
 - [TLS to PostgreSQL](docs/configuration.md#database) (`sslmode`, `sslrootcert`) for managed databases such as Supabase, Neon, RDS and Cloud SQL
 - Built-in HTTP tile server with ETag caching, CORS, configurable `Cache-Control`, and [TileJSON 3.0.0](docs/serving.md)
 - [Map preview](docs/serving.md#map-preview) at `/`: every source on a MapLibre map, framed on the data, with feature popups and live updates as rows change

@@ -150,7 +150,8 @@ sslrootcert = "/etc/ssl/certs/provider-ca.pem"
 |-------|------|---------|-------------|
 | `debounce_ms` | int | 200 | Debounce window for batching notifications |
 | `worker_concurrency` | int | 8 | Max concurrent tile regeneration workers |
-| `listen` | bool | true | `false`: don't LISTEN for notifications. `serve` serves the MBTiles as they are and something else (a scheduled `generate`) keeps them fresh. `watch` refuses to start. |
+| `listen` | bool | true | `false`: don't LISTEN for notifications. `serve` serves the MBTiles as they are and something else (a scheduled `generate`) keeps them fresh. `watch` refuses to start, unless a source has `watch_files`. |
+| `file_poll_secs` | int | 5 | How often [`watch_files`](#watching-source-files) are checked for changes |
 
 ### `[serve]`
 
@@ -206,6 +207,7 @@ See [Metrics](metrics.md) for the full metric reference.
 | `min_zoom` | int | yes | Minimum zoom level |
 | `max_zoom` | int | yes | Maximum zoom level |
 | `generation_backend` | string | no | `"tippecanoe"` (default), `"gdal"`, `"native"`, or `"on_demand"` (render tiles when requested, see [On demand](#on-demand)) |
+| `watch_files` | list of paths | no | Files or directories the source's data is read from, e.g. a GeoPackage behind OGR_FDW. A change regenerates the source; see [Watching source files](#watching-source-files) |
 
 ### `[[sources.layers]]`
 
@@ -381,3 +383,49 @@ generation_backend = "on_demand"
 - With `[updates] listen = false` nothing drops tiles, so a rendered tile stays as it
   was rendered until the next restart.
 
+## Watching source files
+
+Data read through [OGR_FDW](ogr-fdw.md) (a GeoPackage, a shapefile, a GeoJSON
+file…) can change without PostgreSQL knowing, so no trigger fires. List those
+files in the source's `watch_files`, and `watch`, `run` and `serve` regenerate the
+source when one changes:
+
+```toml
+[updates]
+file_poll_secs = 5   # default
+
+[[sources]]
+name = "parcels"
+mbtiles_path = "./parcels.mbtiles"
+min_zoom = 0
+max_zoom = 14
+watch_files = ["/data/parcels.gpkg", "/data/roads/"]   # a directory: every file directly in it
+```
+
+- **Polled, not event-driven:** each path's size and modification time are checked
+  every `file_poll_secs`, which also works on network shares and Docker bind mounts
+  where filesystem events don't arrive. A directory counts every file directly
+  inside it, so the parts of a shapefile (`.shp`, `.dbf`, `.shx`…) or a
+  GeoPackage's `-wal` all count.
+- **Settled changes only:** after a change, the source is regenerated once the
+  files have stayed the same for a whole poll, so a copy still being written isn't
+  read half-way.
+- **The whole source is regenerated**, with its backend, into a scratch file next
+  to the MBTiles (`<mbtiles_path>.regen`). The result is swapped into the open file
+  in one transaction, so `serve` keeps serving the old tiles until the new ones are
+  complete, then clears its tile cache and sends `generate_complete` to webhooks
+  and SSE clients (the map preview reloads). With `publish_on_generate`, the new
+  file is published too. If generation fails the old tiles stay, and the next
+  change tries again.
+- **Changed while stopped:** at startup, a watched file newer than the MBTiles
+  triggers a regeneration, so `serve --skip-generate` doesn't keep serving tiles
+  older than their data.
+- **The path is the one tilefeed sees.** OGR_FDW reads the file on the PostgreSQL
+  server; tilefeed needs the same file under its own path (the same machine, or a
+  shared volume). The two paths may differ.
+- Regenerations count in `tilefeed_generate_total` and
+  `tilefeed_generate_duration_seconds`, like the startup generation. They need the
+  backend's tool (Tippecanoe or `ogr2ogr`), which `watch`, `run` and `serve` check
+  for at startup when a source has `watch_files`.
+- An incremental update that lands while a source regenerates would be lost by the
+  swap, so the regeneration is redone (up to three times) when one does.

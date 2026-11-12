@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod diff;
 mod events;
+mod filewatch;
 mod generator;
 mod inspect;
 mod mbtiles;
@@ -127,6 +128,14 @@ impl Commands {
     /// Whether Tippecanoe/GDAL must be present. `validate` is a dry run of
     /// generation, so it reports a missing toolchain rather than passing and
     /// leaving the next `generate` to fail.
+    /// Commands that keep running and apply changes.
+    fn watches(&self) -> bool {
+        matches!(
+            self,
+            Commands::Watch | Commands::Run { .. } | Commands::Serve { .. }
+        )
+    }
+
     fn needs_generation_tools(&self) -> bool {
         self.generates() || matches!(self, Commands::Validate)
     }
@@ -183,6 +192,19 @@ async fn main() -> Result<()> {
             if cli.command.needs_generation_tools() {
                 generator::check_required_tools(
                     &app_config.sources,
+                    app_config.tippecanoe_bin.as_deref(),
+                    app_config.ogr2ogr_bin.as_deref(),
+                )?;
+            } else if cli.command.watches() {
+                // Sources with watch_files regenerate while running.
+                let watched: Vec<config::SourceConfig> = app_config
+                    .sources
+                    .iter()
+                    .filter(|s| !s.watch_files.is_empty())
+                    .cloned()
+                    .collect();
+                generator::check_required_tools(
+                    &watched,
                     app_config.tippecanoe_bin.as_deref(),
                     app_config.ogr2ogr_bin.as_deref(),
                 )?;
@@ -365,7 +387,7 @@ async fn watch_updates(
     publisher: Option<Arc<storage::StoragePublisher>>,
     event_tx: events::EventSender,
 ) -> Result<()> {
-    if !config.updates.listen_enabled() {
+    if !config.updates.listen_enabled() && !config.watches_files() {
         anyhow::bail!(
             "[updates] listen = false leaves `watch` nothing to do; use `serve`, or remove the setting"
         );
@@ -380,15 +402,17 @@ async fn watch_updates(
 
     let metrics_task = spawn_metrics_exporter(&config, false);
 
-    let mut listener_task = tokio::spawn(start_listener(
-        config.clone(),
-        stores,
-        updater::UpdateOutputs {
-            publisher: publisher.clone(),
-            event_tx: Some(event_tx),
-            cache: None,
-        },
-    ));
+    let outputs = updater::UpdateOutputs {
+        publisher: publisher.clone(),
+        event_tx: Some(event_tx),
+        cache: None,
+    };
+    let file_watch = filewatch::spawn(config.clone(), stores.clone(), outputs.clone())?;
+    let mut listener_task = if config.updates.listen_enabled() {
+        tokio::spawn(start_listener(config.clone(), stores, outputs))
+    } else {
+        tokio::spawn(std::future::pending::<Result<()>>())
+    };
 
     tokio::select! {
         result = &mut listener_task => {
@@ -399,6 +423,10 @@ async fn watch_updates(
             let _ = listener_task.await;
             info!("Incremental watcher shut down");
         }
+    }
+
+    if let Some(task) = file_watch {
+        task.abort();
     }
 
     if let Some(task) = metrics_task {
@@ -436,16 +464,14 @@ async fn serve_and_watch(
         ))
     });
 
+    let outputs = updater::UpdateOutputs {
+        publisher: publisher.clone(),
+        event_tx: Some(event_tx.clone()),
+        cache: tile_cache.clone(),
+    };
+    let file_watch = filewatch::spawn(config.clone(), stores.clone(), outputs.clone())?;
     let mut listener_task = if config.updates.listen_enabled() {
-        tokio::spawn(start_listener(
-            config.clone(),
-            stores.clone(),
-            updater::UpdateOutputs {
-                publisher: publisher.clone(),
-                event_tx: Some(event_tx.clone()),
-                cache: tile_cache.clone(),
-            },
-        ))
+        tokio::spawn(start_listener(config.clone(), stores.clone(), outputs))
     } else {
         info!("[updates] listen = false: serving without watching for changes");
         tokio::spawn(std::future::pending::<Result<()>>())
@@ -479,6 +505,9 @@ async fn serve_and_watch(
         }
     }
 
+    if let Some(task) = file_watch {
+        task.abort();
+    }
     if let Some(task) = metrics_task {
         task.abort();
     }

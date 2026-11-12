@@ -84,7 +84,13 @@ properties = ["owner", "area_sqm", "land_use"]
 ## Considerations
 
 - **Geometries without an SRID.** When a source has no recognized projection, the foreign table's geometries may have SRID 0, which PostGIS can't transform. Check with `SELECT DISTINCT ST_SRID(geom) FROM parcels` (or run `tilefeed validate`), and if it's 0, set the layer's `srid` to the projection the coordinates are actually in. On a synced local table, pass the same SRID as the trigger's second argument, `notify_tile_update('parcels', '4326')`, so moved and deleted features clear their old tiles.
-- **Edits to the underlying file don't notify.** Triggers on a foreign table only fire for writes made through PostgreSQL (an `INSERT`/`UPDATE`/`DELETE` on the foreign table, if the FDW server is writable). Changes made to the file or remote database directly are invisible to PostgreSQL, so for those use `tilefeed generate` on a schedule (cron) instead of `tilefeed watch`.
+- **Edits to the underlying file don't notify.** Triggers on a foreign table only fire for writes made through PostgreSQL (an `INSERT`/`UPDATE`/`DELETE` on the foreign table, if the FDW server is writable). Changes made to the file or remote database directly are invisible to PostgreSQL. For a local file, list it in the source's [`watch_files`](configuration.md#watching-source-files) and `watch`/`serve` regenerate the source when it changes:
+  ```toml
+  [[sources]]
+  name = "external"
+  watch_files = ["/data/parcels.gpkg"]   # as tilefeed sees it
+  ```
+  For a remote database or service, run `tilefeed generate` on a schedule (cron) instead.
 - **Performance depends on the remote source.** OGR_FDW can push down simple filters, but complex spatial queries may pull entire datasets over the network. For large remote sources, keep a local copy. A materialized view is simplest, but PostgreSQL can't put triggers on one, so it only suits scheduled `generate` runs:
   ```sql
   CREATE MATERIALIZED VIEW parcels_local AS SELECT * FROM parcels;
@@ -92,4 +98,4 @@ properties = ["owner", "area_sqm", "land_use"]
   REFRESH MATERIALIZED VIEW CONCURRENTLY parcels_local;
   ```
   To keep `tilefeed watch` working, sync into a regular table with the notify trigger attached. The upsert only writes rows that changed, so only they notify. See [examples/ogr-fdw](../examples/ogr-fdw/README.md#performance-tips) for the full SQL.
-- **Mixed sources work well.** You can have some sources backed by local PostGIS tables (with LISTEN/NOTIFY for real-time updates) and others backed by OGR_FDW foreign tables (with scheduled `generate` runs). Each `[[sources]]` block operates independently.
+- **Mixed sources work well.** You can have some sources backed by local PostGIS tables (with LISTEN/NOTIFY for real-time updates) and others backed by OGR_FDW foreign tables (with `watch_files` or scheduled `generate` runs). Each `[[sources]]` block operates independently.

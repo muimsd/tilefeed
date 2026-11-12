@@ -609,6 +609,7 @@ mod tests {
             min_zoom: 0,
             max_zoom: 4,
             generation_backend: backend,
+            watch_files: vec![],
             layers: vec![],
             tippecanoe: TippecanoeConfig::default(),
         }
